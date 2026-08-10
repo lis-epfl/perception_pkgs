@@ -1,0 +1,17 @@
+downloads/
+site/
+docs/.obsidian
+*.xmp
+
+# ignore vim temp files
+*.swp
+*.swo
+*.swn
+*.swm
+*.swl
+__pycache__/
+*.pyc
+
+# colcon workspaces and tool output
+ov_ws*/
+out_*/

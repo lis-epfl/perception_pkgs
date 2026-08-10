@@ -1,0 +1,25 @@
+This copy of the OpenVINS fork has been PRUNED to the code reachable in this package's two
+operating points (calibration and flight). See ../docs/DEPLOYMENT_STRIP.md for the full list.
+
+IMPORTANT: BASELINE.txt names the fork's baseline commits. The fork's full pre-prune patch
+record (UNCOMMITTED.diff, 1,776 lines) is NOT shipped here — it no longer applied to these
+sources. It remains in the study package (vio_dataset/selfcalib_tool/openvins/) and the
+fork's git repo is the authoritative history.
+
+Summary of the prune (-1,907 lines, 41 OV_* toggles -> 2):
+  removed  alternative KLT trackers (SE2 / tangent-LK / distort-KLT), cross-camera epipolar
+           stereo, TrackKLTTangent, feature-dump and edge-survival instrumentation,
+           disparity-aware clone marginalization, OV_ROBUST_GATE chi2 down-weighting,
+           gradual-ZUPT, per-camera extrinsic-calibration override, calib-freeze, and the
+           offline-harness knobs (viz dump, calib snapshots, feed timing, IMU/frame decimation)
+  kept     fisheye auto-masking, OV_RNG_SEED per-call RANSAC seeding, update_min_dt,
+           OV_PRIOR_* calibration-prior sigmas, config-driven force-static init, the
+           dynamic-init DENSE_SVD covariance retry, ROS2Visualizer, and OV_DET_LIVE
+
+Verified: reproduces the study's recorded reference run byte-for-byte through the whole
+pipeline (both per-pass trajectories, ATE, and published chain).
+
+Deployment trim (after the code prune): ROS 1 support, the 8 test/simulation executables,
+dataset benchmark scripts, and doc configs were removed at file level. The build produces
+exactly two binaries: run_serial_msckf (calibration) and run_subscribe_msckf (flight VIO).
+The package is ROS 2 (ament) only; CMakeLists fails clearly otherwise.

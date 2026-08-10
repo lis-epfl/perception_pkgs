@@ -1,0 +1,36 @@
+f2b528a6e1da26dc587b10f44a3fe76052aeb728
+f2b528a Tighten CamDS Jacobian unit test to 1e-6 with native-double FD.
+b1e2c10 Add double-sphere camera model and tangent-image KLT tracker.
+6948812 Merge pull request #530 from rpng/android
+--- working tree carries these uncommitted modifications (already applied in this copy):
+ config/uzhfpv_indoor/kalibr_imu_chain.yaml    |  46 +-
+ config/uzhfpv_indoor/kalibr_imucam_chain.yaml |  31 +-
+ ov_core/src/track/TrackBase.h                 |   6 +
+ ov_core/src/track/TrackDescriptor.cpp         | 117 ++++-
+ ov_core/src/track/TrackDescriptor.h           |  21 +-
+ ov_core/src/track/TrackKLT.cpp                | 644 +++++++++++++++++++++++++-
+ ov_core/src/track/TrackKLT.h                  |  51 +-
+ ov_core/src/track/TrackKLTTangent.cpp         |  14 +
+ ov_init/src/dynamic/DynamicInitializer.cpp    |  48 +-
+ ov_init/src/init/InertialInitializer.cpp      |  16 +-
+ ov_init/src/init/InertialInitializerOptions.h |   8 +
+ ov_init/src/static/StaticInitializer.cpp      |  10 +-
+ ov_msckf/cmake/ROS2.cmake                     |  10 +
+ ov_msckf/src/core/VioManager.cpp              | 275 ++++++++++-
+ ov_msckf/src/core/VioManager.h                |  11 +
+ ov_msckf/src/core/VioManagerHelper.cpp        |   8 +-
+ ov_msckf/src/core/VioManagerOptions.h         |  73 ++-
+ ov_msckf/src/ros/ROS2Visualizer.cpp           | 156 ++++++-
+ ov_msckf/src/ros/ROS2Visualizer.h             |   8 +
+ ov_msckf/src/run_subscribe_msckf.cpp          |  28 +-
+ ov_msckf/src/state/Propagator.cpp             |   3 +
+ ov_msckf/src/state/State.cpp                  |  46 +-
+ ov_msckf/src/state/State.h                    |  31 ++
+ ov_msckf/src/state/StateHelper.cpp            |  67 +++
+ ov_msckf/src/state/StateHelper.h              |  31 ++
+ ov_msckf/src/state/StateOptions.h             |  42 ++
+ ov_msckf/src/update/UpdaterHelper.cpp         |   8 +-
+ ov_msckf/src/update/UpdaterMSCKF.cpp          |  47 +-
+ ov_msckf/src/update/UpdaterSLAM.cpp           |  53 ++-
+ ov_msckf/src/update/UpdaterZeroVelocity.cpp   |  27 +-
+ 30 files changed, 1776 insertions(+), 160 deletions(-)

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vio_deploy</name>
+  <version>1.0.0</version>
+  <description>
+    Deployment assets for the pruned OpenVINS VIO estimator: the flight-mode estimator
+    configuration, the calibration-prior stiffness environment file, and the deterministic
+    single-run wrapper used to invoke the estimator. Installs them under share/vio_deploy so
+    both flight VIO and the self-calibration package can locate them through the ament index.
+  </description>
+  <maintainer email="charbeltoumieh95@gmail.com">Charbel Toumieh</maintainer>
+  <license>GPLv3</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- The estimator this package configures and launches. -->
+  <exec_depend>ov_msckf</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
