@@ -137,13 +137,21 @@ class Recording:
     single interleaved ordering, and it does that in C++.
     """
 
-    def __init__(self, uris, imu_topic, imu_type, cam_topics, cam_type):
+    def __init__(self, uris, imu_topic, imu_type, cam_topics, cam_type, window=None):
         self.uris = [resolve_uri(u) for u in uris]
         self.imu_topic = imu_topic
         self.imu_type = imu_type
         self.cam_topics = dict(cam_topics)          # cam index -> topic
         self.cam_type = cam_type
         self.compressed = cam_type.endswith('CompressedImage')
+        # Optional trim, in seconds. Semantics MUST match BagSource in
+        # ov_msckf/src/utils/bag_source.h: measured from the instant every stream is
+        # live, i.e. max(first IMU stamp, first camera stamp) -- on a fleet recording
+        # the camera file starts seconds after the IMU file. If the two disagreed, the
+        # gates and the circle fit would be measuring a different span than the
+        # estimator, and the seed would not describe the data being calibrated on.
+        self.window = float(window) if window else None
+        self._anchor_cache = None
         self._topic_uri = {}                        # topic -> uri holding it
         self._meta = {}
         for uri in self.uris:
@@ -159,7 +167,7 @@ class Recording:
 
     # -- discovery -------------------------------------------------------------
     @classmethod
-    def open(cls, path):
+    def open(cls, path, window=None):
         """Auto-detect the layout. `path` is a swarm-nxt log directory, or a plain
         rosbag2 recording in the study layout."""
         bag_dir = os.path.join(path, 'bag')
@@ -168,10 +176,10 @@ class Recording:
             return cls(uris=[bag_dir, cams_file],
                        imu_topic=PX4_IMU_TOPIC, imu_type=PX4_IMU_TYPE,
                        cam_topics={i: OAK_TOPIC % n for i, n in enumerate(OAK_CAMS)},
-                       cam_type='sensor_msgs/msg/CompressedImage')
+                       cam_type='sensor_msgs/msg/CompressedImage', window=window)
         return cls(uris=[path], imu_topic='/imu0', imu_type='sensor_msgs/msg/Imu',
                    cam_topics={i: '/cam%d/image_raw' % i for i in range(4)},
-                   cam_type='sensor_msgs/msg/Image')
+                   cam_type='sensor_msgs/msg/Image', window=window)
 
     # -- introspection ---------------------------------------------------------
     def topics(self):
@@ -202,6 +210,30 @@ class Recording:
             r.set_filter(rosbag2_py.StorageFilter(topics=ts))
             yield r
 
+    def _first_stamp(self, topic):
+        """Sensor stamp of the first record on a topic, without applying the window."""
+        for r in self._reader([topic]):
+            while r.has_next():
+                _, data, _ = r.read_next()
+                return imu_from_cdr(data)[0] if topic == self.imu_topic and \
+                    self.imu_type == PX4_IMU_TYPE else fast_stamp(data)
+        return None
+
+    def _anchor(self):
+        """t0 = the instant every stream is live. Cached; two cheap single-record reads."""
+        if self._anchor_cache is None:
+            stamps = [self._first_stamp(t) for t in
+                      [self.imu_topic] + [self.cam_topics[c] for c in sorted(self.cam_topics)][:1]]
+            stamps = [x for x in stamps if x is not None]
+            self._anchor_cache = max(stamps) if stamps else 0.0
+        return self._anchor_cache
+
+    def _in_window(self, t):
+        if self.window is None:
+            return True
+        t0 = self._anchor()
+        return t0 <= t <= t0 + self.window
+
     def imu(self):
         """-> (t, gyro(3), accel(3)) in recording order."""
         from rclpy.serialization import deserialize_message
@@ -210,11 +242,17 @@ class Recording:
             while r.has_next():
                 _, data, _ = r.read_next()
                 if native:
-                    yield imu_from_cdr(data)
+                    rec = imu_from_cdr(data)
+                    if self._in_window(rec[0]):
+                        yield rec
+                    continue
                 else:
                     from sensor_msgs.msg import Imu
                     m = deserialize_message(data, Imu)
-                    yield (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9,
+                    _t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+                    if not self._in_window(_t):
+                        continue
+                    yield (_t,
                            np.array([m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z]),
                            np.array([m.linear_acceleration.x, m.linear_acceleration.y,
                                      m.linear_acceleration.z]))
@@ -230,7 +268,10 @@ class Recording:
         for r in self._reader(list(topics)):
             while r.has_next():
                 topic, data, _ = r.read_next()
-                yield topics[topic], fast_stamp(data), data
+                _t = fast_stamp(data)
+                if not self._in_window(_t):
+                    continue
+                yield topics[topic], _t, data
 
     def decode(self, data):
         return decode_image(data, self.compressed)

@@ -308,21 +308,28 @@ def main():
 
     # ---- 1. cheap gates ----
     log('gate: static start')
-    report['gate_static'] = static_start_gate(a.bag)
+    # One windowed Recording for every python stage. --window must trim the gates and
+    # the circle fit too, not just the estimator: the circle fit produces the seed's
+    # principal point, so if it read the whole recording while the estimator read 15 s,
+    # the seed would describe data the calibration never saw. It is also where the time
+    # goes -- these stages stream every frame, and on an Orin they cost ~54 s of a
+    # 3 min run regardless of the window.
+    _wrec = Recording.open(a.bag, window=a.window)
+    report['gate_static'] = static_start_gate(_wrec)
     if not report['gate_static']['pass']:
         report['verdict'] = 'GATE-FAIL: ' + report['gate_static']['reason'] + ' — re-record starting on the ground'
         write_json(report, os.path.join(a.out, 'report.json'))
         log(report['verdict'])
         return 1
     log('gate: timing')
-    report['gate_timing'] = timing_gate(a.bag, cams=cam_ids)
+    report['gate_timing'] = timing_gate(_wrec, cams=cam_ids)
     if not report['gate_timing']['pass']:
         log('WARNING: timing gate flagged (proceeding — predicts a platform-defect verdict, §6.3)')
 
     # ---- 2. one accumulation pass: circle fit + image health ----
     log('image pass: activity/mask/gradient accumulation')
     radii = radii_from_chain(tmpl_cams)
-    acc = accumulate(a.bag, cams=cam_ids)
+    acc = accumulate(_wrec, cams=cam_ids)
     centers = fit_centers(acc, radii)
     report['circle_fit'] = centers
     report['gate_image'] = health_from_acc(acc, centers, radii)
@@ -380,7 +387,7 @@ def main():
     # names the fleet's topics and message types, and only when bagio detected them.
     # Getting this wrong is silent -- the estimator would find no topics and produce
     # no harvest -- so the values come from the same object the gates just read.
-    _rec = Recording.open(a.bag)
+    _rec = _wrec
     cfg_txt = _inject_window(_inject_layout(cfg_txt, _rec), a.window)
     open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
     shutil.copy(a.imu_chain, f'{rd}/kalibr_imu_chain.yaml')
