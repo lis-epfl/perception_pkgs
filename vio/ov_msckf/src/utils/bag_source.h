@@ -27,7 +27,6 @@
 #include <fstream>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -93,8 +92,6 @@ struct BagSourceOptions {
   std::string imu_msg_type = "sensor_msgs/msg/Imu";
   std::string cam_msg_type = "sensor_msgs/msg/Image";
   std::map<std::string, int> cam_topics;      //!< explicit topic -> cam index; empty = "/cam<N>" rule
-  double t_start = 0.0;                       //!< seconds after all streams are live
-  double t_end = std::numeric_limits<double>::infinity();
 };
 
 /// One measurement pulled off the merged stream.
@@ -236,42 +233,13 @@ private:
     return std::atoi(topic.c_str() + p + 3);
   }
 
-  /// Fill every head, then anchor the window at the instant ALL streams are live.
-  ///
-  /// When no window was asked for, NOTHING is filtered: anchoring at the latest
-  /// stream's first stamp would silently discard the IMU that precedes the first
-  /// camera frame (~1.2 s on a fleet recording, since the cam recorder starts
-  /// after ros2 bag), and that history is exactly what static initialization wants.
-  /// The default must stay "feed everything", matching the single-reader behaviour
-  /// this replaced.
+  /// Fill every stream's head so next() has something to compare.
   void prime() {
-    _windowed = (_opt.t_start > 0.0) || std::isfinite(_opt.t_end);
     for (auto &st : _streams)
-      advance(*st, /*ignore_window=*/true);
-    if (!_windowed) {
-      _t0 = std::numeric_limits<double>::quiet_NaN(); // disables all window tests
-      return;
-    }
-    _t0 = -std::numeric_limits<double>::infinity();
-    for (auto &st : _streams) {
-      if (st->head.kind != BagRecord::NONE)
-        _t0 = std::max(_t0, st->head.ts);
-    }
-    if (!std::isfinite(_t0)) {
-      _t0 = 0.0;
-      return;
-    }
-    // Re-apply the window now that the anchor is known. A head that predates the
-    // window is dropped and the stream advanced until it enters.
-    for (auto &st : _streams) {
-      while (st->head.kind != BagRecord::NONE && st->head.ts < _t0 + _opt.t_start)
-        advance(*st, /*ignore_window=*/true);
-      if (st->head.kind != BagRecord::NONE && st->head.ts > _t0 + _opt.t_end)
-        st->head = BagRecord();
-    }
+      advance(*st);
   }
 
-  void advance(Stream &st, bool ignore_window = false) {
+  void advance(Stream &st) {
     st.head = BagRecord();
     while (st.reader->has_next()) {
       auto msg = st.reader->read_next();
@@ -290,12 +258,6 @@ private:
         continue;
       }
 
-      if (!ignore_window && std::isfinite(_t0)) {
-        if (rec.ts < _t0 + _opt.t_start)
-          continue;
-        if (rec.ts > _t0 + _opt.t_end)
-          break; // streams are ordered, so nothing later can qualify either
-      }
       st.head = std::move(rec);
       return;
     }
@@ -361,8 +323,6 @@ private:
 
   BagSourceOptions _opt;
   std::vector<std::unique_ptr<Stream>> _streams;
-  double _t0 = 0.0;
-  bool _windowed = false; //!< false => no window requested, feed every record
   bool _warned_imu = false;
   rclcpp::Serialization<sensor_msgs::msg::Imu> _imu_ser;
   rclcpp::Serialization<sensor_msgs::msg::Image> _img_ser;

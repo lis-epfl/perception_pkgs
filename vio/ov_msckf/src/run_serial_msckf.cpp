@@ -12,8 +12,8 @@
  * one or more files into a single timestamp-ordered stream and auto-detects
  * sqlite3 vs mcap. Its defaults are the study layout -- a single sqlite3 bag with
  * /imu0 and /cam<N> as sensor_msgs/Imu and sensor_msgs/Image -- so an unmodified
- * config behaves exactly as it always has. Topics, message types and a time
- * window are config keys; see bag_source.h.
+ * config behaves exactly as it always has. Topics and message types are config
+ * keys; see bag_source.h.
  *
  * Usage:
  *   ros2 run ov_msckf run_serial_msckf <config.yaml> <bag[,bag2...]> <out_tum> \
@@ -140,14 +140,6 @@ int main(int argc, char **argv) {
     if (!topic.empty())
       bopt.cam_topics[topic] = i;
   }
-  // Calibration only needs a static start plus ~10-15 s of motion, so trimming the
-  // window cuts every warm-start pass proportionally. Defaults take everything.
-  double t_start = 0.0, t_end = -1.0;
-  parser->parse_config("bag_t_start", t_start, false);
-  parser->parse_config("bag_t_end", t_end, false);
-  bopt.t_start = t_start;
-  if (t_end > 0.0)
-    bopt.t_end = t_end;
   BagSource source(bopt);
 
   // A fully-assembled camera frame. Payloads are still encoded here on purpose --
