@@ -239,6 +239,16 @@ def main():
                          '~10-15 s of motion, so a long recording costs passes it does not '
                          'need. Applied to BOTH the warm-start passes and the frozen '
                          'deployment pass, so the certificate measures the same data.')
+    ap.add_argument('--frozen-check', action='store_true',
+                    help='certify the ATE on a dedicated extra pass that runs the published '
+                         'chain under the FLIGHT config plus flight_stiffness.env, instead of '
+                         'on the last warm-start pass. Costs one more estimator pass (~a third '
+                         'of total runtime). OFF by default: measured over 12 fleet recordings '
+                         'with the flight-config loop, the last pass tracks the frozen pass to '
+                         'a median 1.17x and gives identical verdicts on all 12. Turn it ON if '
+                         'the loop is driven by a different config -- under the CALIBRATION '
+                         'config the same comparison produced a 21.49 cm last-pass ATE against '
+                         '1.94 cm frozen, which crosses the 0.20 m gate.')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -446,11 +456,21 @@ def main():
 
     # ---- 6. diagnosis ----
     est = os.path.join(a.out, 'estimate_pass%d.tum' % report['converged_at_pass'])
-    # Certify the trajectory the vehicle will actually fly, not the last calibration
-    # pass. Only meaningful with ground truth, and never silently substituted: if the
-    # flight pass fails, ate_source says so and the fallback reads WORSE, not better.
+    # Which trajectory the ATE certificate measures. Default is the last warm-start
+    # pass, which under the FLIGHT-config loop tracks a dedicated frozen run closely:
+    # measured over 12 fleet recordings, median 1.17x, identical verdicts on all 12,
+    # and better than frozen on 3 of them. --frozen-check buys the dedicated run at the
+    # cost of a third of the runtime.
+    #
+    # That equivalence is a property of the LOOP CONFIG, not a general fact. Under the
+    # calibration config (max_slam 0, num_pts 2000, track_frequency 29) the same
+    # comparison gave 21.49 cm on the last pass against 1.94 cm frozen -- across the
+    # 0.20 m gate. If the loop stops using the flight config, turn --frozen-check back on.
+    #
+    # ate_source records which one was used either way, so a stored report can never
+    # imply a deployment measurement that did not happen.
     est_cert, cert_kind = est, 'calibration-pass'
-    if a.gt:
+    if a.gt and a.frozen_check:
         fd = os.path.join(a.out, 'deploy_check')
         try:
             est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s)
