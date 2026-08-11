@@ -47,12 +47,16 @@ if [ -z "${OV_BUILD_JOBS:-}" ]; then
   [ "$_mem_jobs" -lt 1 ] && _mem_jobs=1
   OV_BUILD_JOBS=$(( _cores < _mem_jobs ? _cores : _mem_jobs ))
 fi
+# NOTE: colcon's --parallel-workers and MAKEFLAGS MULTIPLY -- N packages in flight,
+# each running make -jN, is N*N concurrent compilers. Pinning workers to 1 makes the
+# ceiling exactly OV_BUILD_JOBS: packages build one at a time, and the parallelism goes
+# where the memory actually goes (many translation units inside one package).
 echo "build_openvins.sh: building with $OV_BUILD_JOBS parallel compile jobs"
 export MAKEFLAGS="-j${OV_BUILD_JOBS}"
 
 # shellcheck disable=SC2086
 colcon build --packages-select $PKGS \
-    --parallel-workers "$OV_BUILD_JOBS" \
+    --parallel-workers 1 \
     --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 echo "OK. Estimator invocation goes through: $VIO/vio_deploy/scripts/run_serial.sh"
 echo "  bash run_serial.sh BAG CONFIG OUT_DIR [NCAM] [STEREO] [SEED] [DOMAIN]"
