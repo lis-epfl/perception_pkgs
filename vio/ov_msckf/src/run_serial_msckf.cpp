@@ -140,6 +140,15 @@ int main(int argc, char **argv) {
     if (!topic.empty())
       bopt.cam_topics[topic] = i;
   }
+  // Optional trim. Calibration needs a static start plus ~10-15 s of motion, so a long
+  // recording costs passes it does not need: runtime is ~(bag length) x (passes) x
+  // 1-4x real time, and on an Orin that is ~4x per pass.
+  double t_start = 0.0, t_end = -1.0;
+  parser->parse_config("bag_t_start", t_start, false);
+  parser->parse_config("bag_t_end", t_end, false);
+  bopt.t_start = t_start;
+  if (t_end > 0.0)
+    bopt.t_end = t_end;
   BagSource source(bopt);
 
   // A fully-assembled camera frame. Payloads are still encoded here on purpose --

@@ -103,6 +103,16 @@ def resolve_vio_root(explicit=None):
         '  Pass --vio-root or set $VIO_ROOT to the vio/ directory.' % (RUNNER, sibling))
 
 
+def _inject_window(cfg_txt, window):
+    """Append the read-time trim. Must go into every config the estimator is given, or
+    the calibration and its certificate would be measured over different data."""
+    if not window:
+        return cfg_txt
+    return (cfg_txt.rstrip('\n') +
+            '\n\n# --- read-time window (written by run_tool.py --window) ---\n'
+            'bag_t_start: 0.0\nbag_t_end: %.3f\n' % float(window))
+
+
 def _inject_layout(cfg_txt, rec):
     """Append this recording's topic/type layout to an estimator config.
 
@@ -172,7 +182,7 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     # The flight config resolves its chains by RELATIVE name, so they must sit beside the copy.
     rec = Recording.open(a.bag)
     open(f'{outdir}/estimator_flight.yaml', 'w').write(
-        _inject_layout(_redirect_scratch(open(fcfg).read(), outdir), rec))
+        _inject_window(_inject_layout(_redirect_scratch(open(fcfg).read(), outdir), rec), a.window))
     shutil.copy(a.imu_chain, f'{outdir}/kalibr_imu_chain.yaml')
     shutil.copy(published_chain, f'{outdir}/kalibr_imucam_chain.yaml')
 
@@ -223,6 +233,12 @@ def main():
     ap.add_argument('--fleet-exclude', default=None)
     ap.add_argument('--max-pass', type=int, default=8)
     ap.add_argument('--domain', type=int, default=70)
+    ap.add_argument('--window', type=float, default=None,
+                    help='seconds of the recording to use, measured from the instant every '
+                         'stream is live. The input contract needs only a static start plus '
+                         '~10-15 s of motion, so a long recording costs passes it does not '
+                         'need. Applied to BOTH the warm-start passes and the frozen '
+                         'deployment pass, so the certificate measures the same data.')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -355,7 +371,7 @@ def main():
     # Getting this wrong is silent -- the estimator would find no topics and produce
     # no harvest -- so the values come from the same object the gates just read.
     _rec = Recording.open(a.bag)
-    cfg_txt = _inject_layout(cfg_txt, _rec)
+    cfg_txt = _inject_window(_inject_layout(cfg_txt, _rec), a.window)
     open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
     shutil.copy(a.imu_chain, f'{rd}/kalibr_imu_chain.yaml')
     write_chain(a.template, seed, seed_toff, f'{rd}/kalibr_imucam_chain.yaml')
