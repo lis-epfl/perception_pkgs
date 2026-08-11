@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Pre-flight data gates (paper §6.1): static-start, timing-health, image-health.
 
-Each gate reads a ros2 sqlite3 bag directly and returns a dict verdict.
-CLI: python3 gates.py <bag_dir> [--chain chain.yaml] [--gates static,timing,image] [--json out.json]
+Each gate reads a recording through bagio (which handles sqlite3 vs mcap, one file
+or several, raw vs compressed images) and returns a dict verdict.
+CLI: python3 gates.py <recording> [--chain chain.yaml] [--gates static,timing,image] [--json out.json]
 """
 import argparse, json, os, re, struct, sys
 import numpy as np
-import rosbag2_py
-from rclpy.serialization import deserialize_message
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bagio import Recording
 from chainio import parse_chain, kb4_radius
 
 # ---------------- thresholds (calibrated on fleet data, see docs/VALIDATION_MATRIX.md) ----
@@ -17,6 +17,8 @@ STATIC_GYRO_STD = 0.03      # rad/s per-axis-norm std within a bin counted as st
 STATIC_ACC_STD = 0.20       # m/s^2 (on-ground with electronics running)
 STATIC_MIN_S = 1.5          # required contiguous static duration
 STATIC_SEARCH_S = 12.0      # static phase must appear within this window from bag start
+GRAVITY_Z_MIN = 8.0         # static accel z must exceed this (FLU: +g). Catches an inverted axis.
+GRAVITY_NORM_TOL = 1.5      # |static accel| must be within this of 9.81 (catches unit errors)
 TIMING_DROP_RATE = 0.03     # fraction of dropped frames above this → flag (fleet ≤1.5%, nxt1 ≈8%)
 TIMING_NOISE_STD_MS = 25.0  # windowed(10 s) grid-residual std above this → flag (fleet ≤16, nxt1 ≈35)
 TIMING_SYNC_MS = 1.0        # cameras' stamps must agree to this (synchronized-trigger rig)
@@ -52,31 +54,25 @@ def _load_theta_max(cfg_path=None):
 THETA_MAX = _load_theta_max()
 
 
-def _reader(bag, topics=None):
-    r = rosbag2_py.SequentialReader()
-    r.open(rosbag2_py.StorageOptions(uri=bag, storage_id='sqlite3'), rosbag2_py.ConverterOptions('', ''))
-    if topics:
-        r.set_filter(rosbag2_py.StorageFilter(topics=topics))
-    return r
+def _rec(bag):
+    """Accept a path or an already-open Recording. Which files the recording spans,
+    and how they are stored, is bagio's problem rather than each gate's."""
+    return bag if isinstance(bag, Recording) else Recording.open(bag)
 
 
 # ---------------- gate 1: static start ----------------
-def static_start_gate(bag, imu_topic='/imu0'):
-    from sensor_msgs.msg import Imu
-    r = _reader(bag, [imu_topic])
+def static_start_gate(bag, imu_topic=None):
+    rec = _rec(bag)
     T, G, A = [], [], []
     t0 = None
-    while r.has_next():
-        _, data, _ = r.read_next()
-        m = deserialize_message(data, Imu)
-        t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+    for t, g, a in rec.imu():
         if t0 is None:
             t0 = t
         if t - t0 > STATIC_SEARCH_S + 2:
             break
         T.append(t - t0)
-        G.append([m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z])
-        A.append([m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z])
+        G.append(g)
+        A.append(a)
     T, G, A = np.array(T), np.array(G), np.array(A)
     if len(T) < 50:
         return {'pass': False, 'reason': 'no/too-few IMU messages', 'static_s': 0.0}
@@ -94,9 +90,39 @@ def static_start_gate(bag, imu_topic='/imu0'):
         run = run + 0.5 if s else 0.0
         best = max(best, run)
     g0 = float(G[T < min(3.0, T[-1])].std(0).max())
-    return {'pass': bool(best >= STATIC_MIN_S), 'static_s': best,
-            'gyro_std_first3s': round(g0, 4), 'reason': '' if best >= STATIC_MIN_S else
-            'no >=%.1fs static phase in first %.0fs (longest %.1fs)' % (STATIC_MIN_S, STATIC_SEARCH_S, best)}
+
+    # Gravity direction and magnitude at rest. Variance alone cannot see an inverted
+    # axis: an IMU published in PX4's FRD body frame sits perfectly still, passes every
+    # variance test, and then diverges the estimator by kilometres with no earlier
+    # warning -- the calibration states still converge self-consistently, so the run
+    # ends in a confident wrong verdict. This is the cheapest place to catch it.
+    sm = T < min(STATIC_MIN_S, T[-1])
+    a_mean = A[sm].mean(0) if sm.sum() >= 10 else A[:min(len(A), 200)].mean(0)
+    a_norm = float(np.linalg.norm(a_mean))
+    grav_ok = bool(a_mean[2] > GRAVITY_Z_MIN and abs(a_norm - 9.81) < GRAVITY_NORM_TOL)
+
+    if grav_ok:
+        grav_reason = ''
+    elif a_mean[2] < -GRAVITY_Z_MIN:
+        grav_reason = ('gravity points the WRONG WAY on IMU z (a_z=%+.2f, expected about +9.81): '
+                       'the IMU axis convention is inverted. ROS/REP-103 expects FLU; PX4 '
+                       'publishes body-frame FRD -- convert (x,y,z)->(x,-y,-z).' % a_mean[2])
+    elif abs(a_norm - 9.81) >= GRAVITY_NORM_TOL:
+        grav_reason = ('static accelerometer magnitude %.2f m/s^2, expected ~9.81 '
+                       '(units or scaling wrong).' % a_norm)
+    else:
+        grav_reason = ('gravity not aligned with +z at rest (a=%+.2f,%+.2f,%+.2f); check the '
+                       'IMU axis convention.' % tuple(a_mean))
+
+    static_ok = best >= STATIC_MIN_S
+    # The missing-static-phase reason takes priority; gravity is only meaningful once
+    # we know the vehicle actually held still.
+    reason = ('no >=%.1fs static phase in first %.0fs (longest %.1fs)'
+              % (STATIC_MIN_S, STATIC_SEARCH_S, best)) if not static_ok else grav_reason
+    return {'pass': bool(static_ok and grav_ok), 'static_s': best,
+            'gyro_std_first3s': round(g0, 4), 'reason': reason,
+            'static_accel_mean': [round(float(v), 4) for v in a_mean],
+            'static_accel_norm': round(a_norm, 4), 'gravity_ok': grav_ok}
 
 
 # ---------------- gate 2: timing health ----------------
@@ -111,20 +137,11 @@ def timing_gate(bag, cams=(0, 1, 2, 3)):
     isolated frame drops and slow clock drift shared with the IMU. Flagged: dense drops
     (rate > TIMING_DROP_RATE), large short-term stamp noise (windowed grid-residual std >
     TIMING_NOISE_STD_MS), or cross-camera desynchronization (> TIMING_SYNC_MS)."""
-    from sensor_msgs.msg import Image
-    topics = ['/cam%d/image_raw' % c for c in cams]
-    r = _reader(bag, topics)
+    rec = _rec(bag)
     stamps = {c: [] for c in cams}
-    checked = set()
-    while r.has_next():
-        topic, data, _ = r.read_next()
-        c = int(topic[4])
-        ts = _fast_stamp(data)
-        if c not in checked:                       # validate fast path once per camera
-            m = deserialize_message(data, Image)
-            ref = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
-            assert abs(ref - ts) < 1e-9, 'CDR fast-parse mismatch'
-            checked.add(c)
+    # Stamps only -- images stay encoded here, so the timing gate never pays a
+    # JPEG decode for a recording it is only measuring the clock of.
+    for c, ts, _data in rec.images(cams):
         stamps[c].append(ts)
     out, ok = {}, True
     for c in cams:
@@ -170,23 +187,18 @@ def image_health_gate(bag, chain_yaml, cams=(0, 1, 2, 3), sub=IMAGE_SUB, max_fra
     """Track per-patch max-over-flight of the per-frame p99 |Sobel| gradient; a patch that never
     gets sharp marks a persistent optical defect. `inject(img, cam)->img` is a test hook."""
     import cv2
-    from sensor_msgs.msg import Image
     cal, _ = parse_chain(chain_yaml)
-    topics = ['/cam%d/image_raw' % c for c in cams]
-    r = _reader(bag, topics)
+    rec = _rec(bag)
     best, meta, cnt, done = {}, {}, {c: 0 for c in cams}, {c: 0 for c in cams}
-    while r.has_next():
-        topic, data, _ = r.read_next()
-        c = int(topic[4])
+    for c, _ts, data in rec.images(cams):
         cnt[c] += 1
         if cnt[c] % sub:
-            continue
+            continue                      # subsampled away -- never decoded
         if max_frames and done[c] >= max_frames:
             if all(done[k] >= max_frames for k in cams):
                 break
             continue
-        m = deserialize_message(data, Image)
-        img = np.frombuffer(m.data, np.uint8).reshape(m.height, m.width)
+        img = rec.decode(data)
         if inject is not None:
             img = inject(img, c)
         gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)

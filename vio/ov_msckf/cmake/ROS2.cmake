@@ -16,6 +16,22 @@ find_package(rosbag2_storage REQUIRED)
 find_package(ov_core REQUIRED)
 find_package(ov_init REQUIRED)
 
+# px4_msgs is OPTIONAL on purpose. On a swarm-nxt drone the estimator builds inside
+# ros2_swarmnxt_ws, so it is always present and BagSource deserializes the generated
+# SensorCombined type -- a px4_msgs definition change is then a compile error rather
+# than a silent misread. Elsewhere (a stereo rig, or replaying TUM-VI / EuRoC /
+# UZH-FPV, which this package documents support for) it is absent and the validated
+# CDR fallback in ov_core/utils/swarmnxt_msgs.h runs instead. Making it REQUIRED
+# would render the package unbuildable on every non-PX4 platform.
+find_package(px4_msgs QUIET)
+if (px4_msgs_FOUND)
+    message(STATUS "px4_msgs found — SensorCombined deserialized as a typed message")
+    add_definitions(-DOV_HAVE_PX4_MSGS)
+    list(APPEND ament_libraries px4_msgs)
+else ()
+    message(STATUS "px4_msgs NOT found — SensorCombined falls back to direct CDR parsing")
+endif ()
+
 # Describe ROS project
 option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" ON)
 if (NOT ENABLE_ROS)

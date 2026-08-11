@@ -32,8 +32,27 @@ for pkg in $PKGS; do
   ln -sfn "$VIO/$pkg" "$OV_WS/src/$pkg"
 done
 cd "$OV_WS"
+
+# Cap build parallelism by MEMORY, not by core count. An OpenVINS translation unit
+# pulls in Eigen and Ceres templates and peaks around 1.1 GB in cc1plus, so an
+# unbounded `make -j$(nproc)` sizes the build off cores it has and RAM it does not.
+# Measured failure: a 20-core / 15 GiB host asked for ~22 GB and the kernel
+# OOM-killed cc1plus mid-build. Jetsons are the same shape of trap (Orin NX: 8
+# cores, 16 GB shared with the GPU). Override with OV_BUILD_JOBS if you know better.
+if [ -z "${OV_BUILD_JOBS:-}" ]; then
+  _cores=$(nproc 2>/dev/null || echo 4)
+  # MemAvailable is what we can actually use without swapping; 1.5 GB per job.
+  _avail_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 4096)
+  _mem_jobs=$(( _avail_mb / 1500 ))
+  [ "$_mem_jobs" -lt 1 ] && _mem_jobs=1
+  OV_BUILD_JOBS=$(( _cores < _mem_jobs ? _cores : _mem_jobs ))
+fi
+echo "build_openvins.sh: building with $OV_BUILD_JOBS parallel compile jobs"
+export MAKEFLAGS="-j${OV_BUILD_JOBS}"
+
 # shellcheck disable=SC2086
 colcon build --packages-select $PKGS \
+    --parallel-workers "$OV_BUILD_JOBS" \
     --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 echo "OK. Estimator invocation goes through: $VIO/vio_deploy/scripts/run_serial.sh"
 echo "  bash run_serial.sh BAG CONFIG OUT_DIR [NCAM] [STEREO] [SEED] [DOMAIN]"

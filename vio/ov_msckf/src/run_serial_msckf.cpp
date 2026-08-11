@@ -1,15 +1,22 @@
 /*
  * Deterministic OFFLINE OpenVINS runner.
  *
- * Reads a rosbag2 (sqlite3) directly and feeds IMU + camera measurements into
+ * Reads a rosbag2 recording directly and feeds IMU + camera measurements into
  * VioManager *synchronously, in timestamp order, in the main thread*. There is
  * no rclcpp executor, no real-time bag playback, and no async update thread.
  * Given a fixed OV_RNG_SEED this produces bit-identical results across runs,
  * eliminating the message-timing / frame-dropping variance of the live
  * subscribe path (`ros2 bag play | run_subscribe_msckf`).
  *
+ * The recording is opened through BagSource (utils/bag_source.h), which merges
+ * one or more files into a single timestamp-ordered stream and auto-detects
+ * sqlite3 vs mcap. Its defaults are the study layout -- a single sqlite3 bag with
+ * /imu0 and /cam<N> as sensor_msgs/Imu and sensor_msgs/Image -- so an unmodified
+ * config behaves exactly as it always has. Topics, message types and a time
+ * window are config keys; see bag_source.h.
+ *
  * Usage:
- *   ros2 run ov_msckf run_serial_msckf <config.yaml> <bag_dir> <out_tum> \
+ *   ros2 run ov_msckf run_serial_msckf <config.yaml> <bag[,bag2...]> <out_tum> \
  *        --ros-args -p use_stereo:=true -p max_cameras:=4
  *
  * Output: TUM trajectory file (t x y z qx qy qz qw), one pose per camera frame,
@@ -17,6 +24,7 @@
  * the frame timestamp, gated by initialized() && (t - init_time) >= 1).
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -31,13 +39,10 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
-#include <rosbag2_cpp/reader.hpp>
-#include <rosbag2_storage/storage_options.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/imu.hpp>
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h" // pulls in ov_core::YamlParser + Printer
+#include "utils/bag_source.h"       // merged multi-file reader + deferred decode
 #include "utils/dataset_reader.h"   // pulls in ov_core::CameraData / ImuData
 #include "state/State.h"
 #include "state/Propagator.h"
@@ -109,22 +114,47 @@ int main(int argc, char **argv) {
   };
 
   // ---- bag reader ----
-  rosbag2_storage::StorageOptions storage_options;
-  storage_options.uri = bag_path;
-  storage_options.storage_id = "sqlite3";
-  rosbag2_cpp::ConverterOptions converter_options;
-  converter_options.input_serialization_format = "cdr";
-  converter_options.output_serialization_format = "cdr";
-  rosbag2_cpp::Reader reader;
-  reader.open(storage_options, converter_options);
+  // The recording may be split across several files (swarm-nxt records IMU and
+  // cameras separately), so bag_path accepts a comma-separated list of URIs.
+  BagSourceOptions bopt;
+  {
+    size_t start = 0;
+    while (start <= bag_path.size()) {
+      size_t comma = bag_path.find(',', start);
+      std::string uri = bag_path.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+      if (!uri.empty())
+        bopt.uris.push_back(uri);
+      if (comma == std::string::npos)
+        break;
+      start = comma + 1;
+    }
+  }
+  // Every key below defaults to the study layout, so an unmodified config reads a
+  // single sqlite3 bag of /imu0 + /cam<N> exactly as this runner always has.
+  parser->parse_config("imu_topic", bopt.imu_topic, false);
+  parser->parse_config("imu_msg_type", bopt.imu_msg_type, false);
+  parser->parse_config("cam_msg_type", bopt.cam_msg_type, false);
+  for (int i = 0; i < ncam; i++) {
+    std::string topic;
+    parser->parse_config("cam_topic" + std::to_string(i), topic, false);
+    if (!topic.empty())
+      bopt.cam_topics[topic] = i;
+  }
+  // Calibration only needs a static start plus ~10-15 s of motion, so trimming the
+  // window cuts every warm-start pass proportionally. Defaults take everything.
+  double t_start = 0.0, t_end = -1.0;
+  parser->parse_config("bag_t_start", t_start, false);
+  parser->parse_config("bag_t_end", t_end, false);
+  bopt.t_start = t_start;
+  if (t_end > 0.0)
+    bopt.t_end = t_end;
+  BagSource source(bopt);
 
-  rclcpp::Serialization<sensor_msgs::msg::Imu> imu_ser;
-  rclcpp::Serialization<sensor_msgs::msg::Image> img_ser;
-
-  // A fully-assembled camera frame: all images at one shared stamp.
+  // A fully-assembled camera frame. Payloads are still encoded here on purpose --
+  // see the decode note in feed_frame.
   struct Frame {
     double ts;
-    std::map<int, cv::Mat> imgs; // cam_id -> mono8 image
+    std::map<int, CamPayload> payloads; // cam_id -> undecoded image
   };
   std::map<double, Frame> pending; // keyed by stamp, sorted ascending
   double latest_imu_t = -1;
@@ -179,13 +209,6 @@ int main(int argc, char **argv) {
     std::fclose(cf);
   };
 
-  auto cam_id_from_topic = [](const std::string &t) -> int {
-    // "/cam3/image_raw" -> 3
-    auto p = t.find("cam");
-    if (p == std::string::npos) return -1;
-    return std::atoi(t.c_str() + p + 3);
-  };
-
   // track_frequency throttle (replicates ROS2Visualizer::callback_stereo lines
   // 554-558): per lead-camera, skip a frame whose timestamp is < last_tracked +
   // 1/track_frequency. With 30Hz cams and track_frequency=14.5 this tracks every
@@ -195,9 +218,12 @@ int main(int argc, char **argv) {
   const double track_dt = (params.track_frequency > 1e-6) ? 1.0 / params.track_frequency : 0.0;
 
   // Feed one assembled frame's measurements, then log the pose once.
+  //
+  // Ordering here is load-bearing for speed: the throttle runs BEFORE any decode.
+  // With track_frequency 29.0 against 30 Hz cameras roughly every other frame is
+  // discarded, and decoding first would spend a full JPEG decode per camera on
+  // frames that are then dropped. Only the groups that survive get decoded.
   auto feed_frame = [&](const Frame &fr) {
-    int rows = fr.imgs.begin()->second.rows;
-    int cols = fr.imgs.begin()->second.cols;
     bool fed_any = false;
     auto throttled = [&](int lead) {
       auto it = cam_last_track.find(lead);
@@ -205,31 +231,65 @@ int main(int argc, char **argv) {
       cam_last_track[lead] = fr.ts;
       return false;
     };
+
+    // 1. Which camera groups survive the throttle?
+    std::vector<std::vector<int>> groups;
     if (use_stereo && ncam % 2 == 0) {
       for (int p = 0; p < ncam / 2; p++) {
         int l = 2 * p, r = 2 * p + 1;
-        if (!fr.imgs.count(l) || !fr.imgs.count(r)) continue;
+        if (!fr.payloads.count(l) || !fr.payloads.count(r)) continue;
         if (throttled(l)) continue;
-        ov_core::CameraData msg;
-        msg.timestamp = fr.ts;
-        msg.sensor_ids = {l, r};
-        msg.images = {fr.imgs.at(l), fr.imgs.at(r)};
-        msg.masks = {get_mask(l, rows, cols), get_mask(r, rows, cols)};
-        sys->feed_measurement_camera(msg);
-        fed_any = true;
+        groups.push_back({l, r});
       }
     } else {
-      for (auto const &kv : fr.imgs) {
+      for (auto const &kv : fr.payloads) {
         int cid = kv.first;
         if (throttled(cid)) continue;
-        ov_core::CameraData msg;
-        msg.timestamp = fr.ts;
-        msg.sensor_ids = {cid};
-        msg.images = {kv.second};
-        msg.masks = {get_mask(cid, rows, cols)};
-        sys->feed_measurement_camera(msg);
-        fed_any = true;
+        groups.push_back({cid});
       }
+    }
+    if (groups.empty()) return;
+
+    // 2. Decode only what those groups need, concurrently. Each decode is an
+    //    independent pure function of its own payload, so this does not disturb
+    //    the bit-identical-across-runs property the serial runner exists for.
+    std::vector<int> need;
+    for (auto const &g : groups)
+      for (int c : g)
+        if (std::find(need.begin(), need.end(), c) == need.end())
+          need.push_back(c);
+    std::vector<cv::Mat> decoded(need.size());
+    cv::parallel_for_(cv::Range(0, (int)need.size()), [&](const cv::Range &rng) {
+      for (int i = rng.start; i < rng.end; i++)
+        decoded[i] = fr.payloads.at(need[i]).decode();
+    });
+    std::map<int, cv::Mat> imgs;
+    for (size_t i = 0; i < need.size(); i++) {
+      if (decoded[i].empty()) {
+        PRINT_WARNING(YELLOW "[serial]: cam%d frame at %.6f failed to decode; skipping\n" RESET, need[i], fr.ts);
+        continue;
+      }
+      imgs[need[i]] = decoded[i];
+    }
+    if (imgs.empty()) return;
+    const int rows = imgs.begin()->second.rows;
+    const int cols = imgs.begin()->second.cols;
+
+    // 3. Feed.
+    for (auto const &g : groups) {
+      bool complete = true;
+      for (int c : g)
+        if (!imgs.count(c)) complete = false;
+      if (!complete) continue;
+      ov_core::CameraData msg;
+      msg.timestamp = fr.ts;
+      for (int c : g) {
+        msg.sensor_ids.push_back(c);
+        msg.images.push_back(imgs.at(c));
+        msg.masks.push_back(get_mask(c, rows, cols));
+      }
+      sys->feed_measurement_camera(msg);
+      fed_any = true;
     }
     // Log the filtered IMU state directly at the update time. (We do NOT use
     // fast_state_propagate(state, fr.ts): with a negative cam-imu timeoffset the
@@ -263,41 +323,23 @@ int main(int argc, char **argv) {
   };
 
   size_t n_imu = 0, n_img = 0, n_frames = 0;
-  while (reader.has_next()) {
-    auto bag_msg = reader.read_next();
-    const std::string &topic = bag_msg->topic_name;
-    rclcpp::SerializedMessage extracted(*bag_msg->serialized_data);
+  for (;;) {
+    BagRecord rec = source.next();
+    if (rec.kind == BagRecord::NONE) break;
 
-    if (topic == "/imu0") {
-      sensor_msgs::msg::Imu m;
-      imu_ser.deserialize_message(&extracted, &m);
-      ov_core::ImuData imu;
-      imu.timestamp = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9;
-      imu.wm << m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z;
-      imu.am << m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z;
-      sys->feed_measurement_imu(imu);
-      latest_imu_t = imu.timestamp;
+    if (rec.kind == BagRecord::IMU) {
+      sys->feed_measurement_imu(rec.imu);
+      latest_imu_t = rec.imu.timestamp;
       n_imu++;
       flush_ready();
-    } else if (topic.rfind("/cam", 0) == 0) {
-      int cid = cam_id_from_topic(topic);
+    } else {
+      const int cid = rec.cam.cam_id;
       if (cid < 0 || cid >= ncam) continue; // ignore cams beyond max_cameras
-      sensor_msgs::msg::Image m;
-      img_ser.deserialize_message(&extracted, &m);
-      double ts = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9;
-      cv::Mat img;
-      if (m.encoding == "mono8") {
-        cv::Mat tmp(m.height, m.width, CV_8UC1, m.data.data(), m.step);
-        img = tmp.clone();
-      } else {
-        // robust fallback for other encodings
-        cv::Mat tmp(m.height, m.width, CV_8UC1, m.data.data(), m.step);
-        img = tmp.clone();
-      }
+      const double ts = rec.cam.ts;
       pending[ts].ts = ts;
-      pending[ts].imgs[cid] = img;
+      pending[ts].payloads[cid] = std::move(rec.cam);
       n_img++;
-      if ((int)pending[ts].imgs.size() == ncam) {
+      if ((int)pending[ts].payloads.size() == ncam) {
         n_frames++;
       }
     }

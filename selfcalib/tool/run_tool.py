@@ -20,6 +20,7 @@ import argparse, json, os, re, shutil, subprocess, sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bagio import Recording
 from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual
 from gates import static_start_gate, timing_gate
 from circlefit import accumulate, fit_centers, health_from_acc, radii_from_chain
@@ -102,13 +103,101 @@ def resolve_vio_root(explicit=None):
         '  Pass --vio-root or set $VIO_ROOT to the vio/ directory.' % (RUNNER, sibling))
 
 
+def _inject_layout(cfg_txt, rec):
+    """Append this recording's topic/type layout to an estimator config.
+
+    BOTH configs need it. The calibration config and the flight config are separate
+    files, and neither ships swarm-nxt topic names -- their defaults are the study
+    layout (/imu0 + /cam<N>, sensor_msgs). Omitting it does not error: the estimator
+    opens the bag, matches no topics, and exits 0 having written nothing
+    (imu=0 img=0 frames=0), which surfaces as a bare "no trajectory" failure.
+    """
+    if rec.imu_topic == '/imu0':
+        return cfg_txt      # already the study layout; nothing to say
+    lines = ['', '# --- recording layout (written by run_tool.py from the detected bag) ---',
+             'imu_topic: "%s"' % rec.imu_topic,
+             'imu_msg_type: "%s"' % rec.imu_type,
+             'cam_msg_type: "%s"' % rec.cam_type]
+    for ci in sorted(rec.cam_topics):
+        lines.append('cam_topic%d: "%s"' % (ci, rec.cam_topics[ci]))
+    return cfg_txt.rstrip('\n') + '\n' + '\n'.join(lines) + '\n'
+
+
+def _redirect_scratch(cfg_txt, dirpath):
+    """Point the estimator's four fixed scratch paths into this run's own directory.
+
+    They are inert while record_timing_information and save_total_state are false, but
+    they are absolute and fixed, so two concurrent runs on one machine would overwrite
+    each other's the moment either flag is enabled. --domain separates the DDS traffic;
+    nothing separated these.
+    """
+    for key, fname in (('record_timing_filepath', 'traj_timing.txt'),
+                       ('filepath_est', 'openvins_est.txt'),
+                       ('filepath_std', 'ov_estimate_std.txt'),
+                       ('filepath_gt', 'ov_groundtruth.txt')):
+        cfg_txt = re.sub(r'^(%s:\s*)"[^"]*"' % key,
+                         r'\1"%s"' % os.path.join(os.path.abspath(dirpath), fname),
+                         cfg_txt, flags=re.M)
+    return cfg_txt
+
+
+def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s):
+    """Run the published calibration under the FLIGHT config, exactly as it will be deployed.
+
+    This is what the ATE certificate must measure. The warm-start passes run the
+    CALIBRATION operating point -- loose priors, a still-moving calibration, and a
+    different set of estimator knobs (max_slam 0 vs 250, num_pts 2000 vs 3000,
+    track_frequency 29 vs 40, init_window_time 1.0 vs 3.0, chi2 1.0 vs 0.7) -- so
+    certifying one of them applies ATE_THR_M to a different quantity than the one it
+    was derived from. Measured across seven healthy runs the two differ by ~1.4x
+    (median 4.05 cm on the last calibration pass vs 2.57 cm flying the same chain).
+
+    NOTE ON "FROZEN": online calibration is NOT disabled here. The flight config keeps
+    calib_cam_extrinsics/intrinsics true; what makes it frozen in effect is
+    flight_stiffness.env, whose OV_PRIOR_* values tighten the calibration priors x0.10
+    so the states stay tethered to the published chain instead of random-walking.
+    Measured drift over a full flight is sub-pixel and sub-tenth-degree. Argument 5 of
+    run_serial.sh is use_stereo, not an online-calibration switch; 'false' here matches
+    the documented flight invocation.
+
+    Returns the trajectory path. Raises on any failure -- the caller degrades honestly.
+    """
+    cfgdir = os.path.join(vio_root, 'vio_deploy', 'config')
+    fcfg = os.path.join(cfgdir, 'estimator_flight.yaml')
+    fenv = os.path.join(cfgdir, 'flight_stiffness.env')
+    for p in (fcfg, fenv):
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
+    os.makedirs(outdir, exist_ok=True)
+    # The flight config resolves its chains by RELATIVE name, so they must sit beside the copy.
+    rec = Recording.open(a.bag)
+    open(f'{outdir}/estimator_flight.yaml', 'w').write(
+        _inject_layout(_redirect_scratch(open(fcfg).read(), outdir), rec))
+    shutil.copy(a.imu_chain, f'{outdir}/kalibr_imu_chain.yaml')
+    shutil.copy(published_chain, f'{outdir}/kalibr_imucam_chain.yaml')
+
+    env = dict(os.environ)
+    for line in open(fenv):
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            env[k.strip()] = v.strip()
+    bag_arg = ','.join(rec.uris)
+    cp = subprocess.run(['bash', run_serial, bag_arg, f'{outdir}/estimator_flight.yaml',
+                         f'{outdir}/out', str(ncam), 'false', '42', str(a.domain)],
+                        capture_output=True, timeout=timeout_s, env=env)
+    est = f'{outdir}/out/estimate_tum.txt'
+    if cp.returncode != 0 or not os.path.exists(est):
+        tail = (cp.stderr or b'').decode('utf-8', 'replace').strip().splitlines()[-2:]
+        raise RuntimeError('flight pass exit %d%s' % (cp.returncode, (': ' + ' | '.join(tail)) if tail else ''))
+    return est
+
+
 def bag_seconds(bag):
     """Recording duration in seconds; 0.0 if the metadata cannot be read."""
     try:
-        import rosbag2_py
-        m = rosbag2_py.Info().read_metadata(bag, 'sqlite3')
-        d = m.duration
-        return (d.nanoseconds if hasattr(d, 'nanoseconds') else float(d)) * 1e-9
+        from bagio import Recording
+        return Recording.open(bag).duration()
     except Exception:
         return 0.0
 
@@ -126,6 +215,11 @@ def main():
                     help='force this bag topic as ground truth instead of auto-picking')
     ap.add_argument('--no-gt-autodetect', action='store_true',
                     help='never look inside the bag for ground truth')
+    ap.add_argument('--calib-config', default=None,
+                    help="estimator config driving the WARM-START loop. Default 'flight': "
+                         'vio_deploy/config/estimator_flight.yaml with OV_PRIOR_* UNSET. Pass '
+                         "'fleet' for the study's configs/estimator_fleet.yaml, or a path. The ATE "
+                         'certificate is unaffected -- it always runs flight config + priors.')
     ap.add_argument('--fleet-exclude', default=None)
     ap.add_argument('--max-pass', type=int, default=8)
     ap.add_argument('--domain', type=int, default=70)
@@ -226,7 +320,27 @@ def main():
     # and save_total_state are false) but are fixed paths, so two concurrent calibrations on
     # one machine would overwrite each other's the moment either flag is enabled. --domain
     # separates the DDS traffic; nothing separated these.
-    cfg_txt = open(f'{OVR}/configs/estimator_fleet.yaml').read()
+    # DEFAULT: drive the warm-start loop with the FLIGHT config knobs, priors UNSET.
+    # The two operating points differ in the estimator internals (max_slam 250 vs 0,
+    # num_pts 3000 vs 2000, track_frequency 40 vs 29, chi2 0.7 vs 1.0,
+    # init_window_time 3.0 vs 1.0), and the calibration states stay mobile either way
+    # because OV_PRIOR_* is never exported here -- only frozen_pass() exports it.
+    # Pass --calib-config fleet to restore configs/estimator_fleet.yaml.
+    _calib_cfg = os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')
+    if a.calib_config == 'fleet':
+        _calib_cfg = f'{OVR}/configs/estimator_fleet.yaml'
+    elif a.calib_config and a.calib_config != 'flight':
+        _calib_cfg = a.calib_config
+    log('warm-start loop config: %s (OV_PRIOR_* unset)' % os.path.basename(_calib_cfg))
+    # Guard the documented footgun: flight priors leaking in from the caller's shell
+    # would pin the calibration at its seed, and it fails by reporting a suspiciously
+    # LOW self-consistency residual rather than by erroring.
+    _leaked = sorted(k for k in os.environ if k.startswith('OV_PRIOR'))
+    if _leaked:
+        log('WARNING: %s set in the environment — these tether the calibration to its seed. '
+            'Unsetting for the warm-start passes.' % ','.join(_leaked))
+    report['calib_config'] = _calib_cfg
+    cfg_txt = open(_calib_cfg).read()
     for key, fname in (('record_timing_filepath', 'traj_timing.txt'),
                        ('filepath_est', 'openvins_est.txt'),
                        ('filepath_std', 'ov_estimate_std.txt'),
@@ -235,6 +349,13 @@ def main():
         cfg_txt = re.sub(r'^(%s:\s*)"[^"]*"' % key,
                          r'\1"%s"' % os.path.join(os.path.abspath(rd), fname),
                          cfg_txt, flags=re.M)
+    # Tell the estimator how THIS recording is laid out. The shared config stays on
+    # the study defaults (one sqlite3 bag, /imu0 + /cam<N>); only the per-run copy
+    # names the fleet's topics and message types, and only when bagio detected them.
+    # Getting this wrong is silent -- the estimator would find no topics and produce
+    # no harvest -- so the values come from the same object the gates just read.
+    _rec = Recording.open(a.bag)
+    cfg_txt = _inject_layout(cfg_txt, _rec)
     open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
     shutil.copy(a.imu_chain, f'{rd}/kalibr_imu_chain.yaml')
     write_chain(a.template, seed, seed_toff, f'{rd}/kalibr_imucam_chain.yaml')
@@ -254,9 +375,12 @@ def main():
         if os.path.exists(cjp):
             os.remove(cjp)          # never mistake a previous pass's harvest for this one's
         try:
-            cp = subprocess.run(['bash', run_serial, a.bag,
+            # A fleet recording spans two files (IMU and cameras are recorded
+            # separately), so hand the estimator every URI bagio resolved.
+            _env = {k: v for k, v in os.environ.items() if not k.startswith('OV_PRIOR')}
+            cp = subprocess.run(['bash', run_serial, ','.join(_rec.uris),
                                  f'{rd}/estimator_config.yaml', f'{rd}/out', str(ncam), 'true',
-                                 '42', str(a.domain)], capture_output=True, timeout=timeout_s)
+                                 '42', str(a.domain)], capture_output=True, timeout=timeout_s, env=_env)
         except subprocess.TimeoutExpired:
             log('ERROR: estimator pass %d exceeded %.0f s and was killed. Raise --pass-timeout, '
                 'or shorten the recording.' % (p, timeout_s))
@@ -306,8 +430,25 @@ def main():
 
     # ---- 6. diagnosis ----
     est = os.path.join(a.out, 'estimate_pass%d.tum' % report['converged_at_pass'])
+    # Certify the trajectory the vehicle will actually fly, not the last calibration
+    # pass. Only meaningful with ground truth, and never silently substituted: if the
+    # flight pass fails, ate_source says so and the fallback reads WORSE, not better.
+    est_cert, cert_kind = est, 'calibration-pass'
+    if a.gt:
+        fd = os.path.join(a.out, 'deploy_check')
+        try:
+            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s)
+            cert_kind = 'frozen-deployment'
+            log('deployment check: flight config + flight_stiffness.env priors over the same recording')
+        except Exception as e:
+            rl = os.path.join(fd, 'out', 'run.log')
+            log('deployment check FAILED (%s: %s) — falling back to the calibration-pass '
+                'trajectory, which reads WORSE than deployment.%s'
+                % (type(e).__name__, e, (' See ' + rl) if os.path.exists(rl) else ''))
+            report['deploy_check_error'] = '%s: %s' % (type(e).__name__, e)
+    report['ate_source'] = cert_kind
     diag = diagnose(sessions=[harvests], circle_fit={str(c): centers[c] for c in centers},
-                    est_path=est if a.gt else None, gt_path=a.gt,
+                    est_path=est_cert if a.gt else None, gt_path=a.gt,
                     exclude=a.fleet_exclude, cam_end=a.cam_end)
     if not report['gate_timing']['pass'] and diag['verdict'].startswith('PLATFORM-DEFECT'):
         diag['verdict'] += ' [timing gate had flagged this recording — consistent]'
@@ -318,9 +459,19 @@ def main():
     # M is the constant body/mount rotation separating the start-anchored alignment from the
     # best-fit one. Solve it once per vehicle and reuse it via mount.apply() on later flights
     # to get an accurate UNALIGNED trajectory without fitting against ground truth each time.
-    if a.gt:
+    if a.gt and not diag['ate'].get('pass', False):
+        # A diverged trajectory still yields a confident rotation fit. Measured on a
+        # defective vehicle: yaw 51.23 deg, tilt 102.85 deg, residual 8446 m, written
+        # to mount.json and silently wrong for anything later calling mount.apply().
+        report['mount'] = {'skipped': 'ATE certificate failed — trajectory diverged, '
+                                      'a mount fitted to it would be meaningless'}
+        log('mount: skipped — the trajectory failed the ATE certificate, so there is no '
+            'trustworthy attitude to fit a mount to')
+    elif a.gt:
         try:
-            ms = mount.solve(est, a.gt, toff=toff_pub, cam_end=a.cam_end)
+            # Solve on the certified (flight-config) trajectory: M is applied to future
+            # flights, which run that config, so it must be measured under it.
+            ms = mount.solve(est_cert, a.gt, toff=toff_pub, cam_end=a.cam_end)
             mp = os.path.join(a.out, '%s_mount.json' % a.drone)
             write_json(ms, mp)
             report['mount'] = {k: v for k, v in ms.items() if k != 'M'}

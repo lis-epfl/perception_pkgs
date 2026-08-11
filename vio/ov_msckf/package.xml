@@ -49,6 +49,12 @@
     <depend condition="$ROS_VERSION == 2">image_transport</depend>
     <depend condition="$ROS_VERSION == 2">ov_core</depend>
     <depend condition="$ROS_VERSION == 2">ov_init</depend>
+    <!-- OPTIONAL. Present when the estimator is built inside ros2_swarmnxt_ws,
+         absent for a generic rig; find_package(px4_msgs QUIET) in cmake/ROS2.cmake
+         decides which SensorCombined path compiles. Declared exec_ rather than
+         depend so colcon orders the build correctly where it exists without making
+         it a hard requirement where it does not. -->
+    <exec_depend condition="$ROS_VERSION == 2">px4_msgs</exec_depend>
 
     <!-- System dependencies for both versions -->
     <depend>eigen</depend>

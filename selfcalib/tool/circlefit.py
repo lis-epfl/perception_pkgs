@@ -5,31 +5,25 @@ image, and the per-patch max-over-flight p99 |Sobel| gradient."""
 import os, sys
 import numpy as np
 import cv2
-import rosbag2_py
-from rclpy.serialization import deserialize_message
-from sensor_msgs.msg import Image
 from scipy.signal import fftconvolve
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gates import _reader, IMAGE_PATCH, IMAGE_GRAD_THR, IMAGE_DEAD_FRAC, THETA_MAX
+from gates import _rec, IMAGE_PATCH, IMAGE_GRAD_THR, IMAGE_DEAD_FRAC, THETA_MAX
 from chainio import kb4_radius
 
 
 def accumulate(bag, cams=(0, 1, 2, 3), sub=8, max_frames=None, inject=None):
-    r = _reader(bag, ['/cam%d/image_raw' % c for c in cams])
+    rec = _rec(bag)
     acc, prev, cnt = {}, {}, {c: 0 for c in cams}
-    while r.has_next():
-        topic, data, _ = r.read_next()
-        c = int(topic[4])
+    for c, _ts, data in rec.images(cams):
         cnt[c] += 1
         if cnt[c] % sub:
-            continue
+            continue                      # subsampled away -- never decoded
         if max_frames and c in acc and acc[c]['n'] >= max_frames:
             if all(k in acc and acc[k]['n'] >= max_frames for k in cams):
                 break
             continue
-        m = deserialize_message(data, Image)
-        g = np.frombuffer(m.data, np.uint8).reshape(m.height, m.width)
+        g = rec.decode(data)
         if inject is not None:
             g = inject(g, c)
         gf = g.astype(np.float32)

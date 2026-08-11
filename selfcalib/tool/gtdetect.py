@@ -14,8 +14,10 @@ CLI:
 """
 import argparse, importlib, os, sys
 import numpy as np
-import rosbag2_py
 from rclpy.serialization import deserialize_message
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bagio import Recording
 
 # ---------------------------------------------------------------- what counts as ground truth
 # type string -> (module, class) for deserialization; _pq() maps each to (position, orientation)
@@ -25,6 +27,11 @@ POSE_TYPES = {
     'geometry_msgs/msg/TransformStamped': ('geometry_msgs.msg', 'TransformStamped'),
     'nav_msgs/msg/Odometry': ('nav_msgs.msg', 'Odometry'),
     'tf2_msgs/msg/TFMessage': ('tf2_msgs.msg', 'TFMessage'),
+    # What a swarm-nxt drone actually records in a mocap volume. Unlike every type
+    # above it carries no std_msgs/Header -- the time is a bare `stamp` field and
+    # the pose sits under `rigid_body` -- so _stamp()/_pq() special-case it.
+    'optitrack_multiplexer_ros2_msgs/msg/RigidBodyStamped':
+        ('optitrack_multiplexer_ros2_msgs.msg', 'RigidBodyStamped'),
 }
 
 # Substrings that mark a topic as (not) a mocap stream. Scored, not absolute — a bag that
@@ -44,23 +51,40 @@ def _load(type_str):
     return getattr(importlib.import_module(mod), cls)
 
 
+def _rec(bag):
+    return bag if isinstance(bag, Recording) else Recording.open(bag)
+
+
+class _Reader:
+    """Adapts bagio's generator to the has_next()/read_next() shape used below."""
+
+    def __init__(self, rec, topic):
+        self._it = iter(rec.read_topic(topic))
+        self._head = next(self._it, None)
+
+    def has_next(self):
+        return self._head is not None
+
+    def read_next(self):
+        t_bag, data = self._head
+        self._head = next(self._it, None)
+        return None, data, t_bag
+
+
 def _reader(bag, topics=None):
-    r = rosbag2_py.SequentialReader()
-    r.open(rosbag2_py.StorageOptions(uri=bag, storage_id='sqlite3'), rosbag2_py.ConverterOptions('', ''))
-    if topics:
-        r.set_filter(rosbag2_py.StorageFilter(topics=topics))
-    return r
+    return _Reader(_rec(bag), topics[0])
 
 
 def _meta(bag):
-    m = rosbag2_py.Info().read_metadata(bag, 'sqlite3')
-    dur = m.duration.nanoseconds * 1e-9 if hasattr(m.duration, 'nanoseconds') else float(m.duration) * 1e-9
-    return {t.topic_metadata.name: {'type': t.topic_metadata.type, 'count': t.message_count}
-            for t in m.topics_with_message_count}, dur
+    rec = _rec(bag)
+    return rec.topics(), rec.duration()
 
 
 def _stamp(hdr):
     return hdr.stamp.sec + hdr.stamp.nanosec * 1e-9
+
+
+RIGID_BODY_TYPE = 'optitrack_multiplexer_ros2_msgs/msg/RigidBodyStamped'
 
 
 def _pq(msg, type_str):
@@ -73,9 +97,23 @@ def _pq(msg, type_str):
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
     elif type_str == 'geometry_msgs/msg/TransformStamped':
         p, q = msg.transform.translation, msg.transform.rotation
+    elif type_str == RIGID_BODY_TYPE:
+        # optitrack_wrapper_ros2_msgs has its own Point/Quaternion, and its
+        # quaternion fields are q_x..q_w rather than geometry_msgs' x..w.
+        p, q = msg.rigid_body.pose.position, msg.rigid_body.pose.orientation
+        return (p.x, p.y, p.z), (q.q_x, q.q_y, q.q_z, q.q_w)
     else:
         raise ValueError('not a single-pose type: ' + type_str)
     return (p.x, p.y, p.z), (q.x, q.y, q.z, q.w)
+
+
+def _tracked(msg, type_str):
+    """False for samples the tracker itself flags as invalid. An occluded rigid
+    body keeps publishing at full rate with a stale or zeroed pose, which would
+    otherwise enter the ATE fit as if it were a real measurement."""
+    if type_str == RIGID_BODY_TYPE:
+        return bool(msg.rigid_body.tracking_valid)
+    return True
 
 
 def _name_score(name, hint=None):
@@ -166,9 +204,10 @@ def extract(bag, topic, dst, type_str=None, child_frame=None, hint=None):
                                                       tr.transform.translation.z),
                                   (tr.transform.rotation.x, tr.transform.rotation.y,
                                    tr.transform.rotation.z, tr.transform.rotation.w)))
-        else:
+        elif _tracked(msg, type_str):
             p, q = _pq(msg, type_str)
-            items.append((_stamp(msg.header), p, q))
+            # RigidBodyStamped has no std_msgs/Header; its time is a bare `stamp`.
+            items.append((_stamp(msg if type_str == RIGID_BODY_TYPE else msg.header), p, q))
         for ts, p, q in items:
             # Header stamps are what share the clock with /imu0 and the images. A zero
             # header stamp means the publisher never filled it in; fall back to the bag's

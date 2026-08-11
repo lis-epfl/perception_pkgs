@@ -20,7 +20,13 @@ OV_WS="${OV_WS:-$HOME/ov_ws_vio}"
 # Fail loudly on a missing prerequisite. Sourcing a nonexistent setup.bash used to be
 # swallowed by >/dev/null, leaving `ros2 run` to fail with an unrelated message — or, worse,
 # to pick up a DIFFERENT ov_msckf from the ambient environment.
-[ -d "$BAG" ] || { echo "run_serial.sh: bag not found: $BAG" >&2; exit 66; }
+# BAG may be a comma-separated list of URIs: a swarm-nxt recording keeps IMU and
+# cameras in separate files. Each part must exist, either as a directory (rosbag2)
+# or as a file (a bare .mcap, e.g. cams/recording.mcap).
+IFS=',' read -r -a _BAG_PARTS <<< "$BAG"
+for _p in "${_BAG_PARTS[@]}"; do
+  [ -d "$_p" ] || [ -f "$_p" ] || { echo "run_serial.sh: bag not found: $_p" >&2; exit 66; }
+done
 [ -f "$CFG" ] || { echo "run_serial.sh: config not found: $CFG" >&2; exit 66; }
 [ -f /opt/ros/humble/setup.bash ] || { echo "run_serial.sh: ROS 2 Humble not found at /opt/ros/humble" >&2; exit 69; }
 if [ ! -f "$OV_WS/install/setup.bash" ]; then
