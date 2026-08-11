@@ -21,6 +21,8 @@
 
 #include "VioManager.h"
 
+#include <chrono>
+
 #include <cstdlib>   // std::exit, for the use_aruco guard below
 
 #include "feat/Feature.h"
@@ -48,6 +50,25 @@
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+// Wall-clock breakdown of feed_measurement_camera. record_timing_information covers
+// only frames where an EKF update fires (update_min_dt gates it), so it misses the
+// tracking done on every other frame -- on a fleet recording that was 285 of 451
+// frames and ~26 s of a 55 s pass. These buckets cover every call.
+namespace ov_msckf {
+std::map<std::string, double> g_vio_stage_secs;
+std::map<std::string, long> g_vio_stage_calls;
+} // namespace ov_msckf
+namespace {
+inline double _now() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct VScoped {
+  const char *k; double t0;
+  explicit VScoped(const char *key) : k(key), t0(_now()) {}
+  ~VScoped() { ov_msckf::g_vio_stage_secs[k] += _now() - t0; ov_msckf::g_vio_stage_calls[k] += 1; }
+};
+} // namespace
 
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
@@ -299,7 +320,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   maybe_refresh_fisheye_masks(message);
 
   // Perform our feature tracking!
-  trackFEATS->feed_new_camera(message);
+  { VScoped _s("KLT tracking"); trackFEATS->feed_new_camera(message); }
 
   // If the aruco tracker is available, the also pass to it
   // NOTE: binocular tracking for aruco doesn't make sense as we by default have the ids
@@ -315,7 +336,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
     // If the same state time, use the previous timestep decision
     if (state->_timestamp != message.timestamp) {
-      did_zupt_update = updaterZUPT->try_update(state, message.timestamp);
+      { VScoped _s("ZUPT try_update"); did_zupt_update = updaterZUPT->try_update(state, message.timestamp); }
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
@@ -359,6 +380,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 }
 
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
+  VScoped _sall("do_feature_propagate_update (all)");
 
   //===================================================================================
   // State propagation, and clone augmentation
@@ -376,7 +398,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
   if (state->_timestamp != message.timestamp) {
-    propagator->propagate_and_clone(state, message.timestamp);
+    { VScoped _s("propagate+clone"); propagator->propagate_and_clone(state, message.timestamp); }
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
@@ -521,7 +543,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Lets marginalize out all old SLAM features here
   // These are ones that where not successfully tracked into the current frame
   // We do *NOT* marginalize out our aruco tags landmarks
-  StateHelper::marginalize_slam(state);
+  { VScoped _s("marginalize_slam"); StateHelper::marginalize_slam(state); }
 
   // Separate our SLAM features into new ones, and old ones
   std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
@@ -566,7 +588,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
-  updaterMSCKF->update(state, featsup_MSCKF);
+  { VScoped _s("MSCKF update"); updaterMSCKF->update(state, featsup_MSCKF); }
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -582,13 +604,13 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
     // Do the update
-    updaterSLAM->update(state, featsup_TEMP);
+    { VScoped _s("SLAM update"); updaterSLAM->update(state, featsup_TEMP); }
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
     propagator->invalidate_cache();
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
-  updaterSLAM->delayed_init(state, feats_slam_DELAYED);
+  { VScoped _s("SLAM delayed_init"); updaterSLAM->delayed_init(state, feats_slam_DELAYED); }
   rT6 = boost::posix_time::microsec_clock::local_time();
 
   //===================================================================================
@@ -638,7 +660,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Finally marginalize the oldest clone if needed.
-  StateHelper::marginalize_old_clone(state);
+  { VScoped _s("marginalize_old_clone"); StateHelper::marginalize_old_clone(state); }
 
   rT7 = boost::posix_time::microsec_clock::local_time();
 

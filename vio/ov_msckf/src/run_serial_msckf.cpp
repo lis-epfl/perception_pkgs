@@ -401,6 +401,16 @@ int main(int argc, char **argv) {
   // + cam-imu timeoffset + biases. (Same writer used for the mid-run snapshots above.)
   { Scoped _s("write outputs"); write_calib(out_path + ".calib.json"); }
 
+  {
+    // VioManager's internal buckets, so the 80%+ spent inside feed_measurement_camera
+    // is broken down rather than reported as one number.
+    extern std::map<std::string, double> g_vio_stage_secs;
+    extern std::map<std::string, long> g_vio_stage_calls;
+    PRINT_INFO(GREEN "\n[vio-stage]: %-30s %8s %10s\n" RESET, "stage", "sec", "calls");
+    for (auto const &kv : g_vio_stage_secs)
+      PRINT_INFO(GREEN "[vio-stage]: %-30s %8.2f %10ld\n" RESET, kv.first.c_str(), kv.second,
+                 g_vio_stage_calls[kv.first]);
+  }
   SW.report(now_s() - _wall0);
   PRINT_INFO(GREEN "[serial]: done. imu=%zu img=%zu frames=%zu poses=%zu -> %s\n" RESET,
              n_imu, n_img, n_frames, lines.size(), out_path.c_str());
