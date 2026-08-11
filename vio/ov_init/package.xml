@@ -36,7 +36,6 @@
     <!-- System dependencies for both versions -->
     <depend>eigen</depend>
     <depend>libopencv-dev</depend>
-    <depend>libopencv-contrib-dev</depend>
     <depend>boost</depend>
     <depend>libceres-dev</depend>
 

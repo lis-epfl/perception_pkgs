@@ -37,7 +37,6 @@
 #include "cam/CamRadtan.h"
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
-#include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
 #include "utils/opencv_yaml_parse.h"

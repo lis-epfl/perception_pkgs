@@ -23,3 +23,25 @@ Deployment trim (after the code prune): ROS 1 support, the 8 test/simulation exe
 dataset benchmark scripts, and doc configs were removed at file level. The build produces
 exactly two binaries: run_serial_msckf (calibration) and run_subscribe_msckf (flight VIO).
 The package is ROS 2 (ament) only; CMakeLists fails clearly otherwise.
+
+TrackAruco (removed 2026-08-11)
+------------------------------
+ov_core/src/track/TrackAruco.{h,cpp} deleted; dropped from ov_core/cmake/ROS2.cmake;
+the include and the instantiation removed from ov_msckf VioManager.cpp; the stale
+include removed from ov_core/src/test_tracking.cpp; <depend>libopencv-contrib-dev</depend>
+removed from ov_core, ov_init and ov_msckf package.xml.
+
+Reason: TrackAruco was the ONLY thing in this fork that needed opencv2/aruco.hpp.
+OpenCV moved aruco out of contrib into objdetect in 4.7 with a different API, so that
+header does not exist on OpenCV >= 4.7. JetPack 6.2.1 (L4T R36.4.4) ships OpenCV 4.8.0
+and has no opencv2/aruco.hpp in any apt package; installing Ubuntu's
+libopencv-contrib-dev to obtain it conflicts with the NVIDIA libopencv-dev that
+cv_bridge, the OAK driver and depth estimation are all built against. The dependency
+therefore made the package unbuildable on the target platform.
+
+Neither operating point used it: use_aruco is false in both estimator_fleet.yaml and
+estimator_flight.yaml, and the instantiation was already guarded by that flag.
+
+The trackARUCO member is retained and permanently null. Every use of it was already
+null-guarded, so no other call site changed. A config setting use_aruco: true now
+exits with an explicit error rather than being silently ignored.

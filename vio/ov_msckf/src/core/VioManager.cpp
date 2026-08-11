@@ -21,10 +21,11 @@
 
 #include "VioManager.h"
 
+#include <cstdlib>   // std::exit, for the use_aruco guard below
+
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
-#include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
 #include "track/TrackSIM.h"
@@ -141,10 +142,22 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 
 
-  // Initialize our aruco tag extractor
+  // Aruco tag tracking was removed with the TrackAruco class. It was the only thing in
+  // this fork needing opencv2/aruco.hpp, which OpenCV moved out of contrib into
+  // objdetect in 4.7 with a different API. JetPack 6.2.1 (L4T R36.4.4) ships OpenCV
+  // 4.8.0 and has no opencv2/aruco.hpp at all; installing Ubuntu's
+  // libopencv-contrib-dev to get it conflicts with the NVIDIA libopencv-dev that
+  // cv_bridge, the OAK driver and depth estimation are all built against. Neither
+  // operating point uses it -- use_aruco is false in both configs -- so the dependency
+  // bought nothing and cost the drone build entirely.
+  //
+  // trackARUCO stays declared and permanently null. Every use of it is already
+  // null-guarded, so no other call site changes. Fail loudly rather than silently
+  // ignoring a config that asks for tracking it cannot do.
   if (params.use_aruco) {
-    trackARUCO = std::shared_ptr<TrackBase>(new TrackAruco(state->_cam_intrinsics_cameras, state->_options.max_aruco_features,
-                                                           params.use_stereo, params.histogram_method, params.downsize_aruco));
+    PRINT_ERROR(RED "use_aruco is true, but aruco tracking was removed from this fork.\n" RESET);
+    PRINT_ERROR(RED "  Set use_aruco: false in your config. See PRUNED.txt.\n" RESET);
+    std::exit(EXIT_FAILURE);
   }
 
   // Initialize our state propagator
