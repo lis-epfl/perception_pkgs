@@ -25,6 +25,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -49,7 +50,42 @@
 
 using namespace ov_msckf;
 
+// Coarse wall-clock accounting for the whole run. OpenVINS' own
+// record_timing_information covers only the frames where an EKF update fires
+// (update_min_dt gates it to 7.5 Hz while KLT tracks every frame), so it explains
+// well under half of a pass. These timers close the gap: every second between
+// process start and exit lands in exactly one bucket.
+namespace {
+struct Stopwatch {
+  std::map<std::string, double> total;
+  std::map<std::string, long> count;
+  void add(const std::string &k, double secs) { total[k] += secs; count[k] += 1; }
+  void report(double wall) const {
+    double acc = 0;
+    for (auto const &kv : total) acc += kv.second;
+    PRINT_INFO(GREEN "\n[timing]: %-26s %8s %10s %9s\n" RESET, "stage", "sec", "calls", "share");
+    for (auto const &kv : total)
+      PRINT_INFO(GREEN "[timing]: %-26s %8.2f %10ld %8.1f%%\n" RESET, kv.first.c_str(), kv.second,
+                 count.at(kv.first), 100.0 * kv.second / wall);
+    PRINT_INFO(GREEN "[timing]: %-26s %8.2f %10s %8.1f%%\n" RESET, "-- accounted --", acc, "", 100.0 * acc / wall);
+    PRINT_INFO(GREEN "[timing]: %-26s %8.2f %10s %8.1f%%\n" RESET, "-- unaccounted --", wall - acc, "",
+               100.0 * (wall - acc) / wall);
+    PRINT_INFO(GREEN "[timing]: %-26s %8.2f\n" RESET, "WALL", wall);
+  }
+};
+Stopwatch SW;
+inline double now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct Scoped {
+  const char *k; double t0;
+  explicit Scoped(const char *key) : k(key), t0(now_s()) {}
+  ~Scoped() { SW.add(k, now_s() - t0); }
+};
+} // namespace
+
 int main(int argc, char **argv) {
+  const double _wall0 = now_s();
 
   // Deterministic OpenCV RNG (findFundamentalMat RANSAC in TrackKLT). OV_RNG_SEED overrides.
   {
@@ -260,10 +296,12 @@ int main(int argc, char **argv) {
         if (std::find(need.begin(), need.end(), c) == need.end())
           need.push_back(c);
     std::vector<cv::Mat> decoded(need.size());
+    const double _tdec = now_s();
     cv::parallel_for_(cv::Range(0, (int)need.size()), [&](const cv::Range &rng) {
       for (int i = rng.start; i < rng.end; i++)
         decoded[i] = fr.payloads.at(need[i]).decode();
     });
+    SW.add("  jpeg decode", now_s() - _tdec);
     std::map<int, cv::Mat> imgs;
     for (size_t i = 0; i < need.size(); i++) {
       if (decoded[i].empty()) {
@@ -287,9 +325,9 @@ int main(int argc, char **argv) {
       for (int c : g) {
         msg.sensor_ids.push_back(c);
         msg.images.push_back(imgs.at(c));
-        msg.masks.push_back(get_mask(c, rows, cols));
+        { Scoped _s("  build mask"); msg.masks.push_back(get_mask(c, rows, cols)); }
       }
-      sys->feed_measurement_camera(msg);
+      { Scoped _s("  feed_measurement_camera"); sys->feed_measurement_camera(msg); }
       fed_any = true;
     }
     // Log the filtered IMU state directly at the update time. (We do NOT use
@@ -323,16 +361,20 @@ int main(int argc, char **argv) {
     }
   };
 
+  SW.add("setup+config+masks", now_s() - _wall0);
+
   size_t n_imu = 0, n_img = 0, n_frames = 0;
   for (;;) {
+    double _t = now_s();
     BagRecord rec = source.next();
+    SW.add("bag read+deserialize", now_s() - _t);
     if (rec.kind == BagRecord::NONE) break;
 
     if (rec.kind == BagRecord::IMU) {
-      sys->feed_measurement_imu(rec.imu);
+      { Scoped _s("feed imu"); sys->feed_measurement_imu(rec.imu); }
       latest_imu_t = rec.imu.timestamp;
       n_imu++;
-      flush_ready();
+      { Scoped _s("flush->feed_frame"); flush_ready(); }
     } else {
       const int cid = rec.cam.cam_id;
       if (cid < 0 || cid >= ncam) continue; // ignore cams beyond max_cameras
@@ -347,7 +389,7 @@ int main(int argc, char **argv) {
   }
   // EOF: flush whatever remains (IMU stream ended).
   latest_imu_t = std::numeric_limits<double>::infinity();
-  flush_ready();
+  { Scoped _s("flush->feed_frame"); flush_ready(); }
 
   // Write TUM
   FILE *f = std::fopen(out_path.c_str(), "w");
@@ -357,8 +399,9 @@ int main(int argc, char **argv) {
 
   // Dump OV's CONVERGED calibration: per-cam intrinsics + body_P_cam extrinsic (R_CtoI, p_CinI)
   // + cam-imu timeoffset + biases. (Same writer used for the mid-run snapshots above.)
-  write_calib(out_path + ".calib.json");
+  { Scoped _s("write outputs"); write_calib(out_path + ".calib.json"); }
 
+  SW.report(now_s() - _wall0);
   PRINT_INFO(GREEN "[serial]: done. imu=%zu img=%zu frames=%zu poses=%zu -> %s\n" RESET,
              n_imu, n_img, n_frames, lines.size(), out_path.c_str());
   rclcpp::shutdown();
