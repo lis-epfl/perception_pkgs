@@ -103,6 +103,25 @@ def resolve_vio_root(explicit=None):
         '  Pass --vio-root or set $VIO_ROOT to the vio/ directory.' % (RUNNER, sibling))
 
 
+def _override_track_frequency(cfg_txt, hz):
+    """Rewrite track_frequency in a config copy. The warm-start loop and flight want
+    different rates -- flight tracks every frame for low-latency state estimation,
+    calibration wants parallax -- and they share one file, so the loop overrides it here
+    rather than the file carrying a value that is wrong for one of its two consumers."""
+    if not hz:
+        return cfg_txt
+    out, seen = [], False
+    for line in cfg_txt.splitlines():
+        if line.startswith('track_frequency:'):
+            out.append('track_frequency: %.1f   # overridden by run_tool --track-frequency' % hz)
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        out.append('track_frequency: %.1f' % hz)
+    return '\n'.join(out) + '\n'
+
+
 def _inject_window(cfg_txt, window):
     """Append the read-time trim. Must go into every config the estimator is given, or
     the calibration and its certificate would be measured over different data."""
@@ -239,6 +258,17 @@ def main():
                          '~10-15 s of motion, so a long recording costs passes it does not '
                          'need. Applied to BOTH the warm-start passes and the frozen '
                          'deployment pass, so the certificate measures the same data.')
+    ap.add_argument('--track-frequency', type=float, default=15.0,
+                    help='KLT tracking rate for the WARM-START passes only, overriding the '
+                         'loop config. Default 15: the cameras run at 30 Hz and the throttle '
+                         'skips a frame whose stamp is < last + 1/freq, so this tracks every '
+                         '3rd frame and doubles the parallax baseline -- which the study notes '
+                         'is "the dominant accuracy lever". Measured on an Orin NX it halves a '
+                         'pass (54.7 -> 29.1 s) with ATE unchanged (0.0166 -> 0.0168 m) and the '
+                         'best self-consistency of any setting tried (0.0138). NOT applied to '
+                         'the --frozen-check pass, which must run true flight settings. Only '
+                         'divisors of the frame rate do anything: 30/15/10/7.5 -- 20 and 29 both '
+                         'round to the same every-other-frame pattern.')
     ap.add_argument('--frozen-check', action='store_true',
                     help='certify the ATE on a dedicated extra pass that runs the published '
                          'chain under the FLIGHT config plus flight_stiffness.env, instead of '
@@ -388,7 +418,8 @@ def main():
     # Getting this wrong is silent -- the estimator would find no topics and produce
     # no harvest -- so the values come from the same object the gates just read.
     _rec = _wrec
-    cfg_txt = _inject_window(_inject_layout(cfg_txt, _rec), a.window)
+    cfg_txt = _override_track_frequency(
+        _inject_window(_inject_layout(cfg_txt, _rec), a.window), a.track_frequency)
     open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
     shutil.copy(a.imu_chain, f'{rd}/kalibr_imu_chain.yaml')
     write_chain(a.template, seed, seed_toff, f'{rd}/kalibr_imucam_chain.yaml')
