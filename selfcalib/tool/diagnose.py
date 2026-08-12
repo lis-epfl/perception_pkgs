@@ -23,6 +23,14 @@ from evalate import ate_metrics
 OVR = os.environ.get('SCT_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # thresholds
 SC_THR = 0.10            # self-consistency residual (well inside the τ=0.30 criterion)
+# Settling threshold, used INSTEAD of self-consistency when the recording carries no
+# ground truth. Same metric and weights as SC_THR, so the two are directly comparable
+# -- this is 5x stricter. Measured across window lengths 10/15/20/30/45/full on fleet
+# hardware, the last-5 settling residual of a HEALTHY run was 0.0001-0.0089; 0.02 is
+# just over 2x that worst case. Note the worst case was the 15 s window, a 6x outlier
+# against its neighbours, so a threshold set from any single window would be wrong.
+SETTLE_THR = 0.02
+SETTLE_K = 5             # snapshots at the tail of the series that must agree
 DIST_FOCAL_PCT = 2.0     # |focal - fleet lens batch| — batch agrees to ~0.9% of tolerance (~0.5% abs)
 DIST_K1 = 0.06           # |k1 - fleet| — batch spread ~0.02
 DIST_CXCY_PX = 120.0     # |c - own circle fit| — healthy fit error is 1-19 px fleet-wide (thr ≈6× worst healthy; docs/VALIDATION_MATRIX.md)
@@ -96,6 +104,58 @@ def cert_self_consistency(sessions):
     return {'pass': bool(worst < SC_THR), 'worst_resid': worst, **details}
 
 
+def cert_settled(series_path, k=SETTLE_K):
+    """Did the online calibration stop moving WITHIN one pass?
+
+    Reads <estimate>.calib_series.jsonl (written when calib_series_dt > 0) and measures
+    the residual of each of the last k snapshots against their own median. Used only
+    when there is no ground truth: with no ATE to compute there is no reason to run a
+    second pass purely to compare harvests, and settling is the stronger evidence
+    anyway -- self-consistency compares two END-of-run values and so cannot tell
+    "converged" from "never moved". This fleet produced exactly that failure: a run
+    pinned at its seed reported resid 0.0187 while its trajectory was 14 km out.
+
+    A pinned run also settles trivially, so this is NOT sufficient alone -- it is
+    paired with the in-distribution certificate, which a pinned run fails by sitting
+    exactly on the fleet mean it was seeded from.
+    """
+    if not series_path or not os.path.isfile(series_path):
+        return {'pass': False, 'reason': 'no calibration series (set calib_series_dt > 0)'}
+    rows = []
+    for line in open(series_path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass          # a partial final line if the run was killed mid-write
+    if len(rows) < k:
+        return {'pass': False, 'n': len(rows),
+                'reason': 'only %d snapshots, need %d — lower calib_series_dt or use a '
+                          'longer window' % (len(rows), k)}
+    last = [r['calib'] for r in rows[-k:]]
+    cams_list = [cams_from_caljson(c) for c in last]
+    ref = {}
+    for c in cams_list[0]:
+        M = np.mean([np.asarray(x[c]['R']) for x in cams_list], axis=0)
+        U, _, Vt = np.linalg.svd(M)
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            R = U @ np.diag([1, 1, -1]) @ Vt
+        ref[c] = {'f': np.median([np.asarray(x[c]['f']) for x in cams_list], axis=0),
+                  'k': np.median([np.asarray(x[c]['k']) for x in cams_list], axis=0),
+                  'p': np.median([np.asarray(x[c]['p']) for x in cams_list], axis=0),
+                  'R': R}
+    resid = [calib_residual(x, ref) for x in cams_list]
+    toffs = np.array([c['toff'] for c in last])
+    worst = float(max(resid))
+    return {'pass': bool(worst < SETTLE_THR), 'worst_resid': round(worst, 5),
+            'mean_resid': round(float(np.mean(resid)), 5), 'n': len(rows), 'k': k,
+            'toff_spread_ms': round(float(toffs.max() - toffs.min()) * 1000, 4),
+            'span_s': round(rows[-1]['t'] - rows[-k]['t'], 2)}
+
+
 def cert_in_distribution(cams, toff, circle_fit=None, exclude=None):
     fs = fleet_stats(exclude)
     fails, checks = [], {}
@@ -147,8 +207,17 @@ def verdict(sc, dist, ate):
     return 'HEALTHY: deploy'
 
 
-def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=None, cam_end=None):
-    sc = cert_self_consistency(sessions)
+def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=None, cam_end=None,
+             settle_path=None):
+    # With ground truth the run does multiple passes anyway (the ATE certificate needs a
+    # trajectory), so self-consistency is free. Without it, a second pass exists ONLY to
+    # compare harvests -- so measure settling inside the one pass instead.
+    if gt_path is None and settle_path is not None:
+        sc = cert_settled(settle_path)
+        sc['source'] = 'within-pass settling'
+    else:
+        sc = cert_self_consistency(sessions)
+        sc['source'] = 'between-pass self-consistency'
     cams, toff = _load(sessions[-1][-1])
     dist = cert_in_distribution(cams, toff, circle_fit, exclude)
     ate = cert_ate(est_path, gt_path, toff, cam_end) if est_path and gt_path else {'pass': True, 'skipped': True}

@@ -25,7 +25,7 @@ from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual
 from gates import static_start_gate, timing_gate
 from circlefit import accumulate, fit_centers, health_from_acc, radii_from_chain
 from publish import robust_mean, chordal_mean
-from diagnose import fleet_stats, diagnose
+from diagnose import fleet_stats, diagnose, cert_settled
 import gtdetect
 import mount
 
@@ -466,6 +466,26 @@ def main():
         shutil.copy(f'{rd}/out/estimate_tum.txt.calib.json', hp)
         shutil.copy(f'{rd}/out/estimate_tum.txt', os.path.join(a.out, 'estimate_pass%d.tum' % p))
         harvests.append(hp)
+        sp = f'{rd}/out/estimate_tum.txt.calib_series.jsonl'
+        series_path = os.path.join(a.out, 'calib_series_pass%d.jsonl' % p)
+        if os.path.exists(sp):
+            shutil.copy(sp, series_path)
+        else:
+            series_path = None
+
+        # No ground truth means no ATE certificate, so a second pass would exist only to
+        # compare harvests. Settling inside THIS pass answers the same question and is
+        # the stronger test, so stop here when it holds.
+        if a.gt is None and series_path:
+            st = cert_settled(series_path)
+            if st.get('pass'):
+                log('  settled within pass %d: worst resid %.5f over the last %d snapshots '
+                    '(no ground truth, so no second pass is needed)' % (p, st['worst_resid'], st['k']))
+                report['converged_at_pass'] = p
+                report['settle'] = st
+                break
+            log('  not settled yet in pass %d (%s)'
+                % (p, st.get('reason') or 'worst resid %.5f' % st.get('worst_resid', float('nan'))))
         cams = cams_from_caljson(cj)
         if prev is not None:
             r = calib_residual(cams, prev[0])
@@ -523,7 +543,11 @@ def main():
     report['ate_source'] = cert_kind
     diag = diagnose(sessions=[harvests], circle_fit={str(c): centers[c] for c in centers},
                     est_path=est_cert if a.gt else None, gt_path=a.gt,
-                    exclude=a.fleet_exclude, cam_end=a.cam_end)
+                    exclude=a.fleet_exclude, cam_end=a.cam_end,
+                    settle_path=os.path.join(a.out, 'calib_series_pass%d.jsonl'
+                                             % report['converged_at_pass'])
+                    if os.path.isfile(os.path.join(a.out, 'calib_series_pass%d.jsonl'
+                                                   % report['converged_at_pass'])) else None)
     if not report['gate_timing']['pass'] and diag['verdict'].startswith('PLATFORM-DEFECT'):
         diag['verdict'] += ' [timing gate had flagged this recording — consistent]'
     report['diagnosis'] = diag

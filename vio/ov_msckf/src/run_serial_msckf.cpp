@@ -247,13 +247,14 @@ int main(int argc, char **argv) {
         tg(0),tg(1),tg(2),tg(3),tg(4),tg(5),tg(6),tg(7),tg(8),
         qg(0),qg(1),qg(2),qg(3), qa(0),qa(1),qa(2),qa(3));
     }
-    std::fprintf(cf, "}\n");
+    std::fprintf(cf, "}");   // no newline: the series wraps this in an outer object
   };
 
   auto write_calib = [&](const std::string &path) {
     FILE *cf = std::fopen(path.c_str(), "w");
     if (!cf) return;
     write_calib_to(cf);
+    std::fprintf(cf, "\n");
     std::fclose(cf);
   };
 
@@ -384,6 +385,7 @@ int main(int argc, char **argv) {
         if (ts >= series_next) {
           std::fprintf(series, "{\"t\":%.6f,\"calib\":", ts);
           write_calib_to(series);
+          std::fprintf(series, "}\n");   // closes the {"t":..,"calib":..} wrapper
           series_next = ts + series_dt;
         }
       }
