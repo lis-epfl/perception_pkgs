@@ -26,16 +26,22 @@ SC_THR = 0.10            # self-consistency residual (well inside the τ=0.30 cr
 # Settling threshold. Same metric and weights as SC_THR, so the two are directly
 # comparable -- this is 3x stricter.
 #
-# Calibrated on 20 settled runs over 11 recordings, 4 vehicles (nxt1/3/6/10) and 3
-# dates, at windows 20 and 30 s: healthy last-5 residuals spanned 0.00126-0.01614, so
-# 2x the worst case is 0.032. An earlier 0.02 came from a single vehicle whose worst
-# was 0.0089 and left only 1.24x margin against the fleet -- healthy runs at 0.016 were
-# one bad recording away from a false FLY-AGAIN.
+# Set from BOTH sides of the decision, which is what a gate threshold has to separate:
+#   healthy   0.00126-0.01614  (20 settled runs, 11 recordings, 4 vehicles, 3 dates,
+#                               windows 20 and 30 s -- all 20 pass at 0.02)
+#   unsettled 0.02455          (nxt11 w15 pass 1, which genuinely needed another pass)
+# 0.02 lies between them and classifies every observed case correctly. The usual
+# "2x worst healthy" rule would give 0.032 and swallow the 0.02455 case, so that rule
+# does NOT apply here -- the positive class is close enough to constrain the ceiling.
 #
-# The 20 s window drives the worst case. In 9 of 10 paired recordings a 30 s window
-# settled TIGHTER (e.g. nxt1 06-22: 0.01582 at 20 s vs 0.00148 at 30 s), and every
-# 30 s run converged in one pass while two 20 s runs needed a second.
-SETTLE_THR = 0.032
+# The two classes are only 1.5x apart, so this separates what has been observed and no
+# more. More unsettled examples would tighten it; treat a value in 0.016-0.025 as
+# genuinely uncertain rather than as a clean pass or fail.
+#
+# The 20 s window drives the healthy worst case. In 9 of 10 paired recordings a 30 s
+# window settled TIGHTER (e.g. nxt1 06-22: 0.01582 at 20 s vs 0.00148 at 30 s), and
+# every 30 s run converged in one pass while two 20 s runs needed a second.
+SETTLE_THR = 0.02
 SETTLE_K = 5             # snapshots at the tail of the series that must agree
 DIST_FOCAL_PCT = 2.0     # |focal - fleet lens batch| — batch agrees to ~0.9% of tolerance (~0.5% abs)
 DIST_K1 = 0.06           # |k1 - fleet| — batch spread ~0.02
