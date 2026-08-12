@@ -5,7 +5,7 @@ warm-start self-calibration to self-consistency → robust-mean publish → diag
 Usage:
   python3 run_tool.py --drone nxt3 --bag bags/nxt3_raw_4cam_basin \
       --template cal/nxt3/theta_star.yaml --imu-chain cal/nxt3/kalibr_imu_chain.yaml \
-      --out tool/e2e_nxt3 [--gt bags/nxt3_gt.tum] [--fleet-exclude nxt3] [--max-pass 8] [--domain 70]
+      --out tool/e2e_nxt3 [--gt bags/nxt3_gt.tum] [--fleet-exclude nxt3] [--max-pass 6] [--domain 70]
 The template chain provides the yaml skeleton + mount-position extrinsics source when
 --fleet-exclude derives fleet means (leave-one-out); the seed never uses the template's own
 intrinsics beyond the file structure.
@@ -250,7 +250,8 @@ def main():
                          "'flight' for the untouched flight operating point, or a path. The ATE "
                          'certificate is unaffected -- it always runs flight config + priors.')
     ap.add_argument('--fleet-exclude', default=None)
-    ap.add_argument('--max-pass', type=int, default=8)
+    ap.add_argument('--max-pass', type=int, default=6,
+                    help='cap on estimator passes. With --gt the loop needs at least two: one to settle and one warm-started from it to certify the ATE.')
     ap.add_argument('--domain', type=int, default=70)
     ap.add_argument('--window', type=float, default=None,
                     help='seconds of the recording to use, measured from the instant every '
@@ -488,20 +489,10 @@ def main():
         # moving early on. So run exactly one more, warm-started from the settled harvest:
         # that pass is a valid ATE trajectory AND gives self-consistency against its parent,
         # which is why no separate frozen pass is needed.
-        if st is not None and st.get('pass'):
-            if a.gt is None:
-                log('  settled within pass %d (no ground truth, so no second pass is needed)' % p)
-                report['converged_at_pass'] = p
-                report['settle'] = st
-                break
-            if settled_at is None:
-                settled_at = p
-                log('  settled within pass %d — running one more from it to certify the ATE' % p)
-            elif p > settled_at:
-                report['converged_at_pass'] = p
-                report['settle'] = st
-                break
+        # Computed BEFORE any break so it is logged for the final pass too -- that is the
+        # pass the certificates are read from, so it is the one worth seeing.
         cams = cams_from_caljson(cj)
+        legacy_stop = False
         if prev is not None:
             r = calib_residual(cams, prev[0])
             dtd = abs(cj['toff'] - prev[1]) * 1000
@@ -509,20 +500,39 @@ def main():
             # Legacy stop, and only a fallback for runs with no calibration series: two
             # agreeing endpoints do not imply either pass was settled, so where settling
             # IS measurable it decides when to stop and this must not preempt it.
-            if r < SC_STOP and dtd < TD_STOP_MS and st is None:
+            legacy_stop = r < SC_STOP and dtd < TD_STOP_MS and st is None
+        if st is not None and st.get('pass'):
+            if settled_at is None:
+                settled_at = p
+                if a.gt is not None:
+                    log('  settled within pass %d — running one more from it to certify the ATE' % p)
+            if a.gt is None:
+                log('  settled within pass %d (no ground truth, so no second pass is needed)' % p)
                 report['converged_at_pass'] = p
                 break
+            if p > settled_at:
+                report['converged_at_pass'] = p
+                break
+        if legacy_stop:
+            report['converged_at_pass'] = p
+            break
         prev = (cams, cj['toff'])
         write_chain(f'{rd}/kalibr_imucam_chain.yaml', cams, cj['toff'], f'{rd}/kalibr_imucam_chain.yaml')
     report['passes_run'] = len(harvests)
-    if 'converged_at_pass' not in report:
-        report['verdict'] = 'FLY-AGAIN: never self-consistent within %d passes' % a.max_pass
-        write_json(report, os.path.join(a.out, 'report.json'))
-        log(report['verdict'])
-        return 2
+    # Falling through without converging used to return here with a bare verdict and no
+    # certificates -- on exactly the drone that most needs triage. Carry on to the
+    # diagnosis using the last pass, and force the verdict afterwards.
+    never = 'converged_at_pass' not in report
+    report['never_converged'] = never
+    if never:
+        report['converged_at_pass'] = len(harvests)
+        log('no pass converged within %d passes — diagnosing the last one for triage' % a.max_pass)
 
     # ---- 5. publish robust mean of the settled harvests ----
-    srcs = harvests[-min(3, len(harvests)):]
+    # Only harvests from the settled pass onward: averaging in a pass we measured as
+    # still moving would put the values we certified back next to ones we did not.
+    settled_srcs = harvests[settled_at - 1:] if settled_at else harvests
+    srcs = settled_srcs[-min(3, len(settled_srcs)):]
     cams_pub, toff_pub = robust_mean(srcs)
     pub = os.path.join(a.out, '%s_published_chain.yaml' % a.drone)
     write_chain(a.template, cams_pub, toff_pub, pub)
@@ -578,13 +588,22 @@ def main():
                 % (type(e).__name__, e, (' See ' + rl) if os.path.exists(rl) else ''))
             report['deploy_check_error'] = '%s: %s' % (type(e).__name__, e)
     report['ate_source'] = cert_kind
-    diag = diagnose(sessions=[harvests], circle_fit={str(c): centers[c] for c in centers},
+    # Same reasoning as the published mean: comparing a settled harvest against one that
+    # was still moving measures the convergence, not the agreement.
+    sc_sessions = settled_srcs if len(settled_srcs) > 1 else harvests
+    diag = diagnose(sessions=[sc_sessions], circle_fit={str(c): centers[c] for c in centers},
                     est_path=est_cert if a.gt else None, gt_path=a.gt,
                     exclude=a.fleet_exclude, cam_end=a.cam_end, settle_path=series_final)
     if not report['gate_timing']['pass'] and diag['verdict'].startswith('PLATFORM-DEFECT'):
         diag['verdict'] += ' [timing gate had flagged this recording — consistent]'
     report['diagnosis'] = diag
     report['verdict'] = diag['verdict']
+    if never:
+        # The certificates above describe the last pass and are kept for triage, but the
+        # run never reached a fixed point, so nothing here is deployable.
+        report['verdict'] = ('FLY-AGAIN: no pass settled within %d passes — the certificates '
+                             'below describe the last pass only [%s]'
+                             % (a.max_pass, diag['verdict']))
 
     # ---- 7. mount solve (§6.2) — needs ground truth, so it is opportunistic ----
     # M is the constant body/mount rotation separating the start-anchored alignment from the
@@ -618,7 +637,9 @@ def main():
     write_json(report, os.path.join(a.out, 'report.json'))
     log('ATE: %s' % json.dumps(diag['ate']))
     log('VERDICT: ' + report['verdict'])
-    return 0
+    # Running the diagnosis for triage must not turn a non-deployable run into a success:
+    # the caller (ansible) reads the exit code, so this keeps the pre-triage rc 2.
+    return 2 if never else 0
 
 
 if __name__ == '__main__':

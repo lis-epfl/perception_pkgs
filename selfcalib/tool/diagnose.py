@@ -108,10 +108,11 @@ def cert_settled(series_path, k=SETTLE_K):
     """Did the online calibration stop moving WITHIN one pass?
 
     Reads <estimate>.calib_series.jsonl (written when calib_series_dt > 0) and measures
-    the residual of each of the last k snapshots against their own median. Used only
-    when there is no ground truth: with no ATE to compute there is no reason to run a
-    second pass purely to compare harvests, and settling is the stronger evidence
-    anyway -- self-consistency compares two END-of-run values and so cannot tell
+    the residual of each of the last k snapshots against their own median. Runs on every
+    pass. Without ground truth it REPLACES self-consistency and ends the loop; with it,
+    it decides which pass the ATE may be measured on and gates the verdict alongside it.
+    Either way it is the stronger evidence -- self-consistency compares two END-of-run
+    values and so cannot tell
     "converged" from "never moved". This fleet produced exactly that failure: a run
     pinned at its seed reported resid 0.0187 while its trajectory was 14 km out.
 
@@ -121,7 +122,7 @@ def cert_settled(series_path, k=SETTLE_K):
     """
     if not series_path or not os.path.isfile(series_path):
         return {'pass': False, 'reason': 'no calibration series (set calib_series_dt > 0)'}
-    rows = []
+    rows, bad = [], 0
     for line in open(series_path):
         line = line.strip()
         if not line:
@@ -129,7 +130,14 @@ def cert_settled(series_path, k=SETTLE_K):
         try:
             rows.append(json.loads(line))
         except Exception:
-            pass          # a partial final line if the run was killed mid-write
+            bad += 1      # a partial final line if the run was killed mid-write
+    # Counted, not swallowed: one truncated tail line is expected, but a systematically
+    # malformed series would otherwise reduce to a handful of rows and read as a clean
+    # settle. A silent skip here already hid a writer bug for an entire debug session.
+    if bad > 1:
+        return {'pass': False, 'n': len(rows), 'bad_lines': bad,
+                'reason': '%d unparseable lines in the calibration series — the writer is '
+                          'broken, not the calibration' % bad}
     if len(rows) < k:
         return {'pass': False, 'n': len(rows),
                 'reason': 'only %d snapshots, need %d — lower calib_series_dt or use a '
