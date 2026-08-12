@@ -103,6 +103,22 @@ def resolve_vio_root(explicit=None):
         '  Pass --vio-root or set $VIO_ROOT to the vio/ directory.' % (RUNNER, sibling))
 
 
+def _config_wants_series(cfg_path):
+    """Did the config the estimator was handed ask for a calibration series?
+
+    Read back from the config actually written for the run rather than from the source
+    file, so an override or a hand-edited copy is judged by what the estimator saw.
+    """
+    try:
+        for line in open(cfg_path):
+            line = line.split('#', 1)[0].strip()
+            if line.startswith('calib_series_dt:'):
+                return float(line.split(':', 1)[1].strip()) > 0
+    except Exception:
+        pass          # unreadable config: fall back to the old silent behaviour
+    return False
+
+
 def _override_track_frequency(cfg_txt, hz):
     """Rewrite track_frequency in a config copy. The warm-start loop and flight want
     different rates -- flight tracks every frame for low-latency state estimation,
@@ -476,6 +492,21 @@ def main():
             shutil.copy(sp, series_path)
         else:
             series_path = None
+            # A config that ASKED for a series and did not get one means the estimator
+            # binary predates the feature: it parses no such key and ignores it silently.
+            # Left alone, cert_settled returns None, verdict() skips the settling gate, and
+            # the run reverts to pre-settling behaviour while still printing HEALTHY --
+            # indistinguishable from a fully certified one. Observed on this host: nxt3
+            # deployed twice on a stale binary with the gate inoperative and no warning.
+            if _config_wants_series(f'{rd}/estimator_config.yaml'):
+                raise SystemExit(
+                    '[tool] ERROR: the config sets calib_series_dt > 0 but the estimator wrote no\n'
+                    '  %s\n'
+                    '  The binary is older than the calibration-series feature, so the settling\n'
+                    '  certificate cannot run. Refusing to certify with a gate silently disabled.\n'
+                    '  Rebuild the VIO workspace (colcon build --packages-select ov_msckf), or\n'
+                    '  set calib_series_dt: 0 to accept the weaker between-pass check knowingly.'
+                    % sp)
 
         st = cert_settled(series_path) if series_path else None
         if st is not None:
