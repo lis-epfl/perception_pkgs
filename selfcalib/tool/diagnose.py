@@ -196,7 +196,16 @@ def cert_ate(est_path, gt_path, toff, cam_end=None):
             'global_m': round(m['global_m'], 4), 'noum_m': round(m['noum_m'], 4)}
 
 
-def verdict(sc, dist, ate):
+def verdict(sc, dist, ate, settled=None):
+    # Checked before self-consistency because it subsumes it. Self-consistency compares
+    # two END-of-pass values and is blind to motion in between: on this fleet the 15 s
+    # window produced the TIGHTEST self-consistency of any window (0.0138) on a pass that
+    # was still visibly moving (settling 0.0246). No threshold on an endpoint comparison
+    # can catch that, so the within-pass check has to be its own gate.
+    if settled is not None and not settled['pass']:
+        return 'FLY-AGAIN: the calibration was still moving at the end of the final pass ' \
+               '(settling %.4f > %.2f) — ATE and the harvested values are not on a fixed ' \
+               'point; use a longer window' % (settled.get('worst_resid', float('nan')), SETTLE_THR)
     if not sc['pass']:
         return 'FLY-AGAIN: not self-consistent — insufficient data/excitation (>=15 s flight, static start)'
     if not dist['pass']:
@@ -212,8 +221,12 @@ def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=Non
     # With ground truth the run does multiple passes anyway (the ATE certificate needs a
     # trajectory), so self-consistency is free. Without it, a second pass exists ONLY to
     # compare harvests -- so measure settling inside the one pass instead.
-    if gt_path is None and settle_path is not None:
-        sc = cert_settled(settle_path)
+    # Measured on the final pass either way: with ground truth it says whether the
+    # trajectory ATE is scored on was produced under a static calibration, and without
+    # it it replaces the second pass entirely.
+    settled = cert_settled(settle_path) if settle_path is not None else None
+    if gt_path is None and settled is not None:
+        sc = settled
         sc['source'] = 'within-pass settling'
     else:
         sc = cert_self_consistency(sessions)
@@ -221,7 +234,8 @@ def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=Non
     cams, toff = _load(sessions[-1][-1])
     dist = cert_in_distribution(cams, toff, circle_fit, exclude)
     ate = cert_ate(est_path, gt_path, toff, cam_end) if est_path and gt_path else {'pass': True, 'skipped': True}
-    return {'self_consistency': sc, 'in_distribution': dist, 'ate': ate, 'verdict': verdict(sc, dist, ate)}
+    return {'self_consistency': sc, 'settled': settled, 'in_distribution': dist, 'ate': ate,
+            'verdict': verdict(sc, dist, ate, settled)}
 
 
 if __name__ == '__main__':
