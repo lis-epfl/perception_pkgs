@@ -273,16 +273,14 @@ def main():
                     help='certify the ATE on a dedicated extra pass that runs the published '
                          'chain under the FLIGHT config plus flight_stiffness.env, instead of '
                          'on the last warm-start pass. Costs one more estimator pass (~a third '
-                         'of total runtime). DEFAULT: on when --gt is given, off otherwise. '
-                         'ATE has to be measured on a trajectory the settled calibration '
-                         'produced; the last warm-start pass converges DURING the run it is '
-                         'scored on, so its early trajectory came from calibration values that '
-                         'were still moving. The two agree closely under the flight-config loop '
-                         '(median 1.17x over 12 fleet recordings, identical verdicts on all 12) '
-                         'but that is an empirical property of that config, not a guarantee: '
-                         'under the CALIBRATION config the same comparison produced 21.49 cm '
-                         'last-pass against 1.94 cm frozen, across the 0.20 m gate. Without '
-                         '--gt no ATE is computed, so the pass is pure cost and stays off.')
+                         'of total runtime). OFF by default: with --gt the loop already runs one '
+                         'pass warm-started from a settled harvest and verifies that pass settled '
+                         'too, so its whole trajectory came from a static calibration -- the one '
+                         'property freezing was buying. Measured on one recording: 0.0208 m for '
+                         'that pass against 0.0153 m frozen, and a better noumenal 0.0656 vs '
+                         '0.1136, both far inside the 0.20 m gate. Turn it on to certify under '
+                         'the flight config exactly rather than the calibration config, which '
+                         'differs in track_frequency.')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -437,6 +435,7 @@ def main():
     timeout_s = a.pass_timeout if a.pass_timeout else max(1800.0, 20.0 * bag_seconds(a.bag))
     harvests = []
     prev = None
+    settled_at = None       # first pass whose calibration settled; ATE uses the one after it
     for p in range(1, a.max_pass + 1):
         log('pass %d/%d' % (p, a.max_pass))
         cjp = f'{rd}/out/estimate_tum.txt.calib.json'
@@ -477,25 +476,40 @@ def main():
         else:
             series_path = None
 
-        # No ground truth means no ATE certificate, so a second pass would exist only to
-        # compare harvests. Settling inside THIS pass answers the same question and is
-        # the stronger test, so stop here when it holds.
-        if a.gt is None and series_path:
-            st = cert_settled(series_path)
-            if st.get('pass'):
-                log('  settled within pass %d: worst resid %.5f over the last %d snapshots '
-                    '(no ground truth, so no second pass is needed)' % (p, st['worst_resid'], st['k']))
+        st = cert_settled(series_path) if series_path else None
+        if st is not None:
+            log('  settling in pass %d: %s' % (p, 'worst resid %.5f%s' % (
+                st.get('worst_resid', float('nan')), '' if st.get('pass') else ' — NOT settled')
+                if st.get('worst_resid') is not None else (st.get('reason') or '?')))
+        # Without ground truth there is no ATE certificate, so a further pass would exist
+        # only to compare harvests -- settling inside THIS pass answers the same question
+        # and is the stronger test. With ground truth ATE has to be measured on a pass that
+        # was settled THROUGHOUT, and the pass in which settling is first reached was still
+        # moving early on. So run exactly one more, warm-started from the settled harvest:
+        # that pass is a valid ATE trajectory AND gives self-consistency against its parent,
+        # which is why no separate frozen pass is needed.
+        if st is not None and st.get('pass'):
+            if a.gt is None:
+                log('  settled within pass %d (no ground truth, so no second pass is needed)' % p)
                 report['converged_at_pass'] = p
                 report['settle'] = st
                 break
-            log('  not settled yet in pass %d (%s)'
-                % (p, st.get('reason') or 'worst resid %.5f' % st.get('worst_resid', float('nan'))))
+            if settled_at is None:
+                settled_at = p
+                log('  settled within pass %d — running one more from it to certify the ATE' % p)
+            elif p > settled_at:
+                report['converged_at_pass'] = p
+                report['settle'] = st
+                break
         cams = cams_from_caljson(cj)
         if prev is not None:
             r = calib_residual(cams, prev[0])
             dtd = abs(cj['toff'] - prev[1]) * 1000
             log('  self-consistency vs previous pass: resid=%.4f dtoff=%.2f ms' % (r, dtd))
-            if r < SC_STOP and dtd < TD_STOP_MS:
+            # Legacy stop, and only a fallback for runs with no calibration series: two
+            # agreeing endpoints do not imply either pass was settled, so where settling
+            # IS measurable it decides when to stop and this must not preempt it.
+            if r < SC_STOP and dtd < TD_STOP_MS and st is None:
                 report['converged_at_pass'] = p
                 break
         prev = (cams, cj['toff'])
@@ -539,7 +553,13 @@ def main():
     # is still moving just as faithfully as one that has settled, so running it before
     # this check would buy an authoritative measurement of the wrong chain -- and the
     # verdict is FLY-AGAIN either way.
-    frozen = a.frozen_check if a.frozen_check is not None else bool(a.gt)
+    # OFF by default: the ATE pass is already warm-started from a settled harvest and is
+    # itself verified settled, so its whole trajectory came from a static calibration --
+    # which is the only property the frozen pass was buying. Measured on the same
+    # recording, that pass gives ATE 0.0208 m against 0.0153 m frozen (and a BETTER
+    # noumenal 0.0656 vs 0.1136), both an order of magnitude inside the 0.20 m gate,
+    # for ~130 s less. Turn it on to certify under the flight config exactly.
+    frozen = bool(a.frozen_check)
     if frozen and settled_final is not None and not settled_final['pass']:
         log('skipping the deployment check: the calibration had not settled by the end of '
             'pass %d (worst resid %.5f) — nothing stable to freeze'
