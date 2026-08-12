@@ -20,7 +20,7 @@ tool/                      run_tool.py   the calibration pipeline (entry point)
                            deploy_vio.py the deployment step: read a finished calibration
                                          and write the folder the VIO estimator flies with
 configs/
-  estimator_fleet.yaml       the CALIBRATION config (priors loose; 4-camera fisheye KB4 rigs)
+  estimator_calib.yaml       the CALIBRATION config (priors loose; 4-camera fisheye KB4 rigs)
 fleet_reference/           per-vehicle published calibrations — the seed source for
                            --fleet-exclude and the in-distribution certificate. Replace with
                            YOUR fleet. Each theta_star.yaml doubles as a working example of
@@ -129,11 +129,11 @@ Pick ONE config and edit ONLY hardware descriptors:
 
 | you have | config | edit these fields only |
 |---|---|---|
-| 4-camera fisheye rig (like the study fleet) | `configs/estimator_fleet.yaml` | `gravity_mag`, IMU noise (via imu chain), masks |
+| 4-camera fisheye rig (like the study fleet) | `configs/estimator_calib.yaml` | `gravity_mag`, IMU noise (via imu chain), masks |
 
 (The study package's `estimator_standard_template.yaml` for stereo / other standard rigs is
 not shipped here — this package targets the fisheye fleet. `tool/run_tool.py` always uses
-`configs/estimator_fleet.yaml` for calibration.) The rig's camera count comes from the
+`configs/estimator_calib.yaml` for calibration.) The rig's camera count comes from the
 template chain and the per-camera lens half-FOV from this config's `mask_fisheye_theta_max{i}`
 keys, so a different fisheye rig is a config-and-chain change rather than a code change; a
 non-fisheye rig still needs the standard-rig config from the study package.
@@ -282,7 +282,7 @@ near-limit oscillation without convergence (envelope fitted on too few settled p
 ## Calibration mode vs flight mode
 
 The estimator is one binary with two operating points, and this package only ever drives the
-**calibration** one: `configs/estimator_fleet.yaml` with `OV_PRIOR_*` **unset**. Loose stock
+**calibration** one: `configs/estimator_calib.yaml` with `OV_PRIOR_*` **unset**. Loose stock
 priors leave the calibration states mobile so the warm-start iterations can converge away
 from the seed.
 

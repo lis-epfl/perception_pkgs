@@ -57,7 +57,7 @@ The tightened priors tether the online calibration to its published chain. This 
 (uniform, no per-vehicle tuning) produced 2.4–4.5 cm SE(3) ATE across an 11-flight,
 3-vehicle benchmark.
 
-**Calibration** — `selfcalib/configs/estimator_fleet.yaml` with `OV_PRIOR_*` **unset**.
+**Calibration** — `selfcalib/configs/estimator_calib.yaml` with `OV_PRIOR_*` **unset**.
 `selfcalib` never sets them. Loose priors keep the calibration states mobile so the
 warm-start iterations can converge away from the seed.
 

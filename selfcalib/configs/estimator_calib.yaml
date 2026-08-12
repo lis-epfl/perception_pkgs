@@ -1,12 +1,42 @@
 %YAML:1.0 # need to specify the file type at the top!
 # NOTE: %YAML:1.0 must stay on line 1 — cv::FileStorage rejects the file otherwise.
+#
+# THE CALIBRATION CONFIG. Derived from vio_deploy/config/estimator_flight.yaml so the
+# warm-start loop and flight share one estimator operating point, differing only where
+# calibration genuinely needs something else. Replaces the study's
+# estimator_fleet.yaml, which used a much lighter point (max_slam 0, num_pts 2000,
+# max_msckf_in_update 200); measured on this fleet, running the loop at the FLIGHT
+# point makes the last warm-start pass track a dedicated frozen-deployment pass to a
+# median 1.17x with identical verdicts across 12 recordings, which is what allows the
+# extra certification pass to be skipped.
+#
+# DIFFERENCES FROM estimator_flight.yaml -- keep this list current:
+#   track_frequency  40 -> 15   Flight tracks every frame for low-latency state
+#                               estimation. Calibration wants PARALLAX: with 30 Hz
+#                               cameras the throttle skips a frame whose stamp is
+#                               < last + 1/freq, so 15 tracks every 3rd frame and
+#                               triples the baseline -- "the dominant accuracy lever"
+#                               per the study's tuning history. Measured on an Orin NX:
+#                               a pass drops 54.7 -> 29.1 s, ATE is unchanged
+#                               (0.0166 -> 0.0168 m) and self-consistency IMPROVES
+#                               (0.0187 -> 0.0138). Only divisors of the frame rate do
+#                               anything: 30 / 15 / 10 / 7.5. 20 and 29 both collapse
+#                               to the same every-other-frame pattern.
+#
+# The priors are NOT set here -- they are environment variables. Calibration runs with
+# OV_PRIOR_* UNSET so the calibration states stay mobile enough to converge away from
+# the seed; flight exports vio_deploy/config/flight_stiffness.env to tether them.
+# run_tool.py strips any that leak in from the caller's shell.
+#
+# gates.py reads mask_fisheye_theta_max* from THIS file, so the tool's circle geometry
+# and the estimator's own fisheye mask cannot drift apart.
+# NOTE: %YAML:1.0 must stay on line 1 — cv::FileStorage rejects the file otherwise.
 # FLIGHT / DEPLOYMENT configuration (NOT for calibration runs).
 # This is the estimator configuration that produced 2.4-4.5 cm SE(3) ATE and
 # 3.1-5.6 cm anchored error across an 11-flight, 3-vehicle fisheye benchmark
 # (uniform settings, no per-vehicle or per-flight tuning).
 # USE WITH configs/flight_stiffness.env sourced into the environment — the
 # tightened calibration priors are half of what makes this config work.
-# For CALIBRATION runs use configs/estimator_calib.yaml with OV_PRIOR_* UNSET.
 # See README section "Two configurations: calibration mode vs flight mode".
 # ============================================================================
 
@@ -84,7 +114,7 @@ grid_x: 5
 grid_y: 5
 min_px_dist: 15
 knn_ratio: 0.70
-track_frequency: 40.0   # track EVERY frame (30Hz cams); accuracy comes from update_min_dt below
+track_frequency: 15.0   # see the header: parallax, not latency
 downsample_cameras: false
 num_opencv_threads: 0  # det-live
 histogram_method: "CLAHE"

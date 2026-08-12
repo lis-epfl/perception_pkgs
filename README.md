@@ -15,7 +15,7 @@ and five environment variables, not the code:
 | | config | calibration priors |
 |---|---|---|
 | **flight** (in `vio/`) | `vio_deploy/config/estimator_flight.yaml` + `flight_stiffness.env` | tethered (x0.10) — the online calibration can absorb a small per-flight offset but cannot random-walk |
-| **calibration** (in `selfcalib/`) | `configs/estimator_fleet.yaml`, `OV_PRIOR_*` unset | loose (stock) — the states must be mobile enough for the warm-start iterations to converge |
+| **calibration** (in `selfcalib/`) | `configs/estimator_calib.yaml`, `OV_PRIOR_*` unset | loose (stock) — the states must be mobile enough for the warm-start iterations to converge |
 
 Keeping the estimator in one place is the point. If each package carried its own copy they
 would drift, and the day they drift is the day a calibration produced by one version gets
@@ -33,7 +33,7 @@ vio/                        drop into a colcon workspace src/ — four ament pac
 selfcalib/
   tool/run_tool.py          the calibration pipeline
   tool/deploy_vio.py        read a finished calibration -> write the flight folder
-  configs/estimator_fleet.yaml     the CALIBRATION config
+  configs/estimator_calib.yaml     the CALIBRATION config
   fleet_reference/          per-vehicle published chains for seeding + in-distribution checks
   docs/
 ```

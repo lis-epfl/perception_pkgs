@@ -27,7 +27,7 @@ plumbing, one YAML syntax fix, documentation, and the ground-truth/mount additio
 | `e2e_test_nxt3/`, `e2e_test.sh`, `e2e_test.log` | 4.3 MB | A recorded reference run plus a driver hardcoded to `/tmp/swarm30_runs` and `~/vio_dataset/ov_reverify` |
 | ~~`tool/mount.py`~~ | — | **Kept.** Was dropped as dead code, then restored and wired into `run_tool.py` — see "Ground truth and the mount solve" below |
 | `scripts/converters/`, `scripts/truncate_bag.py` | 3 files | ASL/EuRoC and image-list bag converters (fleet vehicles record ROS 2 bags natively) plus a debug helper with hardcoded paths |
-| `configs/estimator_standard_template.yaml`, `configs/examples/` | 3 files | Stereo/standard-rig template and documentation examples. `run_tool.py` hardcodes `estimator_fleet.yaml` in its seed-assembly step; `fleet_reference/*/theta_star.yaml` serves as the chain-format example |
+| `configs/estimator_standard_template.yaml`, `configs/examples/` | 3 files | Stereo/standard-rig template and documentation examples. `run_tool.py` hardcodes `estimator_calib.yaml` in its seed-assembly step; `fleet_reference/*/theta_star.yaml` serves as the chain-format example |
 
 **`openvins/config/` the directory must keep existing** (a `README.txt` placeholder holds it
 open). `ov_msckf/cmake/ROS2.cmake:123` runs `install(DIRECTORY ../config/ ...)` and colcon
@@ -66,7 +66,7 @@ Complete change surface vs the study package, verified by `diff -rq` over the wh
 `openvins/config/README.txt`, `.gitignore`):
 
 ```
-configs/estimator_fleet.yaml     configs/estimator_flight.yaml    README.md
+configs/estimator_calib.yaml     configs/estimator_flight.yaml    README.md
 docs/TOOL_INTERNALS.md           docs/TROUBLESHOOTING.md
 scripts/build_openvins.sh        scripts/run_serial.sh
 tool/chainio.py   tool/diagnose.py   tool/gates.py   tool/mount.py   tool/run_tool.py
@@ -254,7 +254,7 @@ them.
    edit, and an unusable fleet gives a message naming what it found instead of a
    `FileNotFoundError` traceback. Verified to reproduce the previous means exactly for all
    four exclude variants.
-3. **`tool/gates.py`** — `THETA_MAX` is now read from `configs/estimator_fleet.yaml`
+3. **`tool/gates.py`** — `THETA_MAX` is now read from `configs/estimator_calib.yaml`
    (`mask_fisheye_theta_max` plus per-camera `mask_fisheye_theta_max{i}`), matching
    `VioManagerOptions.h:318-338` semantics, with the study rig's values as fallback if the
    config is absent. The tool's image-circle geometry and the estimator's own fisheye mask
@@ -290,7 +290,7 @@ them.
    and `configs/FINAL_single_config.yaml`, and `tool/gates.py` / `tool/diagnose.py` /
    `tool/mount.py` cited `tool_tests.md` in comments. Neither file exists in this package or
    in the study package. All now point at `docs/VALIDATION_MATRIX.md` and
-   `configs/estimator_fleet.yaml`.
+   `configs/estimator_calib.yaml`.
 
 ### `use_klt_tangent` was inert, and the keys are now gone
 

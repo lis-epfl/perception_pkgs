@@ -39,7 +39,7 @@ libopencv-contrib-dev to obtain it conflicts with the NVIDIA libopencv-dev that
 cv_bridge, the OAK driver and depth estimation are all built against. The dependency
 therefore made the package unbuildable on the target platform.
 
-Neither operating point used it: use_aruco is false in both estimator_fleet.yaml and
+Neither operating point used it: use_aruco is false in both estimator_calib.yaml and
 estimator_flight.yaml, and the instantiation was already guarded by that flag.
 
 The trackARUCO member is retained and permanently null. Every use of it was already

@@ -27,7 +27,7 @@ import rosbag2_py
 
 # --- swarm-nxt defaults -------------------------------------------------------
 # CAM_A..CAM_D map to cam0..cam3 in that order. The mapping is physical, not
-# cosmetic: estimator_fleet.yaml gives cam3 a wider lens
+# cosmetic: estimator_calib.yaml gives cam3 a wider lens
 # (mask_fisheye_theta_max3 1.87 vs 1.83), and cert_in_distribution compares each
 # camera against the fleet mean for ITS mount position. A permuted mapping is
 # caught by the principal-point certificate rather than shipping silently.

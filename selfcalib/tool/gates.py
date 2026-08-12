@@ -37,7 +37,7 @@ THETA_MAX_DEFAULT = 1.83
 def _load_theta_max(cfg_path=None):
     """-> dict {cam_index: theta_max}. Falls back to the study rig if the config is absent."""
     root = os.environ.get('SCT_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    cfg_path = cfg_path or os.path.join(root, 'configs', 'estimator_fleet.yaml')
+    cfg_path = cfg_path or os.path.join(root, 'configs', 'estimator_calib.yaml')
     theta = {}
     try:
         txt = open(cfg_path).read()

@@ -34,5 +34,5 @@ trajectory estimates.
 
 ## Fleet reference data used
 `cal/{nxt3,nxt6,nxt10}/theta_star.yaml` (fixed points), `td_center.json` (rig-global toff
-centers), `circle_center_*.json` (fit references), `configs/estimator_fleet.yaml` +
+centers), `circle_center_*.json` (fit references), `configs/estimator_calib.yaml` +
 `run_serial.sh` (deterministic estimator).

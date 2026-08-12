@@ -245,9 +245,9 @@ def main():
     ap.add_argument('--no-gt-autodetect', action='store_true',
                     help='never look inside the bag for ground truth')
     ap.add_argument('--calib-config', default=None,
-                    help="estimator config driving the WARM-START loop. Default 'flight': "
-                         'vio_deploy/config/estimator_flight.yaml with OV_PRIOR_* UNSET. Pass '
-                         "'fleet' for the study's configs/estimator_fleet.yaml, or a path. The ATE "
+                    help="estimator config driving the WARM-START loop. Default 'calib': "
+                         'configs/estimator_calib.yaml with OV_PRIOR_* UNSET. Pass '
+                         "'flight' for the untouched flight operating point, or a path. The ATE "
                          'certificate is unaffected -- it always runs flight config + priors.')
     ap.add_argument('--fleet-exclude', default=None)
     ap.add_argument('--max-pass', type=int, default=8)
@@ -258,7 +258,7 @@ def main():
                          '~10-15 s of motion, so a long recording costs passes it does not '
                          'need. Applied to BOTH the warm-start passes and the frozen '
                          'deployment pass, so the certificate measures the same data.')
-    ap.add_argument('--track-frequency', type=float, default=15.0,
+    ap.add_argument('--track-frequency', type=float, default=None,
                     help='KLT tracking rate for the WARM-START passes only, overriding the '
                          'loop config. Default 15: the cameras run at 30 Hz and the throttle '
                          'skips a frame whose stamp is < last + 1/freq, so this tracks every '
@@ -388,11 +388,11 @@ def main():
     # num_pts 3000 vs 2000, track_frequency 40 vs 29, chi2 0.7 vs 1.0,
     # init_window_time 3.0 vs 1.0), and the calibration states stay mobile either way
     # because OV_PRIOR_* is never exported here -- only frozen_pass() exports it.
-    # Pass --calib-config fleet to restore configs/estimator_fleet.yaml.
-    _calib_cfg = os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')
-    if a.calib_config == 'fleet':
-        _calib_cfg = f'{OVR}/configs/estimator_fleet.yaml'
-    elif a.calib_config and a.calib_config != 'flight':
+    # Pass --calib-config flight to run the untouched flight operating point.
+    _calib_cfg = f'{OVR}/configs/estimator_calib.yaml'
+    if a.calib_config == 'flight':
+        _calib_cfg = os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')
+    elif a.calib_config and a.calib_config != 'calib':
         _calib_cfg = a.calib_config
     log('warm-start loop config: %s (OV_PRIOR_* unset)' % os.path.basename(_calib_cfg))
     # Guard the documented footgun: flight priors leaking in from the caller's shell
