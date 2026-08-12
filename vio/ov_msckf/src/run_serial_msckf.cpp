@@ -208,9 +208,8 @@ int main(int argc, char **argv) {
                               // frames leave state->_timestamp unchanged
 
   // Harvest the online-calibration state at the end of the run (the tool reads this).
-  auto write_calib = [&](const std::string &path) {
+  auto write_calib_to = [&](FILE *cf) {
     auto st = sys->get_state();
-    FILE *cf = std::fopen(path.c_str(), "w");
     if (!cf) return;
     Eigen::Vector3d ba = st->_imu->bias_a(), bg = st->_imu->bias_g();
     double toff = st->_calib_dt_CAMtoIMU->value()(0);
@@ -249,8 +248,31 @@ int main(int argc, char **argv) {
         qg(0),qg(1),qg(2),qg(3), qa(0),qa(1),qa(2),qa(3));
     }
     std::fprintf(cf, "}\n");
+  };
+
+  auto write_calib = [&](const std::string &path) {
+    FILE *cf = std::fopen(path.c_str(), "w");
+    if (!cf) return;
+    write_calib_to(cf);
     std::fclose(cf);
   };
+
+  // Periodic snapshots of the online-calibration state, one JSON object per line.
+  //
+  // The end-of-run harvest is a single sample, so the only convergence evidence the
+  // tool has is agreement BETWEEN passes -- and that cannot tell "converged" from
+  // "never moved". A run whose calibration stayed pinned at its seed reports a
+  // suspiciously LOW self-consistency residual while the trajectory diverges; this
+  // fleet produced exactly that (resid 0.0187 against a 14 km trajectory error).
+  //
+  // With a series, settling is measurable inside ONE pass: if the last few snapshots
+  // oscillate around a stable mean, the calibration has converged, and a second pass
+  // exists only to confirm what the series already shows.
+  FILE *series = nullptr;
+  double series_dt = 0.0, series_next = -1;
+  parser->parse_config("calib_series_dt", series_dt, false);
+  if (series_dt > 0.0)
+    series = std::fopen((out_path + ".calib_series.jsonl").c_str(), "w");
 
   // track_frequency throttle (replicates ROS2Visualizer::callback_stereo lines
   // 554-558): per lead-camera, skip a frame whose timestamp is < last_tracked +
@@ -355,6 +377,16 @@ int main(int argc, char **argv) {
       std::snprintf(buf, sizeof(buf), "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f",
                     state->_timestamp, p(0), p(1), p(2), q(0), q(1), q(2), q(3));
       lines.emplace_back(buf);
+      if (series != nullptr) {
+        const double ts = state->_timestamp;
+        if (series_next < 0)
+          series_next = ts;              // first snapshot as soon as the filter is up
+        if (ts >= series_next) {
+          std::fprintf(series, "{\"t\":%.6f,\"calib\":", ts);
+          write_calib_to(series);
+          series_next = ts + series_dt;
+        }
+      }
     }
   };
 
@@ -406,6 +438,8 @@ int main(int argc, char **argv) {
   // Dump OV's CONVERGED calibration: per-cam intrinsics + body_P_cam extrinsic (R_CtoI, p_CinI)
   // + cam-imu timeoffset + biases. (Same writer used for the mid-run snapshots above.)
   { Scoped _s("write outputs"); write_calib(out_path + ".calib.json"); }
+  if (series != nullptr)
+    std::fclose(series);
 
   {
     // VioManager's internal buckets, so the 80%+ spent inside feed_measurement_camera

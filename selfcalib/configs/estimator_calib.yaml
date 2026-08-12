@@ -141,3 +141,10 @@ mask_bottom_frac: 0.0
 
 relative_config_imu: "kalibr_imu_chain.yaml"
 relative_config_imucam: "kalibr_imucam_chain.yaml"
+
+# Period, in seconds of recording time, between online-calibration snapshots written to
+# <out>.calib_series.jsonl. 0 disables. The series makes SETTLING measurable inside one
+# pass: agreement between passes cannot distinguish "converged" from "never moved", and
+# this fleet produced exactly that failure -- a run pinned at its seed reported a
+# self-consistency residual of 0.0187 while its trajectory was 14 km out.
+calib_series_dt: 0.5
