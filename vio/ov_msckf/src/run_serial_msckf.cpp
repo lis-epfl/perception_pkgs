@@ -48,6 +48,12 @@
 #include "state/State.h"
 #include "state/Propagator.h"
 
+namespace ov_msckf {
+// Defined in VioManager.cpp: per-stage wall clock inside feed_measurement_camera.
+extern std::map<std::string, double> g_vio_stage_secs;
+extern std::map<std::string, long> g_vio_stage_calls;
+} // namespace ov_msckf
+
 using namespace ov_msckf;
 
 // Coarse wall-clock accounting for the whole run. OpenVINS' own
@@ -404,8 +410,8 @@ int main(int argc, char **argv) {
   {
     // VioManager's internal buckets, so the 80%+ spent inside feed_measurement_camera
     // is broken down rather than reported as one number.
-    extern std::map<std::string, double> g_vio_stage_secs;
-    extern std::map<std::string, long> g_vio_stage_calls;
+    using ov_msckf::g_vio_stage_secs;
+    using ov_msckf::g_vio_stage_calls;
     PRINT_INFO(GREEN "\n[vio-stage]: %-30s %8s %10s\n" RESET, "stage", "sec", "calls");
     for (auto const &kv : g_vio_stage_secs)
       PRINT_INFO(GREEN "[vio-stage]: %-30s %8.2f %10ld\n" RESET, kv.first.c_str(), kv.second,
