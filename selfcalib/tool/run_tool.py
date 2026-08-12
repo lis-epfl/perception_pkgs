@@ -269,16 +269,20 @@ def main():
                          'the --frozen-check pass, which must run true flight settings. Only '
                          'divisors of the frame rate do anything: 30/15/10/7.5 -- 20 and 29 both '
                          'round to the same every-other-frame pattern.')
-    ap.add_argument('--frozen-check', action='store_true',
+    ap.add_argument('--frozen-check', action=argparse.BooleanOptionalAction, default=None,
                     help='certify the ATE on a dedicated extra pass that runs the published '
                          'chain under the FLIGHT config plus flight_stiffness.env, instead of '
                          'on the last warm-start pass. Costs one more estimator pass (~a third '
-                         'of total runtime). OFF by default: measured over 12 fleet recordings '
-                         'with the flight-config loop, the last pass tracks the frozen pass to '
-                         'a median 1.17x and gives identical verdicts on all 12. Turn it ON if '
-                         'the loop is driven by a different config -- under the CALIBRATION '
-                         'config the same comparison produced a 21.49 cm last-pass ATE against '
-                         '1.94 cm frozen, which crosses the 0.20 m gate.')
+                         'of total runtime). DEFAULT: on when --gt is given, off otherwise. '
+                         'ATE has to be measured on a trajectory the settled calibration '
+                         'produced; the last warm-start pass converges DURING the run it is '
+                         'scored on, so its early trajectory came from calibration values that '
+                         'were still moving. The two agree closely under the flight-config loop '
+                         '(median 1.17x over 12 fleet recordings, identical verdicts on all 12) '
+                         'but that is an empirical property of that config, not a guarantee: '
+                         'under the CALIBRATION config the same comparison produced 21.49 cm '
+                         'last-pass against 1.94 cm frozen, across the 0.20 m gate. Without '
+                         '--gt no ATE is computed, so the pass is pure cost and stays off.')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -528,7 +532,20 @@ def main():
     # ate_source records which one was used either way, so a stored report can never
     # imply a deployment measurement that did not happen.
     est_cert, cert_kind = est, 'calibration-pass'
-    if a.gt and a.frozen_check:
+    series_final = os.path.join(a.out, 'calib_series_pass%d.jsonl' % report['converged_at_pass'])
+    series_final = series_final if os.path.isfile(series_final) else None
+    settled_final = cert_settled(series_final) if series_final else None
+    # Settle FIRST, then spend the extra pass. A frozen pass replays a calibration that
+    # is still moving just as faithfully as one that has settled, so running it before
+    # this check would buy an authoritative measurement of the wrong chain -- and the
+    # verdict is FLY-AGAIN either way.
+    frozen = a.frozen_check if a.frozen_check is not None else bool(a.gt)
+    if frozen and settled_final is not None and not settled_final['pass']:
+        log('skipping the deployment check: the calibration had not settled by the end of '
+            'pass %d (worst resid %.5f) — nothing stable to freeze'
+            % (report['converged_at_pass'], settled_final.get('worst_resid', float('nan'))))
+        frozen = False
+    if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
             est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s)
@@ -543,11 +560,7 @@ def main():
     report['ate_source'] = cert_kind
     diag = diagnose(sessions=[harvests], circle_fit={str(c): centers[c] for c in centers},
                     est_path=est_cert if a.gt else None, gt_path=a.gt,
-                    exclude=a.fleet_exclude, cam_end=a.cam_end,
-                    settle_path=os.path.join(a.out, 'calib_series_pass%d.jsonl'
-                                             % report['converged_at_pass'])
-                    if os.path.isfile(os.path.join(a.out, 'calib_series_pass%d.jsonl'
-                                                   % report['converged_at_pass'])) else None)
+                    exclude=a.fleet_exclude, cam_end=a.cam_end, settle_path=series_final)
     if not report['gate_timing']['pass'] and diag['verdict'].startswith('PLATFORM-DEFECT'):
         diag['verdict'] += ' [timing gate had flagged this recording — consistent]'
     report['diagnosis'] = diag
