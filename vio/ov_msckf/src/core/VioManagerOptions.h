@@ -487,6 +487,9 @@ struct VioManagerOptions {
   /// Will half the resolution all tracking image (aruco will be 1/4 instead of halved if dowsize_aruoc also enabled)
   bool downsample_cameras = false;
 
+  bool use_polar_grid = false;
+  int polar_rings = 4, polar_sectors = 8;
+
   /// Threads our front-end should try to use (opencv uses this also)
   int num_opencv_threads = 4;
 
@@ -536,6 +539,9 @@ struct VioManagerOptions {
       parser->parse_config("use_aruco", use_aruco);
       parser->parse_config("downsize_aruco", downsize_aruco);
       parser->parse_config("downsample_cameras", downsample_cameras);
+      parser->parse_config("use_polar_grid", use_polar_grid, false);
+      parser->parse_config("polar_rings", polar_rings, false);
+      parser->parse_config("polar_sectors", polar_sectors, false);
       parser->parse_config("num_opencv_threads", num_opencv_threads);
       parser->parse_config("multi_threading_pubs", use_multi_threading_pubs, false);
       parser->parse_config("multi_threading_subs", use_multi_threading_subs, false);

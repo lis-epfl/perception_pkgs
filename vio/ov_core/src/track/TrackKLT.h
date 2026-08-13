@@ -39,6 +39,50 @@ namespace ov_core {
 class TrackKLT : public TrackBase {
 
 public:
+  bool use_polar_grid = false;
+  int polar_rings = 4, polar_sectors = 8;
+  std::map<size_t, std::pair<cv::Point2f, float>> polar_geom; // cam -> (circle centre, radius)
+
+  /// (ring, sector) bin index for a point, or -1 if outside the image circle.
+  /// Rings carry EQUAL SOLID ANGLE under the equidistant model r = f*theta: the k-th boundary
+  /// is at theta_k = acos(1 - (k/K)(1 - cos theta_max)), i.e. r_k = R * theta_k / theta_max.
+  /// Equal-area-in-image rings would over-populate the periphery in bearing terms.
+  int polar_bin(size_t cam_id, const cv::Point2f &pt, const cv::Size &sz, const cv::Mat &mask) {
+    auto it = polar_geom.find(cam_id);
+    if (it == polar_geom.end()) {
+      // Derive the circle from the mask: centre = centroid of valid pixels, R = max radius.
+      double sx = 0, sy = 0; long n = 0;
+      for (int y = 0; y < mask.rows; y += 4)
+        for (int x = 0; x < mask.cols; x += 4)
+          if (mask.at<uint8_t>(y, x) <= 127) { sx += x; sy += y; n++; }
+      cv::Point2f c = n ? cv::Point2f((float)(sx / n), (float)(sy / n))
+                        : cv::Point2f(sz.width / 2.0f, sz.height / 2.0f);
+      float R = 1.0f;
+      for (int y = 0; y < mask.rows; y += 4)
+        for (int x = 0; x < mask.cols; x += 4)
+          if (mask.at<uint8_t>(y, x) <= 127)
+            R = std::max(R, (float)std::hypot(x - c.x, y - c.y));
+      polar_geom[cam_id] = {c, R};
+      it = polar_geom.find(cam_id);
+    }
+    const cv::Point2f &c = it->second.first;
+    float R = it->second.second;
+    float dx = pt.x - c.x, dy = pt.y - c.y;
+    float r = std::sqrt(dx * dx + dy * dy);
+    if (r > R) return -1;
+    const double th_max = 1.83;                 // platform lens half-FOV (rad)
+    double th = th_max * (double)(r / R);
+    double frac = (1.0 - std::cos(th)) / (1.0 - std::cos(th_max));   // solid-angle fraction
+    int ring = (int)(frac * polar_rings);
+    if (ring >= polar_rings) ring = polar_rings - 1;
+    if (ring < 0) ring = 0;
+    double phi = std::atan2((double)dy, (double)dx) + M_PI;          // [0, 2pi)
+    int sec = (int)(phi / (2.0 * M_PI) * polar_sectors);
+    if (sec >= polar_sectors) sec = polar_sectors - 1;
+    if (sec < 0) sec = 0;
+    return ring * polar_sectors + sec;
+  }
+
   /**
    * @brief Public constructor with configuration variables
    * @param cameras camera calibration object which has all camera intrinsics in it
@@ -90,7 +134,7 @@ protected:
    * Passed images should already be grayscaled.
    */
   void perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
-                                   std::vector<size_t> &ids0);
+                                   std::vector<size_t> &ids0, size_t cam_id = 0);
 
   /**
    * @brief Detects new features in the current stereo pair

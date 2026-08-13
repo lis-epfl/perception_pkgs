@@ -121,7 +121,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     // Detect new features
     std::vector<cv::KeyPoint> good_left;
     std::vector<size_t> good_ids_left;
-    perform_detection_monocular(imgpyr, mask, good_left, good_ids_left);
+    perform_detection_monocular(imgpyr, mask, good_left, good_ids_left, cam_id);
     // Save the current image and pyramid
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     img_last[cam_id] = img;
@@ -137,7 +137,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   int pts_before_detect = (int)pts_last[cam_id].size();
   auto pts_left_old = pts_last[cam_id];
   auto ids_left_old = ids_last[cam_id];
-  perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old);
+  perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old, cam_id);
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // Our return success masks, and predicted new features
@@ -405,7 +405,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
 }
 
 void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
-                                           std::vector<size_t> &ids0) {
+                                           std::vector<size_t> &ids0, size_t cam_id) {
 
   // Create a 2D occupancy grid for this current image
   // Note that we scale this down, so that each grid point is equal to a set of pixels
@@ -417,6 +417,7 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   float size_y = (float)img0pyr.at(0).rows / (float)grid_y;
   cv::Size size_grid(grid_x, grid_y); // width x height
   cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1);
+  cv::Mat grid_polar = cv::Mat::zeros(1, std::max(1, polar_rings * polar_sectors), CV_16UC1);
   cv::Mat mask0_updated = mask0.clone();
   auto it0 = pts0.begin();
   auto it1 = ids0.begin();
@@ -465,6 +466,11 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     if (grid_2d_grid.at<uint8_t>(y_grid, x_grid) < 255) {
       grid_2d_grid.at<uint8_t>(y_grid, x_grid) += 1;
     }
+    if (use_polar_grid) {
+      int pb = polar_bin(cam_id, kpt.pt, img0pyr.at(0).size(), mask0);
+      if (pb >= 0 && grid_polar.at<uint16_t>(pb) < 60000)
+        grid_polar.at<uint16_t>(pb) += 1;
+    }
     // Append this to the local mask of the image
     if (x - min_px_dist >= 0 && x + min_px_dist < img0pyr.at(0).cols && y - min_px_dist >= 0 && y + min_px_dist < img0pyr.at(0).rows) {
       cv::Point pt1(x - min_px_dist, y - min_px_dist);
@@ -495,10 +501,30 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
   int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
   std::vector<std::pair<int, int>> valid_locs;
-  for (int x = 0; x < grid_2d_grid.cols; x++) {
-    for (int y = 0; y < grid_2d_grid.rows; y++) {
-      if ((int)grid_2d_grid.at<uint8_t>(y, x) < num_features_grid_req && (int)mask0_grid.at<uint8_t>(y, x) != 255) {
-        valid_locs.emplace_back(x, y);
+  if (use_polar_grid) {
+    // Quota per (ring, sector) bin of equal solid angle. A rectangular extraction cell is
+    // opened when the polar bin containing its centre is under-filled; extraction still
+    // uses Grider_GRID's rectangular ROIs, only the QUOTA allocation is polar.
+    int nbins = std::max(1, polar_rings * polar_sectors);
+    int per_bin_req = std::max(1, (int)(min_feat_percent * ((double)num_features / nbins)));
+    float csx = (float)img0pyr.at(0).cols / (float)grid_2d_grid.cols;
+    float csy = (float)img0pyr.at(0).rows / (float)grid_2d_grid.rows;
+    for (int x = 0; x < grid_2d_grid.cols; x++) {
+      for (int y = 0; y < grid_2d_grid.rows; y++) {
+        if ((int)mask0_grid.at<uint8_t>(y, x) == 255)
+          continue;
+        cv::Point2f cc((x + 0.5f) * csx, (y + 0.5f) * csy);
+        int pb = polar_bin(cam_id, cc, img0pyr.at(0).size(), mask0);
+        if (pb >= 0 && (int)grid_polar.at<uint16_t>(pb) < per_bin_req)
+          valid_locs.emplace_back(x, y);
+      }
+    }
+  } else {
+    for (int x = 0; x < grid_2d_grid.cols; x++) {
+      for (int y = 0; y < grid_2d_grid.rows; y++) {
+        if ((int)grid_2d_grid.at<uint8_t>(y, x) < num_features_grid_req && (int)mask0_grid.at<uint8_t>(y, x) != 255) {
+          valid_locs.emplace_back(x, y);
+        }
       }
     }
   }

@@ -156,6 +156,12 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
                                                          state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
                                                          params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
+    {
+      auto _tk = std::dynamic_pointer_cast<TrackKLT>(trackFEATS);
+      if (_tk) { _tk->use_polar_grid = params.use_polar_grid;
+                 _tk->polar_rings = params.polar_rings;
+                 _tk->polar_sectors = params.polar_sectors; }
+    }
   } else {
     trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
         state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo, params.histogram_method,

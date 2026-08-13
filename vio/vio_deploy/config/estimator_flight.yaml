@@ -23,8 +23,8 @@ calib_cam_timeoffset: true
 calib_imu_intrinsics: false
 calib_imu_g_sensitivity: false
 
-max_clones: 50
-max_slam: 250
+max_clones: 25
+max_slam: 100
 max_slam_in_update: 150
 max_msckf_in_update: 1000
 dt_slam_delay: 1
@@ -78,16 +78,23 @@ init_force_static: true # anchor trajectory in the pre-takeoff static phase (raw
 use_klt: true
 # use_klt_tangent/klt_tangent_patch_size intentionally absent: the tangent-image tracker
 # was removed from this pruned OpenVINS (it never executed — see openvins/PRUNED.txt).
-num_pts: 3000
+# WARNING: num_pts is per CAMERA (4x650 here) and is the dominant compute knob, but it is also
+#   the ONLY knob that destabilises a marginal vehicle. On nxt1 (6-8% frame drops) reducing it
+#   from 3000 diverges the filter outright, non-monotonically (1000 was worse than 500). Vehicles
+#   that fail the timing gate should stay on num_pts 3000; healthy ones are fine at 650.
+num_pts: 650
 fast_threshold: 30
-grid_x: 5
-grid_y: 5
+grid_x: 8
+grid_y: 8
 min_px_dist: 15
 knn_ratio: 0.70
-track_frequency: 40.0   # track EVERY frame (30Hz cams); accuracy comes from update_min_dt below
+track_frequency: 15.0
 downsample_cameras: false
 num_opencv_threads: 0  # det-live
-histogram_method: "CLAHE"
+# histogram_method: CLAHE costs ~30% CPU and HURT accuracy on all 9 indoor recordings.
+#   Set to "CLAHE" for outdoor / backlit / high-dynamic-range flight, where it is untested here
+#   but is what CLAHE exists for. Expect ~1.07x real time on an Orin NX with it on, ~0.79x off.
+histogram_method: "NONE"
 
 use_aruco: false
 num_aruco: 1024
@@ -107,6 +114,14 @@ mask_fisheye_theta_max3: 1.87
 mask_fisheye_inset_px: 4.0
 mask_fisheye_dynamic: true
 mask_fisheye_dyn_thresh_px: 1.0
+
+# Fisheye detection grid: allocate the feature quota over (ring, sector) bins of EQUAL SOLID
+# ANGLE instead of a rectangular lattice. On this rig 27 of 64 uniform cells fall outside the
+# image circle. Measured: 4.10 -> 3.40 cm median ATE for ~3% more CPU. 5x12 is the optimum;
+# 3x6 under-constrains, 6x16 fragments the quota and the tail returns.
+use_polar_grid: true
+polar_rings: 5
+polar_sectors: 12
 mask_bottom_frac: 0.0
 
 relative_config_imu: "kalibr_imu_chain.yaml"
