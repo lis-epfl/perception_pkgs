@@ -45,6 +45,7 @@ include_directories(
         ${EIGEN3_INCLUDE_DIR}
         ${Boost_INCLUDE_DIRS}
         ${CERES_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 # Set link libraries used by all binaries
@@ -92,7 +93,7 @@ list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp src/ros/ROSVisualizerHelp
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_msckf_lib ${ament_libraries})
-target_link_libraries(ov_msckf_lib ${thirdparty_libraries} gomp cublas cusolver cudart)
+target_link_libraries(ov_msckf_lib ${thirdparty_libraries} gomp CUDA::cublas CUDA::cusolver CUDA::cudart)
 target_include_directories(ov_msckf_lib PUBLIC src/)
 install(TARGETS ov_msckf_lib
         LIBRARY DESTINATION lib

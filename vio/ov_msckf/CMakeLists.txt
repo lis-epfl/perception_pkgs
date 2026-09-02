@@ -4,13 +4,18 @@ project(ov_msckf)
 # Include libraries (if we don't have opencv 4, then fallback to opencv 3)
 # The OpenCV version needs to match the one used by cv_bridge otherwise you will get a segmentation fault!
 find_package(Eigen3 REQUIRED)
-set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+# Default to the toolkit at /usr/local/cuda (JetPack layout) but let a host override it with
+# -DCMAKE_CUDA_COMPILER=... ; the toolkit's include/lib dirs then come from FindCUDAToolkit
+# instead of hardcoded /usr/local/cuda paths, so a host with several toolkits builds too.
+if (NOT CMAKE_CUDA_COMPILER AND EXISTS /usr/local/cuda/bin/nvcc)
+    set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+endif ()
 include(CheckLanguage)
 check_language(CUDA)
 if (CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_ARCHITECTURES 87)
-    link_directories(/usr/local/cuda/lib64)
     message(STATUS "CUDA found: fp32 EKF path enabled")
 endif ()
 find_package(OpenCV 3 QUIET)
@@ -40,7 +45,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Enable compile optimizations
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fopenmp -mcpu=cortex-a78ae -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fopenmp -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops")
+# -mcpu=cortex-a78ae is the Jetson Orin core; an x86 compiler rejects it outright, so it is
+# applied only when building for aarch64 (the flight binaries are unaffected).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=cortex-a78ae")
+endif()
 
 # Enable debug flags (use if you want to debug in gdb)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wuninitialized")

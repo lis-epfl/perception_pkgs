@@ -59,6 +59,20 @@ else ()
 endif ()
 
 ##################################################
+# nvjpg_decode.cpp needs the Jetson multimedia API (nvbufsurface.h) and the tegra
+# nvbufsurface/EGL libraries, which exist only on a Jetson. Elsewhere compile the no-op
+# stub instead so the library links unchanged and OV_NVJPG falls back to CPU decode.
+##################################################
+if (EXISTS ${JMM}/include/nvbufsurface.h)
+    set(OV_NVJPG_DECODE_SRC src/track/nvjpg_decode.cpp)
+    set(OV_TEGRA_LIBS -L/usr/lib/aarch64-linux-gnu/tegra -lnvbufsurface -lEGL)
+    message(STATUS "OV_NVJPG: Jetson multimedia API found -- hardware decode compiled")
+else ()
+    set(OV_NVJPG_DECODE_SRC src/track/nvjpg_decode_stub.cpp)
+    set(OV_TEGRA_LIBS "")
+    message(STATUS "OV_NVJPG: Jetson multimedia API absent -- portable stub compiled")
+endif ()
+##################################################
 # Make the core library
 ##################################################
 
@@ -72,7 +86,7 @@ list(APPEND LIBRARY_SOURCES
         src/track/TrackKLT.cpp
         src/track/clahe_cuda.cu
         src/track/gpu_track.cu
-        src/track/nvjpg_decode.cpp
+        ${OV_NVJPG_DECODE_SRC}
         src/track/TrackSIM.cpp
         src/types/Landmark.cpp
         src/feat/Feature.cpp
@@ -83,9 +97,8 @@ list(APPEND LIBRARY_SOURCES
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_core_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_core_lib rclcpp cv_bridge)
-target_link_libraries(ov_core_lib ${thirdparty_libraries} cudart nvvpi
-        -L/usr/lib/aarch64-linux-gnu/tegra -lnvbufsurface -lEGL)
-target_include_directories(ov_core_lib PRIVATE ${JMM}/include /usr/local/cuda/include)
+target_link_libraries(ov_core_lib ${thirdparty_libraries} CUDA::cudart nvvpi ${OV_TEGRA_LIBS})
+target_include_directories(ov_core_lib PRIVATE ${JMM}/include ${CUDAToolkit_INCLUDE_DIRS})
 set_target_properties(ov_core_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_include_directories(ov_core_lib PUBLIC src/)
 install(TARGETS ov_core_lib
