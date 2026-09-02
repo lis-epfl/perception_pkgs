@@ -24,6 +24,7 @@
 
 #include <Eigen/Eigen>
 #include <unordered_map>
+#include <vector>
 
 #include <opencv2/opencv.hpp>
 
@@ -113,6 +114,25 @@ public:
     pt_out.x = ept2(0);
     pt_out.y = ept2(1);
     return pt_out;
+  }
+
+  /**
+   * @brief Batched undistortion of many raw uv points at once.
+   *
+   * The DEFAULT implementation is exactly today's per-point loop, so any model that does not
+   * override this is byte-for-byte unchanged. Models whose per-point path pays a large
+   * fixed per-CALL cost (an OpenCV entry, heap-allocated 1-point cv::Mat headers) override it
+   * to amortise that cost over N points. Overrides MUST be bit-exact per point: the OpenCV
+   * undistortion kernels process each point independently, so batching may change only how
+   * many times the per-call preamble is paid.
+   *
+   * @param in  Raw uv coordinates
+   * @param out Normalized coordinates (resized to in.size())
+   */
+  virtual void undistort_cv_batch(const std::vector<cv::Point2f> &in, std::vector<cv::Point2f> &out) {
+    out.resize(in.size());
+    for (size_t i = 0; i < in.size(); i++)
+      out[i] = undistort_cv(in[i]);
   }
 
   /**

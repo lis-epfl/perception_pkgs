@@ -23,6 +23,7 @@
 #define OV_CORE_TRACK_BASE_H
 
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -38,6 +39,20 @@
 #include "utils/sensor_data.h"
 
 namespace ov_core {
+
+// Realtime backlog signal (ms the current frame waited between arrival and processing).
+// Written by the serial runner before each feed; consumed by the detection cadence gate
+// (OV_DETECT_BACKLOG_MS) so detection top-off yields while the estimator is draining a
+// convoy. 0 when caught up or not in realtime mode.
+extern double g_rt_behind_ms;
+
+// Realtime look-ahead signal (OV_SPREAD_ADAPT). Counts COMPLETE camera frame-sets that have
+// already arrived (sensor-clock paced) but have not yet been handed to the estimator. Read
+// inside feed_measurement_camera: >0 means at least one LATER frame is already waiting, i.e.
+// spending this frame's slack on a queued sub-update would directly convoy it. Only ever
+// touched when OV_REALTIME=1, so it stays 0 (and every policy keyed off it stays inert) in
+// offline runs.
+extern std::atomic<int> g_frames_queued;
 
 class Feature;
 class CamBase;
@@ -95,6 +110,26 @@ public:
    * @param message Contains our timestamp, images, and camera ids
    */
   virtual void feed_new_camera(const CameraData &message) = 0;
+
+  /// Async-update support: when measurement writes are deferred (OV_ASYNC_UPDATE), the
+  /// estimator calls this after joining the update worker to commit them. Default: no-op.
+  virtual void flush_pending() {}
+
+  /// Runtime switch mirroring OV_ASYNC_UPDATE's deferred DB writes, for intra-frame overlap.
+  void set_defer(bool v) { defer_runtime.store(v, std::memory_order_relaxed); }
+  std::atomic<bool> defer_runtime{false};
+
+  /// OV_PIPELINE: refresh the tracker's PRIVATE copy of the camera intrinsics.  Under
+  /// calib_cam_intrinsics=true the filter writes state->_cam_intrinsics_cameras (the very
+  /// CamBase objects the tracker holds) on every EKF update -- a non-atomic 8-vector +
+  /// Matx33d + Vec4d write.  When tracking runs concurrently with the update that is a torn
+  /// read.  Called ONLY at a point where the update worker is drained, so both the read of
+  /// get_value() here and the later reads by the tracking threads are race-free.
+  /// Default: no-op (tracker keeps reading the live objects, byte-identical to today).
+  virtual void snapshot_calib() {}
+  /// Build the private copies.  false => this camera model cannot be cloned; caller must
+  /// refuse the pipeline rather than run with a torn read.
+  virtual bool init_calib_snapshot() { return false; }
 
   /**
    * @brief Shows features extracted in the last image
@@ -192,6 +227,28 @@ protected:
 
   /// Master ID for this tracker (atomic to allow for multi-threading)
   std::atomic<size_t> currid;
+
+  /// OV_DETERMINISTIC: per-camera strided feature ids.
+  /// `++currid` is shared by the four camera threads (use_stereo=false => one feed_monocular
+  /// per camera under one parallel_for_), so the SAME physical feature gets a different id run
+  /// to run even with a perfectly deterministic detector -- and every downstream container is
+  /// keyed or ordered by id (FeatureDatabase's unordered_map buckets, feats_lost/marg/maxtracks,
+  /// the SLAM promotion tail-pick). Striding by camera keeps ids globally unique AND strictly
+  /// increasing WITHIN a camera, which is the only property the code relies on: TrackKLT's
+  /// OV_RANSAC_OLDFIT boundary needs "every new id > every surviving old id", and pts_last /
+  /// ids_last are per-camera, so a per-camera monotone counter satisfies it exactly.
+  static bool det_ids_on() {
+    static const bool d = [] { const char *e = std::getenv("OV_DETERMINISTIC"); return e && *e == '1'; }();
+    return d;
+  }
+  static constexpr size_t DET_ID_STRIDE = 8;
+  std::atomic<size_t> det_ctr[DET_ID_STRIDE]{};
+  size_t next_id(size_t cam_id) {
+    if (!det_ids_on() || cam_id >= DET_ID_STRIDE)
+      return ++currid;
+    const size_t n = det_ctr[cam_id].fetch_add(1, std::memory_order_relaxed) + 1;
+    return n * DET_ID_STRIDE + cam_id + 1;
+  }
 
   // Timing variables (most children use these...)
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;

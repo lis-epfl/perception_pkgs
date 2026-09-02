@@ -78,6 +78,7 @@ list(APPEND LIBRARY_SOURCES
         src/sim/Simulator.cpp
         src/state/State.cpp
         src/state/StateHelper.cpp
+        src/state/ekf_cuda.cu
         src/state/Propagator.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
@@ -91,7 +92,7 @@ list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp src/ros/ROSVisualizerHelp
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_msckf_lib ${ament_libraries})
-target_link_libraries(ov_msckf_lib ${thirdparty_libraries})
+target_link_libraries(ov_msckf_lib ${thirdparty_libraries} gomp cublas cusolver cudart)
 target_include_directories(ov_msckf_lib PUBLIC src/)
 install(TARGETS ov_msckf_lib
         LIBRARY DESTINATION lib
@@ -114,6 +115,11 @@ ament_target_dependencies(run_subscribe_msckf ${ament_libraries})
 target_link_libraries(run_subscribe_msckf ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS run_subscribe_msckf DESTINATION lib/${PROJECT_NAME})
 
+add_executable(run_online_msckf src/run_online_msckf.cpp)
+ament_target_dependencies(run_online_msckf ${ament_libraries})
+target_link_libraries(run_online_msckf ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS run_online_msckf DESTINATION lib/${PROJECT_NAME})
+
 add_executable(run_serial_msckf src/run_serial_msckf.cpp)
 ament_target_dependencies(run_serial_msckf ${ament_libraries})
 target_link_libraries(run_serial_msckf ov_msckf_lib ${thirdparty_libraries})
@@ -128,3 +134,9 @@ install(DIRECTORY ../config/ DESTINATION share/${PROJECT_NAME}/config/)
 
 # finally define this as the package
 ament_package()
+
+# ROUND 21 instrument target: run_serial_msckf + OV_COV_OUT marginal-covariance dump.
+add_executable(run_cov_msckf src/run_cov_msckf.cpp)
+ament_target_dependencies(run_cov_msckf ${ament_libraries})
+target_link_libraries(run_cov_msckf ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS run_cov_msckf DESTINATION lib/${PROJECT_NAME})

@@ -90,6 +90,16 @@ public:
    */
   void update_feature(size_t id, double timestamp, size_t cam_id, float u, float v, float u_n, float v_n);
 
+  /// One observation in a bulk insert (see update_features_bulk).
+  struct BulkObs {
+    size_t id;
+    double timestamp;
+    size_t cam_id;
+    float u, v, u_n, v_n;
+  };
+  /// update_feature for a whole batch under ONE lock acquisition.
+  void update_features_bulk(const std::vector<BulkObs> &obs);
+
   /**
    * @brief Get features that do not have newer measurement then the specified time.
    *

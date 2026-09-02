@@ -33,8 +33,14 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
+#include <atomic>
+namespace ov_msckf {
+extern std::atomic<long> g_slam_init_ok, g_slam_init_fail, g_slam_marg;
+}
+
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include "utils/vprof.h"
 
 using namespace ov_core;
 using namespace ov_type;
@@ -59,6 +65,7 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
 }
 
 void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
+  VPROF("5.slam_delayed/TOTAL");
 
   // Return if no features
   if (feature_vec.empty())
@@ -182,7 +189,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     std::vector<std::shared_ptr<Type>> Hx_order;
 
     // Get the Jacobian for this feature
-    UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
+    { VPROF("8.jacobian_slam");
+    UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order); }
 
     // If we are doing the single feature representation, then we need to remove the bearing portion
     // To do so, we project the bearing portion onto the state and depth Jacobians and the residual.
@@ -230,11 +238,15 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     // Try to initialize, delete new pointer if we failed
     double chi2_multipler =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
-    if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
+    bool _ok; { VPROF("5.slam_delayed/c_state_initialize");
+    _ok = StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler); }
+    if (_ok) {
+      ov_msckf::g_slam_init_ok.fetch_add(1, std::memory_order_relaxed);
       state->_features_SLAM.insert({(*it2)->featid, landmark});
       (*it2)->to_delete = true;
       it2++;
     } else {
+      ov_msckf::g_slam_init_fail.fetch_add(1, std::memory_order_relaxed);
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
     }
@@ -248,9 +260,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     PRINT_ALL("[SLAM-DELAY]: %.4f seconds initialize (%d features)\n", (rT3 - rT2).total_microseconds() * 1e-6, (int)feature_vec.size());
     PRINT_ALL("[SLAM-DELAY]: %.4f seconds total\n", (rT3 - rT1).total_microseconds() * 1e-6);
   }
+  StateHelper::flush_init_updates(state, _options_slam.sigma_pix_sq);
 }
 
 void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
+  VPROF("4.slam_update/TOTAL");
 
   // Return if no features
   if (feature_vec.empty())
@@ -369,7 +383,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     std::vector<std::shared_ptr<Type>> Hx_order;
 
     // Get the Jacobian for this feature
-    UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
+    { VPROF("8.jacobian_slam");
+    UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order); }
 
     // Place Jacobians in one big Jacobian, since the landmark is already in our state vector
     Eigen::MatrixXd H_xf = H_x;
@@ -477,7 +492,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   R_big.conservativeResize(ct_meas, ct_meas);
 
   // 5. With all good SLAM features update the state
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
+  { VPROF("4.slam_update/z_ekf_update");
+  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big); }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // Debug print timing information
@@ -489,6 +505,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
 }
 
 void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
+  VPROF("6.anchor_change/TOTAL");
 
   // Return if we do not have enough clones
   if ((int)state->_clones_IMU.size() <= state->_options.max_clone_size) {

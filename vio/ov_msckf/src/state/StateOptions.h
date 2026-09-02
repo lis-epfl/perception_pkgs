@@ -27,6 +27,8 @@
 #include "utils/print.h"
 #include "utils/sensor_data.h"
 
+#include <cstdlib>
+
 namespace ov_msckf {
 
 /**
@@ -157,6 +159,36 @@ struct StateOptions {
         std::exit(EXIT_FAILURE);
       }
     }
+
+    // OV_MAX_CLONES / OV_MAX_SLAM: env overrides for the two state-dimension caps.
+    // Default OFF (unset => yaml value, behaviour bit-identical to today).
+    //   N    = 15(IMU) + 57(calib) + 6*max_clone_size + 3*n_slam
+    //   cols = 6*max_clone_size + 14*n_cams  <- involved width of every saturated update
+    // Cost of one update ~ sys(rows) + cmp(rows*cols^2) + ekfu(N^2*m + N*c*m + m*c^2),
+    // so max_clone_size is quadratic in BOTH the compression QR and the covariance downdate.
+    // OV_MAX_SLAM exists only to hold n_slam down: lowering max_clone_size also lowers the
+    // feats_maxtracks promotion threshold (VioManager.cpp:834), which inflates n_slam.
+    // Placed OUTSIDE the parser block so it is live on every construction path, and BEFORE
+    // the PRINT_DEBUG below so the log prints the EFFECTIVE value.
+    if (const char *e_mc = std::getenv("OV_MAX_CLONES")) {
+      int v = atoi(e_mc);
+      if (v >= 6) { // >=6: VioManager.cpp:753/791 use min(max_clone_size,5)
+        PRINT_INFO("[statedim]: OV_MAX_CLONES override %d -> %d\n", max_clone_size, v);
+        max_clone_size = v;
+      } else {
+        PRINT_ERROR(RED "[statedim]: OV_MAX_CLONES=%s IGNORED (must be >= 6)\n" RESET, e_mc);
+      }
+    }
+    if (const char *e_ms = std::getenv("OV_MAX_SLAM")) {
+      int v = atoi(e_ms);
+      if (v >= 0) {
+        PRINT_INFO("[statedim]: OV_MAX_SLAM override %d -> %d\n", max_slam_features, v);
+        max_slam_features = v;
+      } else {
+        PRINT_ERROR(RED "[statedim]: OV_MAX_SLAM=%s IGNORED (must be >= 0)\n" RESET, e_ms);
+      }
+    }
+
     PRINT_DEBUG("  - use_fej: %d\n", do_fej);
     PRINT_DEBUG("  - integration: %d\n", integration_method);
     PRINT_DEBUG("  - calib_cam_extrinsics: %d\n", do_calib_camera_pose);

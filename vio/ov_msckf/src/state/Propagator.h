@@ -35,6 +35,42 @@ namespace ov_msckf {
 class State;
 
 /**
+ * OV_ASYNC_EMIT (round 6): immutable snapshot of everything fast_state_propagate needs from
+ * `state`, published by the update thread at the END of do_feature_propagate_update (and after
+ * ZUPT / init).  The point is that `State` has NO general lock -- State::_mutex_state guards
+ * only margtimestep()/oldest_clone_time(); _imu, _Cov, _clones_IMU and every _calib_* are
+ * unprotected and StateHelper mutates them in 9 places.  So a decoupled pose emitter must never
+ * touch `state` at all.  A freshly-allocated, never-mutated snapshot handed over by shared_ptr
+ * is safe by construction and deliberately avoids the std::map-first-insert race class that
+ * produced this project's documented startup SIGSEGV.
+ *
+ * NOTE: carries the MEAN only.  Covariance is intentionally absent: get_marginal_covariance()
+ * is the expensive part of fast_state_propagate and it needs the live state.
+ */
+struct PoseSnap {
+  double t = -1.0;                                                   ///< state->_timestamp (CAMERA clock)
+  double t_off = 0.0;                                                ///< _calib_dt_CAMtoIMU
+  Eigen::Matrix<double, 16, 1> imu = Eigen::Matrix<double, 16, 1>::Zero(); ///< q_GtoI,p_IinG,v_IinG,bg,ba
+  Eigen::Matrix3d Dw = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d Da = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d Tg = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d R_A2I = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d R_G2I = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d gravity = Eigen::Vector3d::Zero();
+  long seq = 0;                                                      ///< monotone publication counter
+};
+
+/// Publish a new snapshot (update thread).  Cheap: one shared_ptr store under a tiny mutex,
+/// ~40 calls/s against ~30 loads/s -- an atomic<shared_ptr> would need C++20 on this toolchain.
+void ov_pose_snap_publish(const std::shared_ptr<const PoseSnap> &s);
+
+/// Load the newest snapshot (emitter thread).  Returns nullptr before the first publication.
+std::shared_ptr<const PoseSnap> ov_pose_snap_load();
+
+/// OV_ASYNC_EMIT=1 -- gate for snapshot publication.  Default OFF (nothing is published).
+bool ov_async_emit_enabled();
+
+/**
  * @brief Performs the state covariance and mean propagation using imu measurements
  *
  * We will first select what measurements we need to propagate with.
@@ -124,6 +160,34 @@ public:
    */
   bool fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                             Eigen::Matrix<double, 12, 12> &covariance);
+
+  /// Global gravity vector (set once at construction, never mutated -- safe to read cross-thread)
+  const Eigen::Vector3d &gravity() const { return _gravity; }
+
+  /**
+   * @brief MEAN-ONLY fast propagation from an immutable PoseSnap -- the thread-safe twin of
+   * fast_state_propagate().  Identical arithmetic on the mean (verified in-binary under
+   * OV_ASYNC_VERIFY=1); the F/G/Qd covariance recursion is omitted on purpose.
+   *
+   * Pure function of its arguments: touches no member and no `state`, so it may be called from
+   * any thread with any IMU vector the caller owns.
+   *
+   * @param snap Immutable state snapshot
+   * @param imu  IMU readings the CALLER owns (must cover [snap.t+t_off, timestamp+t_off])
+   * @param timestamp Time to propagate to (CAMERA clock -- t_off is applied internally)
+   * @param state_plus out: q_GtoI(4), p_IinG(3), v_IinI(3), w_IinI(3)
+   */
+  static bool fast_propagate_snap(const PoseSnap &snap, const std::vector<ov_core::ImuData> &imu, double timestamp,
+                                  Eigen::Matrix<double, 13, 1> &state_plus);
+
+  /**
+   * @brief OV_ASYNC_VERIFY=1 -- IN-BINARY numerical proof that fast_propagate_snap() reproduces
+   * fast_state_propagate()'s MEAN exactly.  Runs BOTH code paths in THIS process on the SAME
+   * live state and the SAME IMU buffer and returns the max abs difference over the 13-vector.
+   * Leaves the fast-propagation cache invalidated so the surrounding run is unperturbed.
+   * @return 1 both paths produced a result, 0 either path declined (too little IMU)
+   */
+  int fast_propagate_selfcheck(std::shared_ptr<State> state, double timestamp, double &max_abs_diff);
 
   /**
    * @brief Helper function that given current imu data, will select imu readings between the two times.

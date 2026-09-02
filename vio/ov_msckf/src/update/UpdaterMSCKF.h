@@ -67,6 +67,16 @@ public:
    */
   void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
 
+  /**
+   * @brief OV_PREJAC producer: triangulate + build + nullspace-project the per-feature system
+   *        for features that the NEXT queued sub-update will consume, off the critical path.
+   *
+   * Runs on a worker thread during the next frame's tracking window. `feats` are private deep
+   * copies (never the database's Feature objects) and `state` is frozen for the whole call.
+   * Results land in ov_msckf::g_prejac keyed by feature id, stamped with `epoch`.
+   */
+  void prejac_precompute(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_core::Feature>> &feats, uint64_t epoch);
+
 protected:
   /// Options used during update
   UpdaterOptions _options;

@@ -42,6 +42,8 @@
 #include <rclcpp/serialization.hpp>
 
 #include "core/VioManager.h"
+#include "state/State.h"
+#include "state/StateHelper.h"
 #include "core/VioManagerOptions.h" // pulls in ov_core::YamlParser + Printer
 #include "utils/bag_source.h"       // merged multi-file reader + deferred decode
 #include "utils/dataset_reader.h"
@@ -446,6 +448,28 @@ struct Scoped {
 };
 } // namespace
 
+
+// ---- ROUND 21 INSTRUMENT: dump the marginal 6x6 covariance of the IMU pose ---------------
+// OV_COV_OUT=<file> -> one line per emitted pose:  t  P(0,0) .. P(5,5)  (row-major, 36 values)
+// StateHelper ordering for _imu->pose() is [theta_GtoI (3) ; p_IinG (3)].
+// Read-only w.r.t. the filter; fired from exactly the same points as the .tum line.
+static FILE *g_covf = nullptr;
+static bool  g_covf_tried = false;
+static inline FILE *ov_covf() {
+  if (!g_covf_tried) {
+    g_covf_tried = true;
+    const char *p = std::getenv("OV_COV_OUT");
+    if (p && *p) {
+      g_covf = std::fopen(p, "w");
+      if (g_covf) {
+        std::fprintf(g_covf, "# t_cam P[6x6] row-major, order [th_x th_y th_z px py pz]\n");
+        std::atexit([]() { if (g_covf) { std::fflush(g_covf); std::fclose(g_covf); g_covf = nullptr; } });
+      }
+    }
+  }
+  return g_covf;
+}
+
 int main(int argc, char **argv) {
   // Any SIGSEGV/SIGABRT prints a raw backtrace to stderr before dying, so rare startup crashes
   // leave evidence even when nothing was attached and stdout buffering ate the log tail.
@@ -833,6 +857,15 @@ int main(int argc, char **argv) {
     std::snprintf(buf, sizeof(buf), "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f",
                   state->_timestamp, p(0), p(1), p(2), q(0), q(1), q(2), q(3));
     lines.emplace_back(buf);
+    if (FILE *cf_ = ov_covf()) {
+      std::vector<std::shared_ptr<ov_type::Type>> hord_;
+      hord_.push_back(state->_imu->pose());
+      Eigen::MatrixXd Pm_ = ov_msckf::StateHelper::get_marginal_covariance(state, hord_);
+      std::fprintf(cf_, "%.9f", state->_timestamp);
+      for (int r_ = 0; r_ < 6; r_++)
+        for (int c_ = 0; c_ < 6; c_++) std::fprintf(cf_, " %.9g", Pm_(r_, c_));
+      std::fprintf(cf_, "\n");
+    }
     if (series != nullptr) {
       const double ts = state->_timestamp;
       if (series_next < 0)
@@ -963,6 +996,15 @@ int main(int argc, char **argv) {
       std::snprintf(buf, sizeof(buf), "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f",
                     state->_timestamp, p(0), p(1), p(2), q(0), q(1), q(2), q(3));
       lines.emplace_back(buf);
+    if (FILE *cf_ = ov_covf()) {
+      std::vector<std::shared_ptr<ov_type::Type>> hord_;
+      hord_.push_back(state->_imu->pose());
+      Eigen::MatrixXd Pm_ = ov_msckf::StateHelper::get_marginal_covariance(state, hord_);
+      std::fprintf(cf_, "%.9f", state->_timestamp);
+      for (int r_ = 0; r_ < 6; r_++)
+        for (int c_ = 0; c_ < 6; c_++) std::fprintf(cf_, " %.9g", Pm_(r_, c_));
+      std::fprintf(cf_, "\n");
+    }
       if (series != nullptr) {
         const double ts = state->_timestamp;
         if (series_next < 0)

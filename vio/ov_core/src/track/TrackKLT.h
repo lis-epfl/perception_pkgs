@@ -106,6 +106,11 @@ public:
    */
   void feed_new_camera(const CameraData &message) override;
 
+  /// Submit next frame's upload+CLAHE+pyramid to the GPU now (async, no sync). Called from the
+  /// estimator right after this frame's tracking so the GPU fills during the EKF update; the
+  /// matching feed_new_camera skips its own gpu_prepare when the timestamp matches.
+  void preseed_gpu(const ov_core::CameraData &message);
+
 protected:
   /**
    * @brief Process a new monocular image
@@ -172,11 +177,68 @@ protected:
    * The two point vectors will be of equal size, but the mask_out variable will specify which points are good or bad.
    * If the second vector is non-empty, it will be used as an initial guess of where the keypoints are in the second image.
    */
+  /// When pre_status is non-null the pyramidal KLT is SKIPPED: pts1 is taken as already tracked
+  /// and pre_status as its success mask. Undistortion and RANSAC then run unchanged, so the GPU
+  /// path gets bit-identical outlier rejection rather than a reimplementation.
+  /// OV_UNDIST_BATCH: when pts1_norm_out is non-null AND the gate is armed, the normalized
+  /// coordinates this function already computed for pts1 (== kpts1 on return, see the copy-back
+  /// at the end of the definition) are handed back so the caller does not have to undistort the
+  /// SAME points a THIRD time at the feature-DB write. nullptr / gate off => untouched.
   void perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &pts0,
-                        std::vector<cv::KeyPoint> &pts1, size_t id0, size_t id1, std::vector<uchar> &mask_out);
+                        std::vector<cv::KeyPoint> &pts1, size_t id0, size_t id1, std::vector<uchar> &mask_out,
+                        const std::vector<uchar> *pre_status = nullptr, int n_old = -1,
+                        std::vector<cv::Point2f> *pts1_norm_out = nullptr);
+
+  void flush_pending() override;
+
+  // ---- OV_PIPELINE calibration snapshot -------------------------------------------------
+  // calib_snap is EMPTY unless init_calib_snapshot() succeeded; empty => every read falls
+  // back to the live camera_calib objects, so the gate-OFF path is byte-identical.
+  void snapshot_calib() override;
+  bool init_calib_snapshot() override;
+  /// Resolve the CamBase the TRACKER should read.  Hoist out of per-point loops.
+  ov_core::CamBase *calib_for(size_t cam_id) {
+    if (!calib_snap.empty()) {
+      auto it = calib_snap.find(cam_id);
+      if (it != calib_snap.end())
+        return it->second.get();
+    }
+    return camera_calib.at(cam_id).get();
+  }
+  std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> calib_snap;
+
+  /// Single-submitter: queue this camera's detection kernels (async) from one thread; the
+  /// parallel completion in feed_monocular then only syncs and downloads.
+  void perform_detection_submit(size_t cam_id, const cv::Mat &mask0, bool due_cadence);
+
+  /// GPU counterpart of perform_detection_monocular. All bookkeeping (pruning, the min_px_dist
+  /// occupancy grid, greedy dedup, id assignment) stays on the CPU so feature selection ORDER is
+  /// unchanged -- MSCKF picks features by id, so order matters. Only FAST runs on the device.
+  void perform_detection_monocular_gpu(size_t cam_id, bool on_current, int w, int h, const cv::Mat &mask0,
+                                       std::vector<cv::KeyPoint> &pts0, std::vector<size_t> &ids0);
 
 
   // Parameters for our FAST grid detector
+  // deferred database writes (async-update mode)
+  std::map<size_t, bool> det_submitted;
+  // OV_DETECT_SPLIT staleness guard: det_gen[cam] counts this camera's gpu_commit calls (i.e.
+  // which image is d_prev); det_pending_gen[cam] is the generation a submitted-but-unharvested
+  // detection was computed against. A submitted detection that is NOT consumed on the predicted
+  // frame (num_featsneeded early-return, or an adaptive burst re-ordering the cadence) must be
+  // DROPPED, not harvested later against a pts_last/d_prev that has moved -- that is the exact
+  // coordinate-frame bug class that makes OV_DETECT_AFTER unusable.
+  std::map<size_t, long> det_pending_gen;   // frame index that must consume it (-1 = none)
+
+  // preseed_gpu bookkeeping: cam -> timestamp whose device prepare is already queued
+  std::mutex preseed_mtx;
+  std::map<size_t, double> preseeded;
+
+  struct PendingObs { size_t id; double ts; size_t cam; float u, v, un, vn; };
+  std::vector<PendingObs> pending_obs;
+  static constexpr size_t PEND_NCAM = 8;          // OV_DETERMINISTIC: per-camera deferral buckets
+  std::vector<PendingObs> pending_by_cam[PEND_NCAM];
+  std::mutex pending_mtx;
+
   int threshold;
   int grid_x;
   int grid_y;

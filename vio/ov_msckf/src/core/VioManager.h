@@ -30,6 +30,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <functional>
+#include <deque>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+#include <cstdint>
 
 #include "VioManagerOptions.h"
 
@@ -37,6 +43,7 @@ namespace ov_core {
 struct ImuData;
 struct CameraData;
 class TrackBase;
+class Feature;
 class FeatureInitializer;
 } // namespace ov_core
 namespace ov_init {
@@ -62,11 +69,54 @@ class Propagator;
 class VioManager {
 
 public:
+  /// Fires right after feature tracking, before the EKF update -- lets the host pipeline
+  /// preseed the NEXT frame's GPU work into the update's idle window. Arg: current frame ts.
+  void set_post_track_hook(std::function<void(double)> f) { post_track_hook = std::move(f); }
+
+  // ================= OV_PIPELINE (default OFF) ==========================================
+  // Overlap the EKF update of frame N with the GPU tracking of frame N+1.  The update runs
+  // on ONE persistent worker thread; the estimator thread drains it immediately after the
+  // next frame's tracking, so exactly one update is ever in flight and the sequence of
+  // filter operations (which measurements, which clone times, which order) is UNCHANGED --
+  // only which thread and which wall-clock window executes them.
+  //
+  // Consequence for anyone reading the state: between the submit at the end of a frame and
+  // the drain in the middle of the next one, `state` is being MUTATED by the worker and must
+  // not be read.  That is why the pose is emitted through pose_sink, which fires only at
+  // points where the worker is provably idle.
+  /// Fires whenever the filter state is quiescent and may have advanced (post-drain, post-ZUPT,
+  /// post-init).  Only used when the pipeline is armed; the caller logs the pose from here
+  /// instead of reading the live state after feed_measurement_camera returns.
+  void set_pose_sink(std::function<void()> f) { pose_sink = std::move(f); }
+  /// True only if OV_PIPELINE=1 AND every refusal check passed.  Read it back from the
+  /// "[pipe]: armed=..." line in the run log; never assume the env var took effect.
+  bool pipeline_on() const { return _pipe_on; }
+  /// Drain the worker and fire pose_sink.  MUST be called once after the last frame, before
+  /// anything reads the state (final .tum row, calibration dump, destructors).
+  void pipeline_flush();
+  /// Hand a batch of sub-updates to the persistent worker.  The batch is captured BY VALUE so
+  /// the worker never touches _upd_queue or _last_update_time_decim.
+  void pipe_submit(const std::vector<ov_core::CameraData> &subs);
+  std::function<void()> pose_sink;
+  bool _pipe_on = false;
+  /// margtimestep()-derived IMU trim time cached at the last quiescent point.  See
+  /// feed_measurement_imu: state->_clones_IMU is inserted into WITHOUT the state mutex
+  /// (StateHelper::augment_clone), so the producer must not iterate it while the worker runs.
+  double _pipe_oldest_time = -1.0;
+  std::atomic<bool> _pipe_inflight{false};
+  /// Queue next frame's device prepare (async). No-op for non-KLT trackers or downsampling.
+  void preseed_next_frame(const ov_core::CameraData &m);
+
   /**
    * @brief Default constructor, will load all configuration variables
    * @param params_ Parameters loaded from either ROS or CMDLINE
    */
   VioManager(VioManagerOptions &params_);
+
+  /// Joins the OV_PREJAC precompute worker. Without this, a still-joinable std::thread member
+  /// is destroyed at shutdown and std::terminate() aborts the process (which also truncated the
+  /// buffered latency dump).
+  ~VioManager();
 
   /**
    * @brief Feed function for inertial data
@@ -187,6 +237,27 @@ protected:
   /// Per-lead-cam time of the last EKF update (OV_UPDATE_MIN_DT decimation).
   std::map<int, double> _last_update_time_decim;
 
+  /// OV_SPREAD_UPD queue of pending sub-updates (tick timestamp, lead cam id). Member rather
+  /// than a function-static so the producer at the end of do_feature_propagate_update can see
+  /// which sub-update runs next.
+  std::deque<std::pair<double, int>> _upd_queue;
+
+  //=================================================================================
+  // OV_PREJAC: hoist the next queued sub-update's triangulation + Jacobian + nullspace
+  // projection onto a worker that runs during the next frame's tracking window. Exact.
+  //=================================================================================
+  std::thread _prejac_thread;
+  /// Snapshot (deep copies) of the features the worker is allowed to touch. Copies, so the
+  /// worker never reads a Feature the tracker may be writing to.
+  std::vector<std::shared_ptr<ov_core::Feature>> _prejac_snap;
+  uint64_t _prejac_epoch = 0;
+  /// Join the precompute worker (no-op if none running). MUST be called before anything can
+  /// mutate the state or the feature database.
+  void prejac_join();
+  /// Snapshot + launch. `lost_all` is the unfiltered feats_lost of the update that just ran.
+  void prejac_launch(int lead_cam, const std::vector<std::shared_ptr<ov_core::Feature>> &lost_all,
+                     const std::unordered_set<size_t> &marg_ids);
+
   /// Manager parameters
   VioManagerOptions params;
 
@@ -198,6 +269,7 @@ protected:
 
   /// Our sparse feature tracker (klt or descriptor)
   std::shared_ptr<ov_core::TrackBase> trackFEATS;
+  std::function<void(double)> post_track_hook;
 
   /// Our aruoc tracker
   std::shared_ptr<ov_core::TrackBase> trackARUCO;

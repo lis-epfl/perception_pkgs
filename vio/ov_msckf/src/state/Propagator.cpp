@@ -30,6 +30,134 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+//=====================================================================================
+// OV_ASYNC_EMIT: decoupled pose emission support (round 6).
+// Snapshot publication + a mean-only, state-free fast propagation.
+//=====================================================================================
+namespace ov_msckf {
+namespace {
+std::mutex g_snap_mtx;
+std::shared_ptr<const PoseSnap> g_snap;
+} // namespace
+
+void ov_pose_snap_publish(const std::shared_ptr<const PoseSnap> &s) {
+  std::lock_guard<std::mutex> lk(g_snap_mtx);
+  g_snap = s;
+}
+
+std::shared_ptr<const PoseSnap> ov_pose_snap_load() {
+  std::lock_guard<std::mutex> lk(g_snap_mtx);
+  return g_snap;
+}
+
+bool ov_async_emit_enabled() {
+  static const bool e = [] {
+    const char *v = std::getenv("OV_ASYNC_EMIT");
+    return v && *v == '1';
+  }();
+  return e;
+}
+} // namespace ov_msckf
+
+int Propagator::fast_propagate_selfcheck(std::shared_ptr<State> state, double timestamp, double &max_abs_diff) {
+
+  max_abs_diff = -1.0;
+
+  // Build the snapshot exactly as VioManager publishes it.
+  PoseSnap snap;
+  snap.t = state->_timestamp;
+  snap.t_off = state->_calib_dt_CAMtoIMU->value()(0);
+  snap.imu = state->_imu->value();
+  snap.Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
+  snap.Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
+  snap.Tg = State::Tg(state->_calib_imu_tg->value());
+  snap.R_A2I = state->_calib_imu_ACCtoIMU->Rot();
+  snap.R_G2I = state->_calib_imu_GYROtoIMU->Rot();
+  snap.gravity = _gravity;
+
+  std::vector<ov_core::ImuData> imu_copy;
+  {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    imu_copy = imu_data;
+  }
+
+  // Reference path: the shipped fast_state_propagate.  Force it to refresh its cache from the
+  // live state so both paths start from identical numbers.
+  invalidate_cache();
+  Eigen::Matrix<double, 13, 1> sp_ref, sp_new;
+  Eigen::Matrix<double, 12, 12> cov_ref;
+  const bool ok_ref = fast_state_propagate(state, timestamp, sp_ref, cov_ref);
+  invalidate_cache(); // leave the run exactly as we found it
+  const bool ok_new = fast_propagate_snap(snap, imu_copy, timestamp, sp_new);
+  if (!ok_ref || !ok_new)
+    return 0;
+  max_abs_diff = (sp_ref - sp_new).cwiseAbs().maxCoeff();
+  return 1;
+}
+
+bool Propagator::fast_propagate_snap(const PoseSnap &snap, const std::vector<ov_core::ImuData> &imu, double timestamp,
+                                     Eigen::Matrix<double, 13, 1> &state_plus) {
+
+  if (snap.t < 0)
+    return false;
+
+  // Same window as fast_state_propagate: state time -> requested time, both shifted into the
+  // IMU clock by the camera-IMU time offset that was live when the snapshot was taken.
+  const double time0 = snap.t + snap.t_off;
+  const double time1 = timestamp + snap.t_off;
+  std::vector<ov_core::ImuData> prop_data = Propagator::select_imu_readings(imu, time0, time1, false);
+  if (prop_data.size() < 2)
+    return false;
+
+  // Biases and IMU intrinsics come from the snapshot, never from live state.
+  const Eigen::Vector3d bias_g = snap.imu.block(10, 0, 3, 1);
+  const Eigen::Vector3d bias_a = snap.imu.block(13, 0, 3, 1);
+  const Eigen::Matrix3d &Dw = snap.Dw;
+  const Eigen::Matrix3d &Da = snap.Da;
+  const Eigen::Matrix3d &Tg = snap.Tg;
+  const Eigen::Matrix3d &R_ACCtoIMU = snap.R_A2I;
+  const Eigen::Matrix3d &R_GYROtoIMU = snap.R_G2I;
+
+  Eigen::Matrix<double, 16, 1> est = snap.imu;
+
+  // Mean-only version of the fast_state_propagate loop.  The F/G/Qd covariance recursion is
+  // deliberately absent -- it is the expensive part and the emitted pose does not carry it.
+  for (size_t i = 0; i < prop_data.size() - 1; i++) {
+
+    const auto &data_minus = prop_data.at(i);
+    const auto &data_plus = prop_data.at(i + 1);
+    const double dt = data_plus.timestamp - data_minus.timestamp;
+
+    Eigen::Vector3d a_hat1 = R_ACCtoIMU * Da * (data_minus.am - bias_a);
+    Eigen::Vector3d a_hat2 = R_ACCtoIMU * Da * (data_plus.am - bias_a);
+    Eigen::Vector3d a_hat = 0.5 * (a_hat1 + a_hat2);
+
+    Eigen::Vector3d w_hat1 = R_GYROtoIMU * Dw * (data_minus.wm - bias_g - Tg * a_hat1);
+    Eigen::Vector3d w_hat2 = R_GYROtoIMU * Dw * (data_plus.wm - bias_g - Tg * a_hat2);
+    Eigen::Vector3d w_hat = 0.5 * (w_hat1 + w_hat2);
+
+    Eigen::Matrix3d R_Gtoi = quat_2_Rot(est.block(0, 0, 4, 1));
+    Eigen::Vector3d v_iinG = est.block(7, 0, 3, 1);
+    Eigen::Vector3d p_iinG = est.block(4, 0, 3, 1);
+
+    est.block(0, 0, 4, 1) = rot_2_quat(exp_so3(-w_hat * dt) * R_Gtoi);
+    est.block(4, 0, 3, 1) = p_iinG + v_iinG * dt + 0.5 * R_Gtoi.transpose() * a_hat * dt * dt - 0.5 * snap.gravity * dt * dt;
+    est.block(7, 0, 3, 1) = v_iinG + R_Gtoi.transpose() * a_hat * dt - snap.gravity * dt;
+  }
+
+  const Eigen::Vector4d q_Gtoi = est.block(0, 0, 4, 1);
+  const Eigen::Vector3d v_iinG = est.block(7, 0, 3, 1);
+  const Eigen::Vector3d p_iinG = est.block(4, 0, 3, 1);
+  state_plus.setZero();
+  state_plus.block(0, 0, 4, 1) = q_Gtoi;
+  state_plus.block(4, 0, 3, 1) = p_iinG;
+  state_plus.block(7, 0, 3, 1) = quat_2_Rot(q_Gtoi) * v_iinG; // local frame v_iini
+  Eigen::Vector3d last_a = R_ACCtoIMU * Da * (prop_data.at(prop_data.size() - 1).am - bias_a);
+  Eigen::Vector3d last_w = R_GYROtoIMU * Dw * (prop_data.at(prop_data.size() - 1).wm - bias_g - Tg * last_a);
+  state_plus.block(10, 0, 3, 1) = last_w;
+  return true;
+}
+
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
   // If the difference between the current update time and state is zero

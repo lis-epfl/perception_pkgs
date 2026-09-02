@@ -93,6 +93,24 @@ public:
                         const Eigen::VectorXd &res, const Eigen::MatrixXd &R);
 
   /**
+   * @brief Isotropic-noise overload: R == sigma2 * I, never materialised.
+   * Bit-identical to the matrix overload for isotropic R, but skips an m x m identity and adds
+   * the scalar straight onto S's diagonal.
+   */
+  static void EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order, const Eigen::MatrixXd &H,
+                        const Eigen::VectorXd &res, double sigma2, Eigen::VectorXd *dx_out = nullptr);
+
+  /**
+   * @brief OV_CHUNK_ROWS: split one compressed (square, upper-triangular) update into k
+   * sequential sub-updates of chunk_rows rows each. Exact for isotropic R -- a row partition of
+   * an isotropic-R system is block-diagonal in R, so the blocks are independent and sequential
+   * conditioning reproduces the batch posterior. Falls back to the batch path when H is not
+   * square (i.e. compression did not run) or the system is too small to split.
+   */
+  static void EKFUpdateTriChunked(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                                  const Eigen::MatrixXd &H, const Eigen::VectorXd &res, double sigma_pix_sq, int chunk_rows);
+
+  /**
    * @brief This will set the initial covaraince of the specified state elements.
    * Will also ensure that proper cross-covariances are inserted.
    * @param state Pointer to state
@@ -113,6 +131,15 @@ public:
    * @param small_variables Vector of variables whose marginal covariance is desired
    * @return Marginal covariance of the passed variables
    */
+  /**
+   * @brief OV_MSCKF_SCRATCH: identical double loop to get_marginal_covariance() with no
+   * zero-fill (the loop writes EVERY block, so the zero is dead) and no allocation -- the
+   * caller owns `out`. Bit-identical result.
+   */
+  static void get_marginal_covariance_into(std::shared_ptr<State> state,
+                                           const std::vector<std::shared_ptr<ov_type::Type>> &small_variables,
+                                           Eigen::Ref<Eigen::MatrixXd> out);
+
   static Eigen::MatrixXd get_marginal_covariance(std::shared_ptr<State> state,
                                                  const std::vector<std::shared_ptr<ov_type::Type>> &small_variables);
 
@@ -166,6 +193,9 @@ public:
    * @param res Residual of initializing measurements
    * @param chi_2_mult Value we should multiply the chi2 threshold by (larger means it will be accepted more measurements)
    */
+  /// Applies all batched init update-portions (OV_BATCH_INIT_UP=1) as one stacked EKF update.
+  static void flush_init_updates(std::shared_ptr<State> state, double sigma_pix_sq);
+
   static bool initialize(std::shared_ptr<State> state, std::shared_ptr<ov_type::Type> new_variable,
                          const std::vector<std::shared_ptr<ov_type::Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
                          Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult);
@@ -234,6 +264,15 @@ public:
   static void marginalize_slam(std::shared_ptr<State> state);
 
 private:
+  /// Shared body of both EKFUpdate overloads. Rp == nullptr means "R is sigma2 * I".
+  /// Must be a member: it touches State::_Cov / State::_variables, which are private to
+  /// State with only StateHelper befriended.
+  /// dx_out, when non-null, receives the full-state correction this update applied (state
+  /// layout, length N). EKFUpdateTriChunked needs it to re-evaluate each later chunk's residual.
+  static void ekf_update_impl(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                              const Eigen::MatrixXd &H, const Eigen::VectorXd &res, const Eigen::MatrixXd *Rp, double sigma2,
+                              Eigen::VectorXd *dx_out = nullptr);
+
   /**
    * All function in this class should be static.
    * Thus an instance of this class cannot be created.

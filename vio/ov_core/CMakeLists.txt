@@ -4,6 +4,22 @@ project(ov_core)
 # Include libraries (if we don't have opencv 4, then fallback to opencv 3)
 # The OpenCV version needs to match the one used by cv_bridge otherwise you will get a segmentation fault!
 find_package(Eigen3 REQUIRED)
+
+# CUDA for the GPU CLAHE path (src/track/clahe_cuda.cu). Optional: if no nvcc is found the
+# .cu is dropped and TrackKLT keeps using cv::CLAHE.
+set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+include(CheckLanguage)
+check_language(CUDA)
+if (CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES 87)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
+    add_definitions(-DHAVE_CUDA_CLAHE=1)
+    # VPI supplies the pyramid and pyramidal-KLT used by the GPU-resident tracker
+    include_directories(/opt/nvidia/vpi3/include)
+    link_directories(/opt/nvidia/vpi3/lib/aarch64-linux-gnu)
+    message(STATUS "CUDA found: GPU CLAHE path enabled")
+endif ()
 find_package(OpenCV 3 QUIET)
 if (NOT OpenCV_FOUND)
     find_package(OpenCV 4 REQUIRED)
@@ -44,10 +60,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Enable compile optimizations
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mcpu=cortex-a78ae -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops")
 
 # Enable debug flags (use if you want to debug in gdb)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g3 -Wall -Wuninitialized -Wmaybe-uninitialized -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wuninitialized -Wmaybe-uninitialized")
 
 # Find our ROS version!
 # NOTE: Default to using the ROS1 package if both are in our enviroment

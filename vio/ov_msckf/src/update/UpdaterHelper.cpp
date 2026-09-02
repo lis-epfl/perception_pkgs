@@ -21,6 +21,13 @@
 
 #include "UpdaterHelper.h"
 
+#include "state/ekf_cuda.h"
+
+#include <omp.h>
+#include <cstring>
+#include <algorithm>
+#include <numeric>
+
 #include "state/State.h"
 
 #include "utils/quat_ops.h"
@@ -28,6 +35,16 @@
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+// OV_MSCKF_SCRATCH: bit-exact execution changes only (no arithmetic op, operand or summation
+// order changes). Set per-call by UpdaterMSCKF so UpdaterSLAM's calls are untouched.
+namespace ov_msckf {
+thread_local bool g_msckf_scratch_tl = false;
+// Monotonically grown 16B-aligned (malloc guarantees it on aarch64, = EIGEN_MAX_ALIGN_BYTES)
+// per-thread scratch. Never shrunk.
+thread_local std::vector<double> g_sc_w;
+}
+#include <vector>
 
 void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                                         std::vector<Eigen::MatrixXd> &H_x, std::vector<std::shared_ptr<Type>> &x_order) {
@@ -292,9 +309,17 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   // Allocate our residual and Jacobians
   int c = 0;
   int jacobsize = (feature.feat_representation != LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) ? 3 : 1;
-  res = Eigen::VectorXd::Zero(2 * total_meas);
-  H_f = Eigen::MatrixXd::Zero(2 * total_meas, jacobsize);
-  H_x = Eigen::MatrixXd::Zero(2 * total_meas, total_hx);
+  const bool sc_ = ov_msckf::g_msckf_scratch_tl;
+  if (sc_) {
+    // res is fully written by the res.block(2*c,...) assignment below, H_f by the
+    // H_f.block(2*c,...) assignment -- every 2-row band, every iteration. The zero is dead.
+    res.resize(2 * total_meas);
+    H_f.resize(2 * total_meas, jacobsize);
+  } else {
+    res = Eigen::VectorXd::Zero(2 * total_meas);
+    H_f = Eigen::MatrixXd::Zero(2 * total_meas, jacobsize);
+  }
+  H_x = Eigen::MatrixXd::Zero(2 * total_meas, total_hx); // genuinely block-sparse -- KEEP the zero
 
   // Derivative of p_FinG in respect to feature representation.
   // This only needs to be computed once and thus we pull it out of the loop
@@ -309,6 +334,12 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     assert(map_hx.find(type) != map_hx.end());
   }
 #endif
+
+  // Per-observation temporaries, hoisted out of both loops when OV_MSCKF_SCRATCH is on.
+  // Same declared types (Eigen::MatrixXd) => same product kernels => bitwise identical values;
+  // Eigen's assignment resizes only when the shape actually changes, so after the first
+  // observation these are pure writes into an already-owned buffer.
+  Eigen::MatrixXd h_dz_dzn, h_dz_dzeta, h_dzn_dpfc, h_dpfc_dpfg, h_dpfc_dclone, h_dz_dpfc, h_dz_dpfg, h_dpfc_dcalib;
 
   // Loop through each camera for this feature
   for (auto const &pair : feature.timestamps) {
@@ -363,18 +394,28 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       }
 
       // Compute Jacobians in respect to normalized image coordinates and possibly the camera intrinsics
-      Eigen::MatrixXd dz_dzn, dz_dzeta;
+      // (compute_distort_jacobian assigns MatrixXd::Zero(...) then fills, so a hoisted buffer is
+      //  fully re-initialised on every call -- identical values, one allocation instead of 2/obs.)
+      Eigen::MatrixXd dz_dzn_own, dz_dzeta_own;
+      Eigen::MatrixXd &dz_dzn = sc_ ? h_dz_dzn : dz_dzn_own;
+      Eigen::MatrixXd &dz_dzeta = sc_ ? h_dz_dzeta : dz_dzeta_own;
       state->_cam_intrinsics_cameras.at(pair.first)->compute_distort_jacobian(uv_norm, dz_dzn, dz_dzeta);
 
       // Normalized coordinates in respect to projection function
-      Eigen::MatrixXd dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
+      Eigen::MatrixXd dzn_dpfc_own;
+      Eigen::MatrixXd &dzn_dpfc = sc_ ? h_dzn_dpfc : dzn_dpfc_own;
+      if (sc_) dzn_dpfc.resize(2, 3); else dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
       dzn_dpfc << 1 / p_FinCi(2), 0, -p_FinCi(0) / (p_FinCi(2) * p_FinCi(2)), 0, 1 / p_FinCi(2), -p_FinCi(1) / (p_FinCi(2) * p_FinCi(2));
 
       // Derivative of p_FinCi in respect to p_FinIi
-      Eigen::MatrixXd dpfc_dpfg = R_ItoC * R_GtoIi;
+      Eigen::MatrixXd dpfc_dpfg_own;
+      Eigen::MatrixXd &dpfc_dpfg = sc_ ? h_dpfc_dpfg : dpfc_dpfg_own;
+      dpfc_dpfg = R_ItoC * R_GtoIi;
 
       // Derivative of p_FinCi in respect to camera clone state
-      Eigen::MatrixXd dpfc_dclone = Eigen::MatrixXd::Zero(3, 6);
+      Eigen::MatrixXd dpfc_dclone_own;
+      Eigen::MatrixXd &dpfc_dclone = sc_ ? h_dpfc_dclone : dpfc_dclone_own;
+      if (sc_) dpfc_dclone.resize(3, 6); else dpfc_dclone = Eigen::MatrixXd::Zero(3, 6);
       dpfc_dclone.block(0, 0, 3, 3).noalias() = R_ItoC * skew_x(p_FinIi);
       dpfc_dclone.block(0, 3, 3, 3) = -dpfc_dpfg;
 
@@ -382,8 +423,11 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       //=========================================================================
 
       // Precompute some matrices
-      Eigen::MatrixXd dz_dpfc = dz_dzn * dzn_dpfc;
-      Eigen::MatrixXd dz_dpfg = dz_dpfc * dpfc_dpfg;
+      Eigen::MatrixXd dz_dpfc_own, dz_dpfg_own;
+      Eigen::MatrixXd &dz_dpfc = sc_ ? h_dz_dpfc : dz_dpfc_own;
+      Eigen::MatrixXd &dz_dpfg = sc_ ? h_dz_dpfg : dz_dpfg_own;
+      dz_dpfc = dz_dzn * dzn_dpfc;
+      dz_dpfg = dz_dpfc * dpfc_dpfg;
 
       // CHAINRULE: get the total feature Jacobian
       H_f.block(2 * c, 0, 2, H_f.cols()).noalias() = dz_dpfg * dpfg_dlambda;
@@ -404,7 +448,9 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       if (state->_options.do_calib_camera_pose) {
 
         // Calculate the Jacobian
-        Eigen::MatrixXd dpfc_dcalib = Eigen::MatrixXd::Zero(3, 6);
+        Eigen::MatrixXd dpfc_dcalib_own;
+        Eigen::MatrixXd &dpfc_dcalib = sc_ ? h_dpfc_dcalib : dpfc_dcalib_own;
+        if (sc_) dpfc_dcalib.resize(3, 6); else dpfc_dcalib = Eigen::MatrixXd::Zero(3, 6);
         dpfc_dcalib.block(0, 0, 3, 3) = skew_x(p_FinCi - p_IinC);
         dpfc_dcalib.block(0, 3, 3, 3) = Eigen::Matrix<double, 3, 3>::Identity();
 
@@ -424,6 +470,35 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 }
 
 void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {
+
+  // OV_HH_NULL: Householder replaces the Givens sweep. 3 reflectors applied blockwise to
+  // [H_x | res] instead of 3*rows rotations each touching a strided 2-row slice of ~300
+  // columns -- same subspace, statistically identical (per-row signs absorbed, res
+  // transformed consistently), dramatically better cache behavior. Runs inside the
+  // OV_OMP_MSCKF per-feature loop; everything here is call-local.
+  static const bool hhn = [] { const char *e = std::getenv("OV_HH_NULL"); return e && *e == '1'; }();
+  if (hhn && H_f.rows() > H_f.cols()) {
+    const int R = (int)H_f.rows(), C3 = (int)H_f.cols();
+    Eigen::HouseholderQR<Eigen::MatrixXd> qr(H_f);
+    auto Q = qr.householderQ();
+    if (ov_msckf::g_msckf_scratch_tl) {
+      // Same 3 reflectors, applied to H_x and to res directly instead of to a materialised
+      // [H_x | res]. A Householder application is column-independent (y = x - v*(tau*(v^T x))),
+      // so splitting the augmented matrix reproduces every column. Saves two R*c copies.
+      H_x.applyOnTheLeft(Q.adjoint());
+      res.applyOnTheLeft(Q.adjoint());
+      H_x = H_x.bottomRows(R - C3).eval();
+      res = res.tail(R - C3).eval();
+      return;
+    }
+    Eigen::MatrixXd W(R, H_x.cols() + 1);
+    W.leftCols(H_x.cols()) = H_x;
+    W.col(H_x.cols()) = res;
+    W.applyOnTheLeft(Q.adjoint());
+    H_x = W.block(C3, 0, R - C3, H_x.cols());
+    res = W.block(C3, H_x.cols(), R - C3, 1);
+    return;
+  }
 
   // Apply the left nullspace of H_f to all variables
   // Based on "Matrix Computations 4th Edition by Golub and Van Loan"
@@ -458,6 +533,120 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
   // Return if H_x is a fat matrix (there is no need to compress in this case)
   if (H_x.rows() <= H_x.cols())
     return;
+
+  // OV_PAR_QR: OMP panel-blocked Householder QR on the augmented [H | res]. Panels are
+  // factored serially (small, tall-skinny) with Eigen's HouseholderQR; the trailing-matrix
+  // update -- which is where nearly all the flops are -- is split across column chunks and
+  // applied in parallel (each chunk applies the SAME read-only reflector block to disjoint
+  // columns). res rides along as the last column, so Q^T*res is free. Same R up to per-row
+  // sign, exactly like the OV_QR_HH path. Takes precedence over OV_QR_HH when set.
+  // OV_GPU_QR: big stacked systems go to cuSOLVER fp32 geqrf (augmented [H|res], top-c-rows
+  // trick identical to the panel path). ~2.8x the CPU panel QR at whale shapes, but fp32:
+  // R carries ~1e-4 relative error -- fleet-gate before shipping. Small systems stay CPU.
+  static const int gpuqr_min = [] { const char *e = std::getenv("OV_GPU_QR_MIN"); return e ? atoi(e) : 500; }();
+  if (ekf_gpu_qr_enabled() && H_x.rows() >= gpuqr_min && H_x.cols() >= 120) {
+    const int r = (int)H_x.rows(), c = (int)H_x.cols();
+    static thread_local Eigen::MatrixXd Rt;
+    static thread_local Eigen::VectorXd rt;
+    Rt.resize(c, c);
+    rt.resize(c);
+    if (ekf_gpu_qr(H_x.data(), r, c, res.data(), Rt.data(), rt.data())) {
+      H_x = Rt;
+      res = rt;
+      return;
+    }
+  }
+
+  static const int parqr = [] { const char *e = std::getenv("OV_PAR_QR"); return e ? atoi(e) : 0; }();
+  // OV_UPD_VERIFY=1: the column-chunk width cw = ceil(tc/nch) depends on the thread count, so the
+  // GEMM shapes handed to applyOnTheLeft change with it. Recompute the WHOLE panel factorisation at
+  // the reference nthr=4 and memcmp -- proven in-binary, not argued.
+  static const bool g_updver = [] { const char *e = std::getenv("OV_UPD_VERIFY"); return e && *e == '1'; }();
+  if (parqr > 0) {
+    const int r = (int)H_x.rows(), c = (int)H_x.cols();
+    const int nthr = parqr > 1 ? parqr : 4;
+    // The panel loop, verbatim, parameterised only by the thread count.
+    auto panel_qr = [&](int nt, Eigen::MatrixXd &Rout, Eigen::VectorXd &rout) {
+      Eigen::MatrixXd W(r, c + 1);
+      W.leftCols(c) = H_x;
+      W.col(c) = res;
+      const int nb = 48;
+      for (int j = 0; j < c; j += nb) {
+        const int bw = std::min(nb, c - j), rr = r - j;
+        Eigen::HouseholderQR<Eigen::MatrixXd> pqr(W.block(j, j, rr, bw));
+        W.block(j, j, rr, bw) = pqr.matrixQR();
+        const int tc = c + 1 - (j + bw);
+        if (tc <= 0)
+          continue;
+        auto Q = pqr.householderQ();
+        const int nch = std::min(nt, (tc + 15) / 16);
+        const int cw = (tc + nch - 1) / nch;
+#pragma omp parallel for schedule(static) num_threads(nt)
+        for (int t = 0; t < nch; t++) {
+          const int c0 = j + bw + t * cw, w = std::min(cw, c + 1 - c0);
+          if (w > 0) {
+            auto blk = W.block(j, c0, rr, w);
+            blk.applyOnTheLeft(Q.adjoint());
+          }
+        }
+      }
+      Rout = W.topLeftCorner(c, c).triangularView<Eigen::Upper>();
+      rout = W.col(c).head(c);
+    };
+    // Reference run FIRST (H_x/res still hold the inputs), then the real run writes THROUGH to
+    // H_x/res exactly as the original code did -- zero extra copy when the gate is off.
+    // OV_UPD_VERIFY_NT sets the REFERENCE thread count. Setting it equal to nthr turns the check
+    // into a pure self-consistency / race test (same code, same counts, twice).
+    static const int g_ref_nt = [] { const char *e = std::getenv("OV_UPD_VERIFY_NT"); return e ? atoi(e) : 4; }();
+    const bool ver = g_updver;
+    Eigen::MatrixXd R4;
+    Eigen::VectorXd r4;
+    if (ver) panel_qr(g_ref_nt, R4, r4);
+    panel_qr(nthr, H_x, res);
+    if (ver) {
+      double dR = (R4 - H_x).cwiseAbs().maxCoeff(), dr = (r4 - res).cwiseAbs().maxCoeff();
+      double nR = H_x.cwiseAbs().maxCoeff(), nr = res.cwiseAbs().maxCoeff();
+      bool bx = (std::memcmp(R4.data(), H_x.data(), sizeof(double) * (size_t)H_x.size()) == 0) &&
+                (std::memcmp(r4.data(), res.data(), sizeof(double) * (size_t)res.size()) == 0);
+      // A QR factorisation is unique only up to R -> D*R, res -> D*res with D = diag(+-1). Test
+      // that directly: if the two thread counts differ ONLY by per-row sign, |R| and |res| agree
+      // to rounding. nflip counts the rows whose diagonal sign actually turned over.
+      double dRa = (R4.cwiseAbs() - H_x.cwiseAbs()).cwiseAbs().maxCoeff();
+      double dra = (r4.cwiseAbs() - res.cwiseAbs()).cwiseAbs().maxCoeff();
+      int nflip = 0;
+      for (int i = 0; i < c; i++)
+        if (R4(i, i) * H_x(i, i) < 0.0) nflip++;
+      // THE DECISIVE TEST. Compression is only ever consumed through R and res inside the EKF,
+      // and the EKF update is invariant under [R|res] -> Q'[R|res] for ANY orthogonal Q' (S goes
+      // to Q'SQ'^T, sigma^2 I is invariant, dx = P R^T S^-1 res is unchanged). So the quantity
+      // that must be preserved is not R but the INFORMATION it carries: R^T R = H^T H and
+      // R^T res = H^T res. If these agree to rounding, the two thread counts differ only by an
+      // orthogonal factor and the filter cannot see it.
+      Eigen::MatrixXd I4 = R4.transpose() * R4, I8 = H_x.transpose() * H_x;
+      Eigen::VectorXd b4 = R4.transpose() * r4, b8 = H_x.transpose() * res;
+      double relI = I8.cwiseAbs().maxCoeff() > 0 ? (I4 - I8).cwiseAbs().maxCoeff() / I8.cwiseAbs().maxCoeff() : 0.0;
+      double relB = b8.cwiseAbs().maxCoeff() > 0 ? (b4 - b8).cwiseAbs().maxCoeff() / b8.cwiseAbs().maxCoeff() : 0.0;
+      printf("[updverify] parqr r=%d c=%d nthr=%d refnt=%d dR=%.3e relR=%.3e dres=%.3e relres=%.3e "
+             "relRabs=%.3e relresabs=%.3e nflip=%d relInfo=%.3e relRhs=%.3e %s\n",
+             r, c, nthr, g_ref_nt, dR, nR > 0 ? dR / nR : 0.0, dr, nr > 0 ? dr / nr : 0.0,
+             nR > 0 ? dRa / nR : 0.0, nr > 0 ? dra / nr : 0.0, nflip, relI, relB,
+             bx ? "BITEXACT" : "DIFFER");
+    }
+    return;
+  }
+
+  // Blocked Householder QR (Eigen) instead of scalar Givens: same R (up to per-row sign,
+  // statistically identical since res transforms consistently), ~3-5x faster at these shapes.
+  static const bool hh = [] { const char *e = std::getenv("OV_QR_HH"); return e && *e == '1'; }();
+  if (hh) {
+    Eigen::HouseholderQR<Eigen::MatrixXd> qr(H_x);
+    Eigen::VectorXd res2 = qr.householderQ().transpose() * res;
+    const int r2 = (int)std::min(H_x.rows(), H_x.cols());
+    Eigen::MatrixXd R = qr.matrixQR().topRows(r2).triangularView<Eigen::Upper>();
+    H_x = R;
+    res = res2.head(r2);
+    return;
+  }
 
   // Do measurement compression through givens rotations
   // Based on "Matrix Computations 4th Edition by Golub and Van Loan"
