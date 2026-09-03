@@ -1,35 +1,22 @@
 %YAML:1.0 # need to specify the file type at the top!
-# NOTE: %YAML:1.0 must stay on line 1 — cv::FileStorage rejects the file otherwise.
+# THE CALIBRATION CONFIG = the campaign operating point below, plus calib_series_dt (the
+# within-pass settling series the certificate reads). That is the ONLY difference from
+# vio_deploy/config/estimator_flight.yaml -- keep it that way; the warm-start loop and flight
+# share one estimator operating point, which is what lets the frozen certification pass be
+# skipped (the settled-parent pass IS the deployment trajectory).
 #
-# THE CALIBRATION CONFIG. Derived from vio_deploy/config/estimator_flight.yaml so the
-# warm-start loop and flight share one estimator operating point, differing only where
-# calibration genuinely needs something else. Replaces the study's
-# estimator_fleet.yaml, which used a much lighter point (max_slam 0, num_pts 2000,
-# max_msckf_in_update 200); measured on this fleet, running the loop at the FLIGHT
-# point makes the last warm-start pass track a dedicated frozen-deployment pass to a
-# median 1.17x with identical verdicts across 12 recordings, which is what allows the
-# extra certification pass to be skipped.
+# CAMPAIGN OPERATING POINT (Sep 2026). Every quoted fleet number came from this yaml: raw VIO
+# fleet POSTG 3.50 cm (deterministic serial oracle) / 3.57 cm (online, 3 draws), online
+# p50 14 ms / p90 16 ms per update on an Orin NX, EKF2-fused 3.84 cm. Provenance: the
+# pre-downsizing flight config (3263a7c) as deployed to vio_calib/current on 2026-08-12,
+# with the campaign drivers' rewrites applied (num_pts 2750, num_opencv_threads 8) and
+# OV_MAX_CLONES=30 folded in.
 #
-# DIFFERENCES FROM estimator_flight.yaml -- keep this list current:
-#   track_frequency  40 -> 15   Flight tracks every frame for low-latency state
-#                               estimation. Calibration wants PARALLAX: with 30 Hz
-#                               cameras the throttle skips a frame whose stamp is
-#                               < last + 1/freq, so 15 tracks every 3rd frame and
-#                               triples the baseline -- "the dominant accuracy lever"
-#                               per the study's tuning history. Measured on an Orin NX:
-#                               a pass drops 54.7 -> 29.1 s, ATE is unchanged
-#                               (0.0166 -> 0.0168 m) and self-consistency IMPROVES
-#                               (0.0187 -> 0.0138). Only divisors of the frame rate do
-#                               anything: 30 / 15 / 10 / 7.5. 20 and 29 both collapse
-#                               to the same every-other-frame pattern.
-#
-# The priors are NOT set here -- they are environment variables. Calibration runs with
-# OV_PRIOR_* UNSET so the calibration states stay mobile enough to converge away from
-# the seed; flight exports vio_deploy/config/flight_stiffness.env to tether them.
-# run_tool.py strips any that leak in from the caller's shell.
-#
-# gates.py reads mask_fisheye_theta_max* from THIS file, so the tool's circle geometry
-# and the estimator's own fisheye mask cannot drift apart.
+# REAL TIME NEEDS THE GPU PATH. At track_frequency 40 (every frame) this point runs 1.8x real
+# time on the CPU tracker; the campaign latency numbers were taken with the GPU KLT / CUDA
+# CLAHE / NVJPEG paths enabled through the OV_* environment (OV_GPU_TRACK=1 OV_GPU_CUSTOM_KLT=1
+# OV_NVJPG=1 OV_PIPELINE=1 ... the full string is in the campaign run scripts, not yet in this
+# package). Without that environment this yaml is correct but not real time on the Orin.
 # NOTE: %YAML:1.0 must stay on line 1 — cv::FileStorage rejects the file otherwise.
 # FLIGHT / DEPLOYMENT configuration (NOT for calibration runs).
 # This is the estimator configuration that produced 2.4-4.5 cm SE(3) ATE and
@@ -37,6 +24,7 @@
 # (uniform settings, no per-vehicle or per-flight tuning).
 # USE WITH configs/flight_stiffness.env sourced into the environment — the
 # tightened calibration priors are half of what makes this config work.
+# For CALIBRATION runs use configs/estimator_calib.yaml with OV_PRIOR_* UNSET.
 # See README section "Two configurations: calibration mode vs flight mode".
 # ============================================================================
 
@@ -53,7 +41,7 @@ calib_cam_timeoffset: true
 calib_imu_intrinsics: false
 calib_imu_g_sensitivity: false
 
-max_clones: 50
+max_clones: 30   # the campaign ran this via OV_MAX_CLONES=30 in its env; set here so the yaml alone reproduces it
 max_slam: 250
 max_slam_in_update: 150
 max_msckf_in_update: 1000
@@ -108,15 +96,15 @@ init_force_static: true # anchor trajectory in the pre-takeoff static phase (raw
 use_klt: true
 # use_klt_tangent/klt_tangent_patch_size intentionally absent: the tangent-image tracker
 # was removed from this pruned OpenVINS (it never executed — see openvins/PRUNED.txt).
-num_pts: 3000
+num_pts: 2750
 fast_threshold: 30
 grid_x: 5
 grid_y: 5
 min_px_dist: 15
 knn_ratio: 0.70
-track_frequency: 15.0   # see the header: parallax, not latency
+track_frequency: 40.0   # track EVERY frame (30Hz cams); accuracy comes from update_min_dt below
 downsample_cameras: false
-num_opencv_threads: 0  # det-live
+num_opencv_threads: 8
 histogram_method: "CLAHE"
 
 use_aruco: false
@@ -142,9 +130,5 @@ mask_bottom_frac: 0.0
 relative_config_imu: "kalibr_imu_chain.yaml"
 relative_config_imucam: "kalibr_imucam_chain.yaml"
 
-# Period, in seconds of recording time, between online-calibration snapshots written to
-# <out>.calib_series.jsonl. 0 disables. The series makes SETTLING measurable inside one
-# pass: agreement between passes cannot distinguish "converged" from "never moved", and
-# this fleet produced exactly that failure -- a run pinned at its seed reported a
-# self-consistency residual of 0.0187 while its trajectory was 14 km out.
+# --- calibration only: write the online-calibration series every 0.5 s (settling certificate) ---
 calib_series_dt: 0.5

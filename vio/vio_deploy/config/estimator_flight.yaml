@@ -1,4 +1,16 @@
 %YAML:1.0 # need to specify the file type at the top!
+# CAMPAIGN OPERATING POINT (Sep 2026). Every quoted fleet number came from this yaml: raw VIO
+# fleet POSTG 3.50 cm (deterministic serial oracle) / 3.57 cm (online, 3 draws), online
+# p50 14 ms / p90 16 ms per update on an Orin NX, EKF2-fused 3.84 cm. Provenance: the
+# pre-downsizing flight config (3263a7c) as deployed to vio_calib/current on 2026-08-12,
+# with the campaign drivers' rewrites applied (num_pts 2750, num_opencv_threads 8) and
+# OV_MAX_CLONES=30 folded in.
+#
+# REAL TIME NEEDS THE GPU PATH. At track_frequency 40 (every frame) this point runs 1.8x real
+# time on the CPU tracker; the campaign latency numbers were taken with the GPU KLT / CUDA
+# CLAHE / NVJPEG paths enabled through the OV_* environment (OV_GPU_TRACK=1 OV_GPU_CUSTOM_KLT=1
+# OV_NVJPG=1 OV_PIPELINE=1 ... the full string is in the campaign run scripts, not yet in this
+# package). Without that environment this yaml is correct but not real time on the Orin.
 # NOTE: %YAML:1.0 must stay on line 1 — cv::FileStorage rejects the file otherwise.
 # FLIGHT / DEPLOYMENT configuration (NOT for calibration runs).
 # This is the estimator configuration that produced 2.4-4.5 cm SE(3) ATE and
@@ -23,8 +35,8 @@ calib_cam_timeoffset: true
 calib_imu_intrinsics: false
 calib_imu_g_sensitivity: false
 
-max_clones: 25
-max_slam: 100
+max_clones: 30   # the campaign ran this via OV_MAX_CLONES=30 in its env; set here so the yaml alone reproduces it
+max_slam: 250
 max_slam_in_update: 150
 max_msckf_in_update: 1000
 dt_slam_delay: 1
@@ -78,23 +90,16 @@ init_force_static: true # anchor trajectory in the pre-takeoff static phase (raw
 use_klt: true
 # use_klt_tangent/klt_tangent_patch_size intentionally absent: the tangent-image tracker
 # was removed from this pruned OpenVINS (it never executed — see openvins/PRUNED.txt).
-# WARNING: num_pts is per CAMERA (4x650 here) and is the dominant compute knob, but it is also
-#   the ONLY knob that destabilises a marginal vehicle. On nxt1 (6-8% frame drops) reducing it
-#   from 3000 diverges the filter outright, non-monotonically (1000 was worse than 500). Vehicles
-#   that fail the timing gate should stay on num_pts 3000; healthy ones are fine at 650.
-num_pts: 650
+num_pts: 2750
 fast_threshold: 30
-grid_x: 8
-grid_y: 8
+grid_x: 5
+grid_y: 5
 min_px_dist: 15
 knn_ratio: 0.70
-track_frequency: 15.0
+track_frequency: 40.0   # track EVERY frame (30Hz cams); accuracy comes from update_min_dt below
 downsample_cameras: false
-num_opencv_threads: 0  # det-live
-# histogram_method: CLAHE costs ~30% CPU and HURT accuracy on all 9 indoor recordings.
-#   Set to "CLAHE" for outdoor / backlit / high-dynamic-range flight, where it is untested here
-#   but is what CLAHE exists for. Expect ~1.07x real time on an Orin NX with it on, ~0.79x off.
-histogram_method: "NONE"
+num_opencv_threads: 8
+histogram_method: "CLAHE"
 
 use_aruco: false
 num_aruco: 1024
@@ -114,14 +119,6 @@ mask_fisheye_theta_max3: 1.87
 mask_fisheye_inset_px: 4.0
 mask_fisheye_dynamic: true
 mask_fisheye_dyn_thresh_px: 1.0
-
-# Fisheye detection grid: allocate the feature quota over (ring, sector) bins of EQUAL SOLID
-# ANGLE instead of a rectangular lattice. On this rig 27 of 64 uniform cells fall outside the
-# image circle. Measured: 4.10 -> 3.40 cm median ATE for ~3% more CPU. 5x12 is the optimum;
-# 3x6 under-constrains, 6x16 fragments the quota and the tail returns.
-use_polar_grid: true
-polar_rings: 5
-polar_sectors: 12
 mask_bottom_frac: 0.0
 
 relative_config_imu: "kalibr_imu_chain.yaml"
