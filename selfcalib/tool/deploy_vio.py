@@ -129,6 +129,11 @@ def main():
     # ---- 4. write the folder the estimator expects ----
     os.makedirs(a.out, exist_ok=True)
     shutil.copy(flight_cfg, os.path.join(a.out, 'estimator_flight.yaml'))
+    campaign_env = os.path.join(vio, 'vio_deploy', 'config', 'campaign.env')
+    if os.path.isfile(campaign_env):
+        shutil.copy(campaign_env, os.path.join(a.out, 'campaign.env'))
+    else:
+        log('WARNING: %s not found -- the deployed folder will not carry the campaign switches' % campaign_env)
     shutil.copy(chain, os.path.join(a.out, 'kalibr_imucam_chain.yaml'))
     shutil.copy(imu, os.path.join(a.out, 'kalibr_imu_chain.yaml'))
     if mount is not None:
@@ -167,6 +172,7 @@ FILES
                              distortion coefficients, T_imu_cam extrinsics, and the
                              camera-IMU time offset timeshift_cam_imu = %+.9f s.
   kalibr_imu_chain.yaml      IMU noise densities + IMU-intrinsics blocks.
+  campaign.env               the OV_* environment of the campaign numbers (aarch64 only).
   mount.json                 mount rotation M. NOT read by the estimator -- apply it to the
                              OUTPUT trajectory (selfcalib/tool/mount.py, apply()).%s
 
@@ -174,6 +180,10 @@ All three YAML files must stay in THIS directory together: the estimator resolve
 relative_config_imu / relative_config_imucam relative to the config file's own location.
 
 FLY IT
+  # on the vehicle (aarch64) ALSO source the campaign switches -- the GPU tracker, scheduler and
+  # algorithm gates every quoted fleet number was measured with. Never on a desktop.
+  [ "$(uname -m)" = aarch64 ] && { set -a; source %s/campaign.env; set +a; }
+
   # offline replay of a recording
   set -a; source <vio>/vio_deploy/config/flight_stiffness.env; set +a
   bash <vio>/vio_deploy/scripts/run_serial.sh BAG %s/estimator_flight.yaml OUT %d false 42 DOMAIN
@@ -188,7 +198,7 @@ it the estimator runs with loose calibration priors, which is the CALIBRATION op
 point, not the flight one.
 """ % (drone, cal, verdict, dep_toff,
        '' if mount is not None else '  (mount.json absent: that calibration had no ground truth)',
-       os.path.abspath(a.out), ncam, os.path.abspath(a.out))
+       os.path.abspath(a.out), os.path.abspath(a.out), ncam, os.path.abspath(a.out))
     open(os.path.join(a.out, 'MANIFEST.txt'), 'w').write(manifest)
 
     log('deployed -> %s' % os.path.abspath(a.out))

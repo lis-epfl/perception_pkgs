@@ -119,6 +119,31 @@ def _config_wants_series(cfg_path):
     return False
 
 
+def _campaign_env(vio_root, enabled=True):
+    """The OV_* switches the campaign numbers were measured with (vio_deploy/config/campaign.env).
+
+    Sourced ONLY on aarch64: the file pins an Orin NX -- 8-core affinity, sm_87 GPU kernels,
+    Jetson NVJPEG -- and the GPU tracker cannot run on a desktop. Values already present in the
+    caller's environment win, so an operator can still override a single switch. Returns
+    (dict_to_merge, message)."""
+    import platform
+    path = os.path.join(vio_root, 'vio_deploy', 'config', 'campaign.env')
+    if not enabled:
+        return {}, 'campaign.env: disabled (--no-campaign-env)'
+    if platform.machine() != 'aarch64':
+        return {}, 'campaign.env: not sourced (%s is not aarch64; CPU tracker)' % platform.machine()
+    if not os.path.isfile(path):
+        return {}, 'campaign.env: MISSING at %s -- running WITHOUT the campaign switches' % path
+    out = {}
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            if k.strip() not in os.environ:
+                out[k.strip()] = v.strip()
+    return out, 'campaign.env: sourced %d switches from %s' % (len(out), path)
+
+
 def _override_track_frequency(cfg_txt, hz):
     """Rewrite track_frequency in a config copy. The warm-start loop and flight want
     different rates -- flight tracks every frame for low-latency state estimation,
@@ -222,6 +247,7 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     shutil.copy(published_chain, f'{outdir}/kalibr_imucam_chain.yaml')
 
     env = dict(os.environ)
+    env.update(_campaign_env(vio_root, not getattr(a, 'no_campaign_env', False))[0])
     for line in open(fenv):
         line = line.strip()
         if line and not line.startswith('#') and '=' in line:
@@ -266,6 +292,15 @@ def main():
                          "'flight' for the untouched flight operating point, or a path. The ATE "
                          'certificate is unaffected -- it always runs flight config + priors.')
     ap.add_argument('--fleet-exclude', default=None)
+    ap.add_argument('--calib-stereo', choices=['true', 'false'], default='false',
+                    help='use_stereo for the warm-start calibration passes. Default false = MONO, the '
+                         'operating point of the flight pass, the online node and every campaign '
+                         'number (and the only mode the NVJPEG path accepts). Until 2026-09-03 the '
+                         'loop ran true, i.e. the four fisheyes as two stereo pairs; pass true to '
+                         'reproduce that.')
+    ap.add_argument('--no-campaign-env', action='store_true',
+                    help='do not source vio_deploy/config/campaign.env on aarch64 (CPU tracker, '
+                         'different numbers from the campaign)')
     ap.add_argument('--max-pass', type=int, default=6,
                     help='cap on estimator passes. With --gt the loop needs at least two: one to settle and one warm-started from it to certify the ATE.')
     ap.add_argument('--domain', type=int, default=70)
@@ -320,6 +355,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     report = {'drone': a.drone, 'bag': a.bag, 'vio_root': vio_root}
     log('estimator: %s' % run_serial)
+    _campaign, _campaign_msg = _campaign_env(vio_root, not a.no_campaign_env)
+    log(_campaign_msg)
 
     # ---- 0. ground truth: explicit --gt wins, else look for a mocap stream in the bag ----
     if a.gt:
@@ -413,7 +450,7 @@ def main():
         _calib_cfg = os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')
     elif a.calib_config and a.calib_config != 'calib':
         _calib_cfg = a.calib_config
-    log('warm-start loop config: %s (OV_PRIOR_* unset)' % os.path.basename(_calib_cfg))
+    log('warm-start loop config: %s (OV_PRIOR_* unset, use_stereo=%s)' % (os.path.basename(_calib_cfg), a.calib_stereo))
     # Guard the documented footgun: flight priors leaking in from the caller's shell
     # would pin the calibration at its seed, and it fails by reporting a suspiciously
     # LOW self-consistency residual rather than by erroring.
@@ -462,8 +499,9 @@ def main():
             # A fleet recording spans two files (IMU and cameras are recorded
             # separately), so hand the estimator every URI bagio resolved.
             _env = {k: v for k, v in os.environ.items() if not k.startswith('OV_PRIOR')}
+            _env.update(_campaign)
             cp = subprocess.run(['bash', run_serial, ','.join(_rec.uris),
-                                 f'{rd}/estimator_config.yaml', f'{rd}/out', str(ncam), 'true',
+                                 f'{rd}/estimator_config.yaml', f'{rd}/out', str(ncam), a.calib_stereo,
                                  '42', str(a.domain)], capture_output=True, timeout=timeout_s, env=_env)
         except subprocess.TimeoutExpired:
             log('ERROR: estimator pass %d exceeded %.0f s and was killed. Raise --pass-timeout, '
@@ -619,6 +657,7 @@ def main():
                 % (type(e).__name__, e, (' See ' + rl) if os.path.exists(rl) else ''))
             report['deploy_check_error'] = '%s: %s' % (type(e).__name__, e)
     report['ate_source'] = cert_kind
+    report['campaign_env'] = _campaign_msg
     # Same reasoning as the published mean: comparing a settled harvest against one that
     # was still moving measures the convergence, not the agreement.
     sc_sessions = settled_srcs if len(settled_srcs) > 1 else harvests
