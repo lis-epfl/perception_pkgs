@@ -3,11 +3,12 @@
 warm-start self-calibration until the paper's stopping rule holds → publish the converged pass →
 diagnosis verdict.
 
-Data: by default the recording up to 20 s after takeoff (PX4 land detector); --window overrides it,
-and a window longer than the recording uses all of it. Stopping rule (paper Sec. IV): at pass k >= 2,
-stop when no parameter type (principal point, focal length, mean distortion, rotation, translation,
-t_d) moved by more than twice the full-flight envelope since pass k-1; at most --max-pass (16) passes.
-The published calibration is that last pass.
+Data: by default the recording up to 20 s after takeoff (PX4 land detector); --after-takeoff changes
+the 20 s, --window replaces the rule with a fixed span, and a window longer than the recording uses
+all of it. Stopping rule (paper Sec. IV): at pass k >= 2, stop when no parameter type (principal
+point, focal length, mean distortion, rotation, translation, t_d) moved by more than twice the
+full-flight envelope since pass k-1; at most --max-pass (16) passes. The published calibration is
+that last pass.
 
 Usage:
   python3 run_tool.py --drone nxt3 --bag bags/nxt3_raw_4cam_basin \
@@ -311,13 +312,18 @@ def main():
     ap.add_argument('--max-pass', type=int, default=16,
                     help='cap on estimator passes (paper: 16). The stopping rule needs at least two.')
     ap.add_argument('--domain', type=int, default=70)
+    ap.add_argument('--after-takeoff', type=float, default=None,
+                    help='seconds of flight to use after the takeoff the PX4 land detector reports '
+                         '(default %g). The data is then everything from the instant every stream is '
+                         'live up to this long after takeoff, however long the vehicle waited on the '
+                         'ground first. Not combinable with --window. A recording without a '
+                         'land-detector stream, or without a takeoff, is used whole.' % TAKEOFF_WINDOW_S)
     ap.add_argument('--window', type=float, default=None,
-                    help='seconds of the recording to use, measured from the instant every '
-                         'stream is live. Default: up to 20 s after takeoff, found from the PX4 '
-                         'land detector in the recording (the whole recording if it has none). '
-                         'A window longer than the recording uses all of it. Applied to the gates, '
-                         'the image-center prior, the warm-start passes and the frozen deployment '
-                         'pass alike.')
+                    help='a FIXED span instead of the takeoff rule: seconds of the recording to use, '
+                         'measured from the instant every stream is live, wherever the takeoff falls '
+                         'in it. A window longer than the recording uses all of it. Either way the '
+                         'span is applied to the gates, the image-center prior, the warm-start passes '
+                         'and the frozen deployment pass alike.')
     ap.add_argument('--track-frequency', type=float, default=None,
                     help='KLT tracking rate for the WARM-START passes only, overriding the '
                          'loop config. Default 15: the cameras run at 30 Hz and the throttle '
@@ -352,6 +358,10 @@ def main():
         ap.error('--max-pass must be >= 1; got %d' % a.max_pass)
     if a.pass_timeout is not None and a.pass_timeout <= 0:
         ap.error('--pass-timeout must be > 0 seconds; got %g' % a.pass_timeout)
+    if a.after_takeoff is not None and a.after_takeoff <= 0:
+        ap.error('--after-takeoff must be > 0 seconds; got %g' % a.after_takeoff)
+    if a.after_takeoff is not None and a.window is not None:
+        ap.error('--after-takeoff sizes the takeoff rule and --window replaces it: give one, not both')
     for label, path in (('--bag', a.bag), ('--template', a.template), ('--imu-chain', a.imu_chain)):
         if not os.path.exists(path):
             ap.error('%s does not exist: %s' % (label, path))
@@ -397,18 +407,20 @@ def main():
     cam_ids = tuple(sorted(tmpl_cams))
     report['cameras'] = list(cam_ids)
 
-    # ---- window: the paper's 20 s after takeoff unless --window says otherwise ----
+    # ---- window: the paper's 20 s after takeoff (--after-takeoff resizes it) unless --window fixes the span ----
     _rec0 = Recording.open(a.bag)
     _span = _rec0.span_after_anchor()
+    _after = TAKEOFF_WINDOW_S if a.after_takeoff is None else a.after_takeoff
     if a.window is None:
         _tk = _rec0.px4_takeoff()
         if _tk is None:
             log('window: no takeoff found (no PX4 land-detector stream, or no takeoff) — using the whole recording')
         else:
-            a.window = _tk + TAKEOFF_WINDOW_S
-            log('window: PX4 takeoff %.2f s after all streams are live; using the first %.2f s (takeoff + %.0f s)'
-                % (_tk, a.window, TAKEOFF_WINDOW_S))
+            a.window = _tk + _after
+            log('window: PX4 takeoff %.2f s after all streams are live; using the first %.2f s (takeoff + %g s)'
+                % (_tk, a.window, _after))
             report['takeoff_s'] = round(_tk, 3)
+            report['after_takeoff_s'] = _after
     if a.window is not None and _span is not None and a.window >= _span:
         log('window: %.2f s is longer than the recording (%.2f s after all streams are live) — using up to its end'
             % (a.window, _span))

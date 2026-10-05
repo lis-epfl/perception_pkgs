@@ -158,13 +158,15 @@ python3 tool/run_tool.py \
     --out out_myvehicle \
     [--fleet-exclude myvehicle]   # derive seed from fleet means, leave-one-out
     [--gt gt.tum]                 # optional; omit and the tool looks in the bag itself
-    [--window S]                  # default: up to 20 s after takeoff (PX4 land detector)
+    [--after-takeoff S]           # seconds of flight to use after the PX4 takeoff (default 20)
+    [--window S]                  # or a fixed span from the first instant every stream is live
     [--max-pass 16] [--domain 70]
 ```
 
 Stages (all logged to `--out`): ground-truth lookup → data window (by default the recording up
-to 20 s after takeoff, from the PX4 land detector; `--window S` overrides, and a window longer
-than the recording uses all of it) → gates (static start, timing health, image health) → one
+to 20 s after takeoff, from the PX4 land detector; `--after-takeoff S` changes the 20 s,
+`--window S` replaces the rule with a fixed span, and a window longer than the recording uses
+all of it) → gates (static start, timing health, image health) → one
 temporal-accumulation pass (image-center prior: every 4th frame enters the mean image only if
 it changed by more than 2.4 % since the previous one; the mean is thresholded at 15 % of its
 brightest pixel and a disk of the fleet-shared radius is correlated with it, argmax = principal
