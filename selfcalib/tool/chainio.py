@@ -107,3 +107,30 @@ def kb4_radius(f, k, theta_max):
     th = theta_max
     thd = th + k1 * th ** 3 + k2 * th ** 5 + k3 * th ** 7 + k4 * th ** 9
     return 0.5 * (fx + fy) * thd
+
+
+# The paper's convergence envelope (Sec. III-A): the width of the estimator's own settled oscillation
+# around the reference calibration, one limit per parameter type -- principal point px, focal length %,
+# signed mean of the four distortion coefficients, rotation-vector component deg, translation component
+# cm, time offset ms.
+ENVELOPE = {'c': 2.5, 'f%': 0.5, 'k': 0.001, 'r': 0.35, 't': 2.5, 'td': 6.0}
+
+
+def step_types(cams_a, toff_a, cams_b, toff_b, env=ENVELOPE):
+    """Movement from calibration a to b per parameter type, in envelopes, max over cameras (the
+    paper's stopping rule, Sec. IV: converged when every type moved <= 2 envelopes since the
+    previous pass). Same aggregation as the study (ov_reverify/multipass_eval.step_types)."""
+    out = {t: 0.0 for t in env}
+    for c in cams_a:
+        x, y = cams_a[c], cams_b[c]
+        out['c'] = max(out['c'], abs(y['f'][2] - x['f'][2]) / env['c'], abs(y['f'][3] - x['f'][3]) / env['c'])
+        out['f%'] = max(out['f%'], abs(y['f'][0] / x['f'][0] - 1) * 100 / env['f%'])
+        out['k'] = max(out['k'], abs(float(np.mean([y['k'][j] - x['k'][j] for j in range(4)]))) / env['k'])
+        dR = np.asarray(y['R']) @ np.asarray(x['R']).T
+        ang = np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))
+        if ang > 1e-12:
+            rv = np.degrees(ang) * np.array([dR[2, 1] - dR[1, 2], dR[0, 2] - dR[2, 0], dR[1, 0] - dR[0, 1]]) / (2 * np.sin(ang))
+            out['r'] = max(out['r'], float(np.max(np.abs(rv))) / env['r'])
+        out['t'] = max(out['t'], float(np.max(np.abs((np.asarray(y['p'], float).reshape(-1) - np.asarray(x['p'], float).reshape(-1)) * 100))) / env['t'])
+    out['td'] = abs(toff_b - toff_a) * 1000 / env['td']
+    return out

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end flight-data calibration tool (paper §6): gates → seed (fleet + circle fit) →
-warm-start self-calibration to self-consistency → robust-mean publish → diagnosis verdict.
+"""End-to-end flight-data calibration tool (paper §6): gates → seed (fleet + image-center prior) →
+warm-start self-calibration until the paper's stopping rule holds → publish the converged pass →
+diagnosis verdict.
+
+Data: by default the recording up to 20 s after takeoff (PX4 land detector); --window overrides it,
+and a window longer than the recording uses all of it. Stopping rule (paper Sec. IV): at pass k >= 2,
+stop when no parameter type (principal point, focal length, mean distortion, rotation, translation,
+t_d) moved by more than twice the full-flight envelope since pass k-1; at most --max-pass (16) passes.
+The published calibration is that last pass.
 
 Usage:
   python3 run_tool.py --drone nxt3 --bag bags/nxt3_raw_4cam_basin \
@@ -21,17 +28,17 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bagio import Recording
-from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual
+from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual, step_types
 from gates import static_start_gate, timing_gate
-from circlefit import accumulate, fit_centers, health_from_acc, radii_from_chain
+from circlefit import accumulate, fit_centers, health_from_acc, radii_from_chain, radii_from_fleet
 from publish import robust_mean, chordal_mean
-from diagnose import fleet_stats, diagnose, cert_settled
+from diagnose import fleet_stats, fleet_members, diagnose
 import gtdetect
 import mount
 
 OVR = os.environ.get('SCT_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SC_STOP = 0.10       # warm-start loop stops when consecutive harvests agree to this
-TD_STOP_MS = 10.0
+STEP_STOP = 2.0          # stop when every parameter type moved <= 2 full-flight envelopes since the last pass
+TAKEOFF_WINDOW_S = 20.0  # default data: up to this long after takeoff (paper Sec. IV: 20 s of flight)
 
 
 def log(s):
@@ -301,15 +308,16 @@ def main():
     ap.add_argument('--no-campaign-env', action='store_true',
                     help='do not source vio_deploy/config/campaign.env on aarch64 (CPU tracker, '
                          'different numbers from the campaign)')
-    ap.add_argument('--max-pass', type=int, default=6,
-                    help='cap on estimator passes. With --gt the loop needs at least two: one to settle and one warm-started from it to certify the ATE.')
+    ap.add_argument('--max-pass', type=int, default=16,
+                    help='cap on estimator passes (paper: 16). The stopping rule needs at least two.')
     ap.add_argument('--domain', type=int, default=70)
     ap.add_argument('--window', type=float, default=None,
                     help='seconds of the recording to use, measured from the instant every '
-                         'stream is live. The input contract needs only a static start plus '
-                         '~10-15 s of motion, so a long recording costs passes it does not '
-                         'need. Applied to BOTH the warm-start passes and the frozen '
-                         'deployment pass, so the certificate measures the same data.')
+                         'stream is live. Default: up to 20 s after takeoff, found from the PX4 '
+                         'land detector in the recording (the whole recording if it has none). '
+                         'A window longer than the recording uses all of it. Applied to the gates, '
+                         'the image-center prior, the warm-start passes and the frozen deployment '
+                         'pass alike.')
     ap.add_argument('--track-frequency', type=float, default=None,
                     help='KLT tracking rate for the WARM-START passes only, overriding the '
                          'loop config. Default 15: the cameras run at 30 Hz and the throttle '
@@ -325,14 +333,11 @@ def main():
                     help='certify the ATE on a dedicated extra pass that runs the published '
                          'chain under the FLIGHT config plus flight_stiffness.env, instead of '
                          'on the last warm-start pass. Costs one more estimator pass (~a third '
-                         'of total runtime). OFF by default: with --gt the loop already runs one '
-                         'pass warm-started from a settled harvest and verifies that pass settled '
-                         'too, so its whole trajectory came from a static calibration -- the one '
-                         'property freezing was buying. Measured on one recording: 0.0208 m for '
-                         'that pass against 0.0153 m frozen, and a better noumenal 0.0656 vs '
-                         '0.1136, both far inside the 0.20 m gate. Turn it on to certify under '
-                         'the flight config exactly rather than the calibration config, which '
-                         'differs in track_frequency.')
+                         'of total runtime). OFF by default: the warm-start passes already run the '
+                         'flight settings, and the last pass starts from a calibration that moved '
+                         'less than two envelopes, so its trajectory comes from an essentially '
+                         'static calibration. Turn it on to certify with the flight stiffness '
+                         'priors exactly.')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -392,6 +397,24 @@ def main():
     cam_ids = tuple(sorted(tmpl_cams))
     report['cameras'] = list(cam_ids)
 
+    # ---- window: the paper's 20 s after takeoff unless --window says otherwise ----
+    _rec0 = Recording.open(a.bag)
+    _span = _rec0.span_after_anchor()
+    if a.window is None:
+        _tk = _rec0.px4_takeoff()
+        if _tk is None:
+            log('window: no takeoff found (no PX4 land-detector stream, or no takeoff) — using the whole recording')
+        else:
+            a.window = _tk + TAKEOFF_WINDOW_S
+            log('window: PX4 takeoff %.2f s after all streams are live; using the first %.2f s (takeoff + %.0f s)'
+                % (_tk, a.window, TAKEOFF_WINDOW_S))
+            report['takeoff_s'] = round(_tk, 3)
+    if a.window is not None and _span is not None and a.window >= _span:
+        log('window: %.2f s is longer than the recording (%.2f s after all streams are live) — using up to its end'
+            % (a.window, _span))
+        a.window = None
+    report['window_s'] = a.window
+
     # ---- 1. cheap gates ----
     log('gate: static start')
     # One windowed Recording for every python stage. --window must trim the gates and
@@ -401,7 +424,10 @@ def main():
     # goes -- these stages stream every frame, and on an Orin they cost ~54 s of a
     # 3 min run regardless of the window.
     _wrec = Recording.open(a.bag, window=a.window)
-    report['gate_static'] = static_start_gate(_wrec)
+    # the static-start test must match the initialiser of the config the warm-start loop will run
+    _gate_cfg = (f'{OVR}/configs/estimator_calib.yaml' if a.calib_config in (None, 'calib') else
+                 os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml') if a.calib_config == 'flight' else a.calib_config)
+    report['gate_static'] = static_start_gate(_wrec, config=_gate_cfg)
     if not report['gate_static']['pass']:
         report['verdict'] = 'GATE-FAIL: ' + report['gate_static']['reason'] + ' — re-record starting on the ground'
         write_json(report, os.path.join(a.out, 'report.json'))
@@ -414,7 +440,10 @@ def main():
 
     # ---- 2. one accumulation pass: circle fit + image health ----
     log('image pass: activity/mask/gradient accumulation')
-    radii = radii_from_chain(tmpl_cams)
+    # fleet-shared disk radius: mean image-circle radius of the identical reference vehicles
+    _members, _ = fleet_members()
+    _fleet = [parse_chain(f'{OVR}/fleet_reference/{d}/theta_star.yaml')[0] for d in _members if d != a.fleet_exclude]
+    radii = radii_from_fleet(_fleet) if _fleet else radii_from_chain(tmpl_cams)
     acc = accumulate(_wrec, cams=cam_ids)
     centers = fit_centers(acc, radii)
     report['circle_fit'] = centers
@@ -489,7 +518,7 @@ def main():
     timeout_s = a.pass_timeout if a.pass_timeout else max(1800.0, 20.0 * bag_seconds(a.bag))
     harvests = []
     prev = None
-    settled_at = None       # first pass whose calibration settled; ATE uses the one after it
+    steps = []              # per-type movement from the previous pass, in envelopes
     for p in range(1, a.max_pass + 1):
         log('pass %d/%d' % (p, a.max_pass))
         cjp = f'{rd}/out/estimate_tum.txt.calib.json'
@@ -528,63 +557,24 @@ def main():
         series_path = os.path.join(a.out, 'calib_series_pass%d.jsonl' % p)
         if os.path.exists(sp):
             shutil.copy(sp, series_path)
-        else:
-            series_path = None
-            # A config that ASKED for a series and did not get one means the estimator
-            # binary predates the feature: it parses no such key and ignores it silently.
-            # Left alone, cert_settled returns None, verdict() skips the settling gate, and
-            # the run reverts to pre-settling behaviour while still printing HEALTHY --
-            # indistinguishable from a fully certified one. Observed on this host: nxt3
-            # deployed twice on a stale binary with the gate inoperative and no warning.
-            if _config_wants_series(f'{rd}/estimator_config.yaml'):
-                raise SystemExit(
-                    '[tool] ERROR: the config sets calib_series_dt > 0 but the estimator wrote no\n'
-                    '  %s\n'
-                    '  The binary is older than the calibration-series feature, so the settling\n'
-                    '  certificate cannot run. Refusing to certify with a gate silently disabled.\n'
-                    '  Rebuild the VIO workspace (colcon build --packages-select ov_msckf), or\n'
-                    '  set calib_series_dt: 0 to accept the weaker between-pass check knowingly.'
-                    % sp)
+        elif _config_wants_series(f'{rd}/estimator_config.yaml'):
+            log('  note: the config asked for a calibration series but the estimator wrote none '
+                '(older binary); it is informational only, the stopping rule does not use it')
 
-        st = cert_settled(series_path) if series_path else None
-        if st is not None:
-            log('  settling in pass %d: %s' % (p, 'worst resid %.5f%s' % (
-                st.get('worst_resid', float('nan')), '' if st.get('pass') else ' — NOT settled')
-                if st.get('worst_resid') is not None else (st.get('reason') or '?')))
-        # Without ground truth there is no ATE certificate, so a further pass would exist
-        # only to compare harvests -- settling inside THIS pass answers the same question
-        # and is the stronger test. With ground truth ATE has to be measured on a pass that
-        # was settled THROUGHOUT, and the pass in which settling is first reached was still
-        # moving early on. So run exactly one more, warm-started from the settled harvest:
-        # that pass is a valid ATE trajectory AND gives self-consistency against its parent,
-        # which is why no separate frozen pass is needed.
-        # Computed BEFORE any break so it is logged for the final pass too -- that is the
-        # pass the certificates are read from, so it is the one worth seeing.
+        # The paper's stopping rule: at pass k >= 2, converged when no parameter type moved by more
+        # than STEP_STOP full-flight envelopes since pass k-1. The calibration series, when the config
+        # writes one, is kept for inspection only.
         cams = cams_from_caljson(cj)
-        legacy_stop = False
         if prev is not None:
-            r = calib_residual(cams, prev[0])
-            dtd = abs(cj['toff'] - prev[1]) * 1000
-            log('  self-consistency vs previous pass: resid=%.4f dtoff=%.2f ms' % (r, dtd))
-            # Legacy stop, and only a fallback for runs with no calibration series: two
-            # agreeing endpoints do not imply either pass was settled, so where settling
-            # IS measurable it decides when to stop and this must not preempt it.
-            legacy_stop = r < SC_STOP and dtd < TD_STOP_MS and st is None
-        if st is not None and st.get('pass'):
-            if settled_at is None:
-                settled_at = p
-                if a.gt is not None:
-                    log('  settled within pass %d — running one more from it to certify the ATE' % p)
-            if a.gt is None:
-                log('  settled within pass %d (no ground truth, so no second pass is needed)' % p)
+            stp = step_types(prev[0], prev[1], cams, cj['toff'])
+            steps.append({k: round(float(v), 3) for k, v in stp.items()})
+            worst = max(stp.values())
+            log('  step from pass %d (envelopes): %s -> max %.2f%s'
+                % (p - 1, ' '.join('%s %.2f' % (k, v) for k, v in stp.items()), worst,
+                   (' <= %.0f: converged' % STEP_STOP) if worst <= STEP_STOP else ''))
+            if worst <= STEP_STOP:
                 report['converged_at_pass'] = p
                 break
-            if p > settled_at:
-                report['converged_at_pass'] = p
-                break
-        if legacy_stop:
-            report['converged_at_pass'] = p
-            break
         prev = (cams, cj['toff'])
         write_chain(f'{rd}/kalibr_imucam_chain.yaml', cams, cj['toff'], f'{rd}/kalibr_imucam_chain.yaml')
     report['passes_run'] = len(harvests)
@@ -597,17 +587,16 @@ def main():
         report['converged_at_pass'] = len(harvests)
         log('no pass converged within %d passes — diagnosing the last one for triage' % a.max_pass)
 
-    # ---- 5. publish robust mean of the settled harvests ----
-    # Only harvests from the settled pass onward: averaging in a pass we measured as
-    # still moving would put the values we certified back next to ones we did not.
-    settled_srcs = harvests[settled_at - 1:] if settled_at else harvests
-    srcs = settled_srcs[-min(3, len(settled_srcs)):]
-    cams_pub, toff_pub = robust_mean(srcs)
+    # ---- 5. publish the converged (last) pass ----
+    _last = json.load(open(harvests[-1]))
+    cams_pub, toff_pub = cams_from_caljson(_last), float(_last['toff'])
     pub = os.path.join(a.out, '%s_published_chain.yaml' % a.drone)
     write_chain(a.template, cams_pub, toff_pub, pub)
     report['published'] = pub
     report['published_toff'] = toff_pub
-    log('published %s (robust mean of %d harvests, toff=%.6f)' % (pub, len(srcs), toff_pub))
+    report['published_from_pass'] = len(harvests)
+    report['steps'] = steps
+    log('published %s (pass %d, the last pass; toff=%.6f)' % (pub, len(harvests), toff_pub))
 
     # ---- 6. diagnosis ----
     est = os.path.join(a.out, 'estimate_pass%d.tum' % report['converged_at_pass'])
@@ -625,25 +614,10 @@ def main():
     # ate_source records which one was used either way, so a stored report can never
     # imply a deployment measurement that did not happen.
     est_cert, cert_kind = est, 'calibration-pass'
-    series_final = os.path.join(a.out, 'calib_series_pass%d.jsonl' % report['converged_at_pass'])
-    series_final = series_final if os.path.isfile(series_final) else None
-    settled_final = cert_settled(series_final) if series_final else None
-    # Settle FIRST, then spend the extra pass. A frozen pass replays a calibration that
-    # is still moving just as faithfully as one that has settled, so running it before
-    # this check would buy an authoritative measurement of the wrong chain -- and the
-    # verdict is FLY-AGAIN either way.
-    # OFF by default: the ATE pass is already warm-started from a settled harvest and is
-    # itself verified settled, so its whole trajectory came from a static calibration --
-    # which is the only property the frozen pass was buying. Measured on the same
-    # recording, that pass gives ATE 0.0208 m against 0.0153 m frozen (and a BETTER
-    # noumenal 0.0656 vs 0.1136), both an order of magnitude inside the 0.20 m gate,
-    # for ~130 s less. Turn it on to certify under the flight config exactly.
+    # OFF by default: the last pass ran the flight settings from a calibration that moved less
+    # than two envelopes, so its trajectory is the one the flight stack would produce, up to
+    # the stiffness priors. Turn it on to certify with the flight stiffness priors exactly.
     frozen = bool(a.frozen_check)
-    if frozen and settled_final is not None and not settled_final['pass']:
-        log('skipping the deployment check: the calibration had not settled by the end of '
-            'pass %d (worst resid %.5f) — nothing stable to freeze'
-            % (report['converged_at_pass'], settled_final.get('worst_resid', float('nan'))))
-        frozen = False
     if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
@@ -658,12 +632,13 @@ def main():
             report['deploy_check_error'] = '%s: %s' % (type(e).__name__, e)
     report['ate_source'] = cert_kind
     report['campaign_env'] = _campaign_msg
-    # Same reasoning as the published mean: comparing a settled harvest against one that
-    # was still moving measures the convergence, not the agreement.
-    sc_sessions = settled_srcs if len(settled_srcs) > 1 else harvests
-    diag = diagnose(sessions=[sc_sessions], circle_fit={str(c): centers[c] for c in centers},
+    # Self-consistency is the stopping rule itself: the published pass agrees with the one before it.
+    sc = {'pass': not never, 'source': 'between-pass rule: every parameter type moved <= %.0f envelopes' % STEP_STOP,
+          'last_step_envelopes': steps[-1] if steps else None,
+          'max_last_step': round(max(steps[-1].values()), 3) if steps else None}
+    diag = diagnose(sessions=[harvests[-1:]], circle_fit={str(c): centers[c] for c in centers},
                     est_path=est_cert if a.gt else None, gt_path=a.gt,
-                    exclude=a.fleet_exclude, cam_end=a.cam_end, settle_path=series_final)
+                    exclude=a.fleet_exclude, cam_end=a.cam_end, settle_path=None, sc=sc)
     if not report['gate_timing']['pass'] and diag['verdict'].startswith('PLATFORM-DEFECT'):
         diag['verdict'] += ' [timing gate had flagged this recording — consistent]'
     report['diagnosis'] = diag
@@ -671,7 +646,7 @@ def main():
     if never:
         # The certificates above describe the last pass and are kept for triage, but the
         # run never reached a fixed point, so nothing here is deployable.
-        report['verdict'] = ('FLY-AGAIN: no pass settled within %d passes — the certificates '
+        report['verdict'] = ('FLY-AGAIN: the stopping rule did not hold within %d passes — the certificates '
                              'below describe the last pass only [%s]'
                              % (a.max_pass, diag['verdict']))
 

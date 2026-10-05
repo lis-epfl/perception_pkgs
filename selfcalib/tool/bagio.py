@@ -35,6 +35,7 @@ OAK_CAMS = ['CAM_A', 'CAM_B', 'CAM_C', 'CAM_D']
 OAK_TOPIC = '/oak_ffc_4p_driver_node/%s/compressed'
 PX4_IMU_TOPIC = '/fmu/out/sensor_combined'
 PX4_IMU_TYPE = 'px4_msgs/msg/SensorCombined'
+PX4_LAND_TOPIC = '/fmu/out/vehicle_land_detected'
 
 # px4_msgs/msg/SensorCombined CDR layout. Validated byte-exact against 2000 real
 # fleet messages (52-byte payload) -- see swarmnxt_msgs.h for the field table.
@@ -190,6 +191,33 @@ class Recording:
 
     def has(self, topic):
         return topic in self._topic_uri
+
+    def px4_takeoff(self):
+        """Seconds from the window anchor (every stream live) to the first PX4 land-detector message
+        reporting 'not landed', i.e. the takeoff; None without a land-detector stream or a takeoff.
+        On the fleet it fires 0.41-0.45 s before the vehicle is 1 cm off the ground (motion capture, six
+        flights). VehicleLandDetected is parsed straight from the CDR (uint64 timestamp at byte 4, already
+        host epoch like SensorCombined; 'landed' is the fourth bool, byte 15), so px4_msgs is not needed."""
+        if not self.has(PX4_LAND_TOPIC):
+            return None
+        for r in self._reader([PX4_LAND_TOPIC]):
+            while r.has_next():
+                _, data, _ = r.read_next()
+                if len(data) > 15 and not data[15]:
+                    return struct.unpack_from('<Q', data, 4)[0] * 1e-6 - self._anchor()
+        return None
+
+    def span_after_anchor(self):
+        """Seconds of recording between the window anchor and the end of the first file to end
+        (from the bag metadata); None if the metadata cannot be read."""
+        try:
+            ends = []
+            for uri in self.uris:
+                info = rosbag2_py.Info().read_metadata(uri, _storage_id(uri))
+                ends.append((info.starting_time.nanoseconds + info.duration.nanoseconds) * 1e-9)
+            return min(ends) - self._anchor()
+        except Exception:
+            return None
 
     # -- reading ---------------------------------------------------------------
     def _reader(self, topics):

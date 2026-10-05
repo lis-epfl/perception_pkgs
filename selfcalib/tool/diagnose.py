@@ -43,8 +43,10 @@ SC_THR = 0.10            # self-consistency residual (well inside the τ=0.30 cr
 # every 30 s run converged in one pass while two 20 s runs needed a second.
 SETTLE_THR = 0.02
 SETTLE_K = 5             # snapshots at the tail of the series that must agree
-DIST_FOCAL_PCT = 2.0     # |focal - fleet lens batch| — batch agrees to ~0.9% of tolerance (~0.5% abs)
-DIST_K1 = 0.06           # |k1 - fleet| — batch spread ~0.02
+DIST_FOCAL_PCT = 2.0     # |f_x - fleet|, |f_y - fleet| — leave-one-out over the fleet: max 1.53 % (f_x), 1.41 % (f_y)
+DIST_K1 = 0.06           # |k1 - fleet| — batch spread ~0.02 (leave-one-out over the fleet: max 0.008)
+DIST_KMEAN = 0.008       # |mean over k1..k4 of (k - fleet)|, the paper's distortion measure — leave-one-out over
+                         # the fleet: max 0.0011, median 0.0004 (same ~7x margin as DIST_K1)
 DIST_CXCY_PX = 120.0     # |c - own circle fit| — healthy fit error is 1-19 px fleet-wide (thr ≈6× worst healthy; docs/VALIDATION_MATRIX.md)
 DIST_ROT_DEG = 8.0       # extrinsic rotation vs fleet mount-position mean (fleet agrees 1-3.4°)
 DIST_TRANS_CM = 15.0     # extrinsic translation vs fleet mean (fleet agrees 1-9 cm)
@@ -179,14 +181,17 @@ def cert_settled(series_path, k=SETTLE_K):
 def cert_in_distribution(cams, toff, circle_fit=None, exclude=None):
     fs = fleet_stats(exclude)
     fails, checks = [], {}
-    foc_dev = max(abs((np.mean(cams[c]['f'][:2]) / np.mean(fs['cams'][c]['f'][:2]) - 1) * 100)
-                  for c in cams)
+    # every parameter type of the convergence envelope: principal point, both focal lengths,
+    # distortion (k1 and the signed mean of k1..k4), rotation, translation, t_d
+    foc_dev = max(abs((cams[c]['f'][i] / fs['cams'][c]['f'][i] - 1) * 100) for c in cams for i in (0, 1))
     checks['focal_vs_fleet_pct'] = round(foc_dev, 3)
     if foc_dev > DIST_FOCAL_PCT:
         fails.append('focal')
     k1_dev = max(abs(cams[c]['k'][0] - fs['cams'][c]['k'][0]) for c in cams)
+    km_dev = max(abs(float(np.mean(np.asarray(cams[c]['k'], float) - np.asarray(fs['cams'][c]['k'], float)))) for c in cams)
     checks['k1_vs_fleet'] = round(k1_dev, 4)
-    if k1_dev > DIST_K1:
+    checks['kmean_vs_fleet'] = round(km_dev, 5)
+    if k1_dev > DIST_K1 or km_dev > DIST_KMEAN:
         fails.append('distortion')
     if circle_fit is not None:
         cc = json.load(open(circle_fit)) if isinstance(circle_fit, str) else circle_fit
@@ -237,7 +242,7 @@ def verdict(sc, dist, ate, settled=None):
 
 
 def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=None, cam_end=None,
-             settle_path=None):
+             settle_path=None, sc=None):
     # With ground truth the run does multiple passes anyway (the ATE certificate needs a
     # trajectory), so self-consistency is free. Without it, a second pass exists ONLY to
     # compare harvests -- so measure settling inside the one pass instead.
@@ -245,7 +250,9 @@ def diagnose(sessions, circle_fit=None, est_path=None, gt_path=None, exclude=Non
     # trajectory ATE is scored on was produced under a static calibration, and without
     # it it replaces the second pass entirely.
     settled = cert_settled(settle_path) if settle_path is not None else None
-    if gt_path is None and settled is not None:
+    if sc is not None:
+        pass                      # the caller's convergence rule (run_tool: the paper's between-pass rule)
+    elif gt_path is None and settled is not None:
         sc = settled
         sc['source'] = 'within-pass settling'
     else:

@@ -28,10 +28,13 @@ Fewer samples undershoot the tail on noisy platforms and produce a radius-indepe
 proportionally on the image for any central camera model; t_d limits are gate-insensitive
 in 1–10 ms because its failure mode is bimodal (recovery <1 ms or frozen at seed).
 
-## Self-consistency stop (the tool's deployment criterion)
-The loop stops when two consecutive harvests agree to 0.10 in the width-normalized residual
-metric and <10 ms in t_d. This is the ground-truth-free surrogate for "reached θ\*"; from
-fleet-quality seeds it fires after 1–2 passes.
+## Stopping rule (the tool's deployment criterion, paper Sec. IV)
+At pass k ≥ 2 the loop stops when no parameter type moved by more than twice the full-flight
+envelope since pass k−1: principal point 5 px, focal length 1 %, signed mean of the four
+distortion coefficients 0.002, rotation-vector component 0.7°, translation component 5 cm,
+t_d 12 ms (max over cameras). This is the ground-truth-free surrogate for "reached θ\*"; from
+fleet-quality seeds it fires at pass 2. At most 16 passes; the published calibration is the
+last pass.
 
 ## Basin, ruler, certificate (context for the numbers you may see quoted)
 Per-axis tolerance half-widths W\* are measured by geometric-scan + bisection ladders
@@ -53,9 +56,11 @@ estimator polishes it to sub-millisecond online. Joint error tightens the cliff 
 noisy platforms.
 
 ## Diagnosis certificates (verdict.json)
-1. **Self-consistency**: consecutive-harvest agreement (above).
-2. **In-distribution**: published calibration within the fleet population's per-parameter
-   spread (requires `fleet_reference/`; leave-one-out when the vehicle is itself a member).
+1. **Self-consistency**: the stopping rule above (the published pass against the one before).
+2. **In-distribution**: every parameter type of the published calibration within limits set
+   from the fleet (requires `fleet_reference/`; leave-one-out when the vehicle is itself a
+   member): principal point vs the vehicle's own circle fit (120 px), f_x and f_y (2 %), k1
+   (0.06) and the mean of k1..k4 (0.008), camera rotation (8°) and translation (15 cm), t_d (20 ms).
 3. **ATE health** (only with `--gt`): frozen-deployment trajectory error within the fleet's
    healthy band.
 Verdict table: all pass → HEALTHY; gates failed → FLY-AGAIN; (1) pass + (2) fail →

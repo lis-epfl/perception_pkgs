@@ -2,8 +2,8 @@
 
 Calibrates a multi-camera + IMU rig **from an ordinary flight recording** — no target, no
 manual session, no ground truth. One command runs the full pipeline: recording health gates →
-zero-cost seed (fleet transfer + image-circle principal point) → iterated warm-start
-self-calibration to self-consistency → robust-mean publish → diagnosis verdict
+zero-cost seed (fleet transfer + image-center prior) → iterated warm-start
+self-calibration until the stopping rule holds → publish the converged pass → diagnosis verdict
 (HEALTHY / FLY-AGAIN / HARDWARE-CHANGED / PLATFORM-DEFECT).
 
 Validated on a 3-vehicle fisheye fleet (certified convergence basin, ~7,000 measured chains),
@@ -158,15 +158,21 @@ python3 tool/run_tool.py \
     --out out_myvehicle \
     [--fleet-exclude myvehicle]   # derive seed from fleet means, leave-one-out
     [--gt gt.tum]                 # optional; omit and the tool looks in the bag itself
-    [--max-pass 8] [--domain 70]
+    [--window S]                  # default: up to 20 s after takeoff (PX4 land detector)
+    [--max-pass 16] [--domain 70]
 ```
 
-Stages (all logged to `--out`): ground-truth lookup → gates (static start, timing health,
-image health) → one temporal-accumulation pass over the bag (image-circle principal-point
-fit) → seed assembly → warm-start loop: run estimator, harvest calibration, re-seed, repeat
-**until two consecutive harvests agree to 0.10 in the residual metric and <10 ms in t_d**
-(typically 1–2 passes from a fleet seed, ≤8 from a blind seed) → robust-mean publish (median
-intrinsics, chordal-mean rotations over harvests) → diagnosis → mount solve.
+Stages (all logged to `--out`): ground-truth lookup → data window (by default the recording up
+to 20 s after takeoff, from the PX4 land detector; `--window S` overrides, and a window longer
+than the recording uses all of it) → gates (static start, timing health, image health) → one
+temporal-accumulation pass (image-center prior: every 4th frame enters the mean image only if
+it changed by more than 2.4 % since the previous one; the mean is thresholded at 15 % of its
+brightest pixel and a disk of the fleet-shared radius is correlated with it, argmax = principal
+point) → seed assembly (fleet average + image-center prior) → warm-start loop: run estimator,
+harvest calibration, re-seed, repeat **until, at pass ≥ 2, no parameter type moved by more than
+twice the full-flight envelope since the previous pass** (5 px principal point, 1 % focal
+length, 0.002 mean distortion, 0.7° rotation, 5 cm translation, 12 ms t_d; at most
+`--max-pass`, 16) → publish that last pass → diagnosis → mount solve.
 
 Runtime: roughly (bag length) × (passes) × 1–2× real time, single machine, no GPU.
 
@@ -191,8 +197,8 @@ python3 tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle
 It also prints every calibrated value (intrinsics, extrinsics, t_d, mount) for inspection.
 See `../WORKFLOW.md` for the full four-step walkthrough.
 
-**Exit codes**: `0` success · `1` gate failure (re-record) · `2` never reached
-self-consistency (`FLY-AGAIN`) · `3` `--gt` file missing · `4` an estimator pass timed out
+**Exit codes**: `0` success · `1` gate failure (re-record) · `2` the stopping rule never held
+within `--max-pass` passes (`FLY-AGAIN`) · `3` `--gt` file missing · `4` an estimator pass timed out
 (raise `--pass-timeout`) · `5` an estimator pass produced no harvest (read
 `--out/calib/out/run.log`). Anything non-zero also writes `report.json` with the reason.
 

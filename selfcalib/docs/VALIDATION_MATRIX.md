@@ -56,6 +56,10 @@ converged harvests; writes a deployable chain yaml (all four timeshift slots = r
   self-consistent on all three vehicles.
 
 ## 5. Diagnosis (`diagnose.py`) — 3 certificates → §6.3 verdict table
+(2026-10: self-consistency is now the paper's between-pass stopping rule, and the
+in-distribution check covers every parameter type: f_x and f_y separately, and the mean of
+k1..k4 < 0.008 besides k1 -- each fleet vehicle passes against the others, a synthetic 4 %
+focal or 0.02 mean-distortion change is caught. The records below predate this.)
 Thresholds: self-consistency < 0.10; in-distribution: focal < 2 % vs fleet, k1 < 0.06,
 c_x,c_y < 120 px vs own circle fit (healthy fit error is 7–83 px fleet-wide — see note below),
 extrinsics < 8°/15 cm vs fleet mount means, toff < 20 ms vs fleet; ATE POSTG < 0.20 m.
