@@ -13,11 +13,20 @@ from bagio import Recording
 from chainio import parse_chain, kb4_radius
 
 # ---------------- thresholds (calibrated on fleet data, see docs/VALIDATION_MATRIX.md) ----
-STATIC_GYRO_STD = 0.03      # rad/s per-axis-norm std within a bin counted as static
-STATIC_ACC_STD = 0.20       # m/s^2 (on-ground with electronics running)
-STATIC_MIN_S = 1.5          # required contiguous static duration
-STATIC_SEARCH_S = 12.0      # static phase must appear within this window from bag start
-GRAVITY_Z_MIN = 8.0         # static accel z must exceed this (FLU: +g). Catches an inverted axis.
+# Static start = what the estimator's forced-static initialiser needs (ov_init StaticInitializer): a window of
+# init_window_time seconds whose two halves both have accelerometer excitation sqrt(sum|a_i - mean a|^2/(n-1)) below
+# init_imu_thresh -- read from the estimator config the loop will run (defaults = selfcalib/configs/estimator_calib.yaml).
+# That window must END within STATIC_START_MAX_S of the recording start: forced-static initialisation fires at the
+# first window that passes, so a later one means it would initialise in flight. The accelerometer test alone is
+# fooled by smooth flight (a takeoff-trimmed fleet recording reads 1.50 m/s^2 while rotating at 0.38 rad/s), and the
+# initialiser takes the gyro bias from the window's mean rate, so the gyro SPREAD (norm of per-axis std; the mean
+# holds the bias) must also stay below STATIC_GYRO_SPREAD. Measured on real still starts: fleet 0.007-0.011, UZH-FPV
+# 0.004, EuRoC V1_01 (rotors idling) 0.055, TUM-VI room1 (hand-held) 0.126 rad/s; smooth flight 0.380.
+INIT_WINDOW_S_DEFAULT = 3.0   # s, estimator init_window_time
+INIT_IMU_THRESH_DEFAULT = 1.5 # m/s^2, estimator init_imu_thresh
+STATIC_GYRO_SPREAD = 0.2      # rad/s
+STATIC_START_MAX_S = 5.0      # s from the recording start
+GRAVITY_Z_MIN = 8.0         # static accel z below -this = gravity down the z axis (PX4 FRD published as FLU): inverted axis.
 GRAVITY_NORM_TOL = 1.5      # |static accel| must be within this of 9.81 (catches unit errors)
 TIMING_DROP_RATE = 0.03     # fraction of dropped frames above this → flag (fleet ≤1.5%, nxt1 ≈8%)
 TIMING_NOISE_STD_MS = 25.0  # windowed(10 s) grid-residual std above this → flag (fleet ≤16, nxt1 ≈35)
@@ -61,45 +70,63 @@ def _rec(bag):
 
 
 # ---------------- gate 1: static start ----------------
-def static_start_gate(bag, imu_topic=None):
+def _init_params(config):
+    """init_window_time and init_imu_thresh from an estimator yaml (defaults if absent)."""
+    W, tau = INIT_WINDOW_S_DEFAULT, INIT_IMU_THRESH_DEFAULT
+    if config and os.path.exists(config):
+        txt = open(config).read()
+        m = re.search(r'^init_window_time:\s*([0-9.eE+-]+)', txt, re.M); W = float(m.group(1)) if m else W
+        m = re.search(r'^init_imu_thresh:\s*([0-9.eE+-]+)', txt, re.M); tau = float(m.group(1)) if m else tau
+    return W, tau
+
+
+def _excitation(A):
+    """the initialiser's accelerometer excitation: sqrt(sum |a_i - mean a|^2 / (n - 1)), m/s^2"""
+    return float(np.sqrt(((A - A.mean(0)) ** 2).sum() / max(len(A) - 1, 1))) if len(A) > 5 else float('inf')
+
+
+def static_start_gate(bag, imu_topic=None, config=None, init_window=None, init_thresh=None):
     rec = _rec(bag)
+    W, tau = _init_params(config)
+    W = init_window if init_window else W; tau = init_thresh if init_thresh else tau
     T, G, A = [], [], []
     t0 = None
     for t, g, a in rec.imu():
         if t0 is None:
             t0 = t
-        if t - t0 > STATIC_SEARCH_S + 2:
+        if t - t0 > STATIC_START_MAX_S + 0.5:
             break
         T.append(t - t0)
         G.append(g)
         A.append(a)
     T, G, A = np.array(T), np.array(G), np.array(A)
     if len(T) < 50:
-        return {'pass': False, 'reason': 'no/too-few IMU messages', 'static_s': 0.0}
-    # 0.5 s bins: static iff gyro std and accel std below thresholds on all axes
-    bins = np.arange(0, min(T[-1], STATIC_SEARCH_S), 0.5)
-    static = []
-    for b in bins:
-        m = (T >= b) & (T < b + 0.5)
-        if m.sum() < 10:
-            static.append(False); continue
-        static.append(bool(G[m].std(0).max() < STATIC_GYRO_STD and A[m].std(0).max() < STATIC_ACC_STD))
-    # longest contiguous static run starting in the search window
-    best = run = 0.0
-    for s in static:
-        run = run + 0.5 if s else 0.0
-        best = max(best, run)
-    g0 = float(G[T < min(3.0, T[-1])].std(0).max())
+        return {'pass': False, 'reason': 'no/too-few IMU messages', 'init_window_end_s': None}
+    # first window [t - W, t] (t <= STATIC_START_MAX_S) that the initialiser would accept AND in which the gyro is still
+    found = None; best = None
+    for t in np.arange(W, min(T[-1], STATIC_START_MAX_S) + 1e-9, 0.05):
+        h1 = (T > t - W) & (T <= t - W / 2); h2 = (T > t - W / 2) & (T <= t)
+        e = max(_excitation(A[h1]), _excitation(A[h2]))
+        m = h1 | h2
+        spread = float(np.linalg.norm(G[m].std(0))) if m.sum() > 5 else float('inf')
+        if best is None or max(e / tau, spread / STATIC_GYRO_SPREAD) < max(best[1] / tau, best[2] / STATIC_GYRO_SPREAD):
+            best = (float(t), e, spread)
+        if e < tau and spread < STATIC_GYRO_SPREAD:
+            found = (float(t), e, spread); break
+    ref = found or best
 
     # Gravity direction and magnitude at rest. Variance alone cannot see an inverted
     # axis: an IMU published in PX4's FRD body frame sits perfectly still, passes every
     # variance test, and then diverges the estimator by kilometres with no earlier
     # warning -- the calibration states still converge self-consistently, so the run
     # ends in a confident wrong verdict. This is the cheapest place to catch it.
-    sm = T < min(STATIC_MIN_S, T[-1])
+    sm = (T > ref[0] - W) & (T <= ref[0])
     a_mean = A[sm].mean(0) if sm.sum() >= 10 else A[:min(len(A), 200)].mean(0)
     a_norm = float(np.linalg.norm(a_mean))
-    grav_ok = bool(a_mean[2] > GRAVITY_Z_MIN and abs(a_norm - 9.81) < GRAVITY_NORM_TOL)
+    # Fail only on what an IMU mounting cannot legitimately produce: gravity pointing DOWN the z axis (the PX4 FRD
+    # vs FLU inversion) or a wrong magnitude (units). Any other orientation is a valid mounting -- the initialiser
+    # estimates the gravity direction itself (EuRoC's IMU reads gravity along +x).
+    grav_ok = bool(a_mean[2] > -GRAVITY_Z_MIN and abs(a_norm - 9.81) < GRAVITY_NORM_TOL)
 
     if grav_ok:
         grav_reason = ''
@@ -111,17 +138,15 @@ def static_start_gate(bag, imu_topic=None):
         grav_reason = ('static accelerometer magnitude %.2f m/s^2, expected ~9.81 '
                        '(units or scaling wrong).' % a_norm)
     else:
-        grav_reason = ('gravity not aligned with +z at rest (a=%+.2f,%+.2f,%+.2f); check the '
-                       'IMU axis convention.' % tuple(a_mean))
+        grav_reason = 'gravity check failed (a=%+.2f,%+.2f,%+.2f)' % tuple(a_mean)
 
-    static_ok = best >= STATIC_MIN_S
-    # The missing-static-phase reason takes priority; gravity is only meaningful once
-    # we know the vehicle actually held still.
-    reason = ('no >=%.1fs static phase in first %.0fs (longest %.1fs)'
-              % (STATIC_MIN_S, STATIC_SEARCH_S, best)) if not static_ok else grav_reason
-    return {'pass': bool(static_ok and grav_ok), 'static_s': best,
-            'gyro_std_first3s': round(g0, 4), 'reason': reason,
-            'static_accel_mean': [round(float(v), 4) for v in a_mean],
+    static_ok = found is not None
+    reason = ('no %.1f s still window ending within the first %.0f s (initialiser test: accelerometer excitation < %.2f '
+              'm/s^2 in both halves, gyro spread < %.2f rad/s; best window ending %.2f s: %.2f m/s^2, %.3f rad/s)'
+              % (W, STATIC_START_MAX_S, tau, STATIC_GYRO_SPREAD, best[0], best[1], best[2])) if not static_ok else grav_reason
+    return {'pass': bool(static_ok and grav_ok), 'init_window_s': W, 'init_imu_thresh': tau,
+            'init_window_end_s': round(ref[0], 2), 'accel_excitation': round(ref[1], 3), 'gyro_spread': round(ref[2], 4),
+            'reason': reason, 'static_accel_mean': [round(float(v), 4) for v in a_mean],
             'static_accel_norm': round(a_norm, 4), 'gravity_ok': grav_ok}
 
 
@@ -241,11 +266,12 @@ def main():
     ap.add_argument('bag')
     ap.add_argument('--chain', default=None, help='chain yaml (needed for image gate circle geometry)')
     ap.add_argument('--gates', default='static,timing')
+    ap.add_argument('--config', default=None, help='estimator yaml the loop will run (init_window_time, init_imu_thresh)')
     ap.add_argument('--json', default=None)
     a = ap.parse_args()
     res = {'bag': a.bag}
     if 'static' in a.gates:
-        res['static'] = static_start_gate(a.bag)
+        res['static'] = static_start_gate(a.bag, config=a.config)
     if 'timing' in a.gates:
         res['timing'] = timing_gate(a.bag)
     if 'image' in a.gates:
