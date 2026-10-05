@@ -847,7 +847,11 @@ int main(int argc, char **argv) {
   };
   if (g_pipeline) {
     sys->set_pose_sink(log_pose_quiescent);
-    std::fprintf(stderr, "[pipe]: bench pose output = post-drain sink (live-state read disabled)\n");
+    // OV_PUB_WHEN_READY: VioManager also fires the sink from the pipeline worker, at the end of each
+    // update batch.  Same rows in the same order (the dedup on state->_timestamp is in the sink),
+    // so <out>.tum is byte-identical with the gate on or off.
+    std::fprintf(stderr, "[pipe]: bench pose output = %s (live-state read disabled)\n",
+                 sys->pub_when_ready() ? "pipeline worker, when each update finishes (OV_PUB_WHEN_READY)" : "post-drain sink");
   }
 
   // track_frequency throttle (replicates ROS2Visualizer::callback_stereo lines

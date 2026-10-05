@@ -88,6 +88,21 @@ public:
   /// post-init).  Only used when the pipeline is armed; the caller logs the pose from here
   /// instead of reading the live state after feed_measurement_camera returns.
   void set_pose_sink(std::function<void()> f) { pose_sink = std::move(f); }
+  // OV_PUB_WHEN_READY=1 (default OFF => the behaviour above, unchanged): the worker ALSO fires
+  // pose_sink itself, at the end of each batch of sub-updates, while it still owns the state.
+  // The post-drain sink only runs once the NEXT frame-set has been tracked, so at 30 Hz a
+  // finished update sat ~30 ms before its pose left (measured on the Orin NX: pose out 47 ms
+  // after its images, with the update done at 17 ms).  From the worker it leaves the moment
+  // the update is done.
+  // Same read, same filter state: the sinks dedup on state->_timestamp, so the post-drain call
+  // that follows is a no-op and the emitted poses are identical -- only their wall-clock time
+  // moves.  No new race: while its job runs the worker is the ONLY thread allowed to touch
+  // `state`, and every sink call on the estimator thread sits behind a drain, so the two never
+  // overlap.  The sink therefore has to be safe on the worker thread: read `state`, append to
+  // containers that only the sink writes, publish.
+  /// True only if OV_PUB_WHEN_READY=1 AND the pipeline is armed ("[pipe]: pub_when_ready=...").
+  bool pub_when_ready() const { return _pipe_pub_ready; }
+  bool _pipe_pub_ready = false;
   /// True only if OV_PIPELINE=1 AND every refusal check passed.  Read it back from the
   /// "[pipe]: armed=..." line in the run log; never assume the env var took effect.
   bool pipeline_on() const { return _pipe_on; }

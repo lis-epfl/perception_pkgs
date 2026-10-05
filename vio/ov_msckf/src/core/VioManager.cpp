@@ -399,6 +399,11 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
         ok = refuse("camera model cannot be snapshotted (would leave a torn intrinsics read)");
       _pipe_on = ok;
       std::fprintf(stderr, "[pipe]: armed=%d\n", (int)_pipe_on);
+      // OV_PUB_WHEN_READY: only exists on top of the armed pipeline -- without it the caller
+      // reads the state inline right after the update, which already is "when ready".
+      const char *pr = std::getenv("OV_PUB_WHEN_READY");
+      _pipe_pub_ready = _pipe_on && pr && *pr == '1';
+      std::fprintf(stderr, "[pipe]: pub_when_ready=%d\n", (int)_pipe_pub_ready);
     }
   }
 }
@@ -416,6 +421,12 @@ void VioManager::pipe_submit(const std::vector<ov_core::CameraData> &subs) {
       n++;
     }
     const double ms = 1000.0 * (PipeWorker::now_s() - t0);
+    // OV_PUB_WHEN_READY: the batch's writes are done and the worker still owns the state, so
+    // the pose leaves NOW rather than after the next frame-set has been tracked.  Once per
+    // batch, AFTER its last sub-update: that is exactly the state the post-drain sink would
+    // read, so the emitted pose is the same one, only earlier.
+    if (_pipe_pub_ready && pose_sink)
+      pose_sink();
     std::lock_guard<std::mutex> lk(g_pipe.m);
     g_pipe.p_upd_ms = ms;
     g_pipe.p_upd_n = n;

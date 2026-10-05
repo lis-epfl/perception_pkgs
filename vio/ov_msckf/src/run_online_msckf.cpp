@@ -87,6 +87,14 @@
  * STAMPS.  Poses are published by ROS2Visualizer::publish_state, which stamps
  * timestamp_inI = state->_timestamp + _calib_dt_CAMtoIMU.  That is correct and is NOT
  * re-stamped here.  Do not replace it with node->now().
+ *
+ * WHEN THE POSE LEAVES.  [online-latency] stops at the hand-off of the update to the pipeline
+ * worker (p50 13.5 ms); it is NOT the pose latency.  Under OV_PIPELINE the pose is emitted by
+ * VioManager's pose_sink, which by default fires only after the NEXT frame-set has been
+ * tracked: measured 47 ms after the pose's own images arrived (80 ms when the sub-update queue
+ * runs one set behind).  OV_PUB_WHEN_READY=1 makes the worker fire the same sink the moment
+ * its update is done.  The [online-pose] census printed at exit is the number a consumer sees:
+ * frame-set complete -> the pose carrying that stamp published.
  */
 
 #include <algorithm>
@@ -642,6 +650,13 @@ int main(int argc, char **argv) {
   std::map<int, double> cam_last_track;
   double latest_imu_t = -1;
   FILE *latf = [] { const char *p = std::getenv("OV_ONLINE_LAT"); return (p && *p) ? std::fopen(p, "w") : (FILE *)nullptr; }();
+  // (frame-set stamp, steady clock) pairs: when each fed set was complete, and when the pose
+  // carrying that stamp had been published.  Joined at exit into the [online-pose] census.
+  // fed_at is written by the estimator thread only; emit_at by emit_pose only, which runs on the
+  // estimator thread or -- OV_PUB_WHEN_READY -- on the pipeline worker, never on both at once.
+  std::vector<std::pair<double, double>> fed_at, emit_at;
+  fed_at.reserve(1 << 16);
+  emit_at.reserve(1 << 16);
 
   // The ONE pose-output path.  poseimu is stamped by ROS2Visualizer::publish_state as
   // state->_timestamp + _calib_dt_CAMtoIMU (the ~-44 ms camera->IMU offset) -- it is NOT
@@ -654,6 +669,7 @@ int main(int argc, char **argv) {
     if (state->_timestamp == last_logged_ts) return;
     last_logged_ts = state->_timestamp;
     if (rclcpp::ok()) { try { viz->visualize(); } catch (...) {} } // the drain runs after shutdown
+    emit_at.emplace_back(state->_timestamp, now_s());
     Eigen::Vector4d q = state->_imu->quat();  // q_GtoI, JPL xyzw
     Eigen::Vector3d p = state->_imu->pos();   // p_IinG
     char buf[256];
@@ -664,7 +680,8 @@ int main(int argc, char **argv) {
   };
   if (g_pipeline_on) {
     sys->set_pose_sink(emit_pose);
-    std::fprintf(stderr, "[pipe]: ON -- pose output = post-drain sink (live-state read disabled)\n");
+    std::fprintf(stderr, "[pipe]: ON -- pose output = %s (live-state read disabled)\n",
+                 sys->pub_when_ready() ? "pipeline worker, when each update finishes (OV_PUB_WHEN_READY)" : "post-drain sink");
   } else {
     std::fprintf(stderr, "[pipe]: OFF -- pose output emitted inline after each fed frame-set\n");
   }
@@ -761,6 +778,7 @@ int main(int argc, char **argv) {
     const double proc = 1000.0 * (t_done - t_feed0);
     lat_ms.push_back(lat);
     proc_ms.push_back(proc);
+    fed_at.emplace_back(fr.ts, fr.arrive_wall);
     // ts  arrival->fed ms  processing ms  ready-queue depth  images  1=prefetched decode
     //   col7 arrive_wall = the MONOTONIC (steady_clock, boot-epoch) reading at which this
     //   frame-set CLOSED, i.e. all its images were in hand.  It is NOT a wall/UTC epoch and it
@@ -926,6 +944,30 @@ int main(int argc, char **argv) {
   };
   dump("[online-latency]", lat_ms);   // frame-set complete -> fed (queueing INCLUDED)
   dump("[online-proc]", proc_ms);     // time inside feed_frame (decode+track+update+publish)
+  {
+    // Frame-set complete -> the pose carrying that stamp published.  Split by how the pose came
+    // about, because the two populations differ by design: a filter step (stamps update_min_dt
+    // apart, the flight case) and a per-frame pose (zero-velocity update, on the ground).
+    std::map<double, double> arrived;
+    for (auto const &f : fed_at) arrived[f.first] = f.second;
+    std::vector<double> age_step, age_frame;
+    FILE *pf = [] { const char *p = std::getenv("OV_ONLINE_POSE_LAT"); return (p && *p) ? std::fopen(p, "w") : (FILE *)nullptr; }();
+    const double step_gap = 0.75 * params.update_min_dt;
+    double prev = -1.0;
+    for (auto const &e : emit_at) {
+      auto it = arrived.find(e.first);
+      if (it != arrived.end() && it->second > 0) {
+        const double age = 1000.0 * (e.second - it->second);
+        const bool step = step_gap > 0 && prev > 0 && (e.first - prev) > step_gap;
+        (step ? age_step : age_frame).push_back(age);
+        if (pf) std::fprintf(pf, "%.9f %.3f %d %.9f\n", e.first, age, (int)step, e.second); // stamp  age ms  1=filter step  emit clock
+      }
+      prev = e.first;
+    }
+    if (pf) std::fclose(pf);
+    dump("[online-pose]: filter steps", age_step);
+    dump("[online-pose]: per-frame", age_frame);
+  }
   if (g_nvjpg) std::fprintf(stderr, "%s\n", ov_core::ov_nvjpg_stats().c_str());
   std::fflush(stderr);
 
