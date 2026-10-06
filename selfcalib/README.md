@@ -86,11 +86,17 @@ record ROS 2 bags natively. Take them from the study package if you need to repl
 public dataset.)
 
 Hard requirements (measured limits, not preferences):
-1. **The recording must begin with a static segment ≥ 4 s** (vehicle on the ground / rig held
-   still). Without it, initialization fails at every tested flight length and pass budget.
-   That 4 s is the *recommendation*; the gate that actually runs (`gates.STATIC_MIN_S`)
-   enforces ≥ 1.5 s of contiguous stillness within the first 12 s, so a recording between
-   1.5 s and 4 s passes the gate but is below what the study validated.
+1. **The recording must begin with at least 6 s of standstill** (vehicle on the ground / rig
+   held still; idling motors are fine), counted from the instant every stream is live. The
+   estimator takes `init_window_time` (3 s) of standstill to start, and it must start before
+   the vehicle moves, with time to settle, not as it lifts off. The static-start gate enforces
+   both: the start window must be found within the first 5 s, and the stillness must last
+   until 6 s after that window began (`--min-still`, default 6). A shorter standstill is
+   rejected (GATE-FAIL) before any estimator work. Measured on the Orin: with 3 s before
+   takeoff the estimator starts at the instant of takeoff and the calibration run's trajectory
+   starts 5 cm off instead of 2.7 cm; from 4.5 s on every result matched the full recording, so
+   6 s includes a margin (docs/VALIDATION_MATRIX.md §1). In the field, leave the vehicle
+   untouched for 10–15 s after the stack starts.
 2. **≥ ~3.2 s of actual motion after the static start** (10–15 s recommended; more only helps).
 3. Time offset between camera and IMU clocks **within ≈ ±0.1 s** of the seed's
    `timeshift_cam_imu`. This is the one parameter self-calibration cannot recover from far
@@ -160,6 +166,7 @@ python3 tool/run_tool.py \
     [--gt gt.tum]                 # optional; omit and the tool looks in the bag itself
     [--after-takeoff S]           # seconds of flight to use after the PX4 takeoff (default 20)
     [--window S]                  # or a fixed span from the first instant every stream is live
+    [--min-still S]               # standstill the recording must begin with (default 6)
     [--max-pass 16] [--domain 70]
 ```
 

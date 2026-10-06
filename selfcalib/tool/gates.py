@@ -26,6 +26,18 @@ INIT_WINDOW_S_DEFAULT = 3.0   # s, estimator init_window_time
 INIT_IMU_THRESH_DEFAULT = 1.5 # m/s^2, estimator init_imu_thresh
 STATIC_GYRO_SPREAD = 0.2      # rad/s
 STATIC_START_MAX_S = 5.0      # s from the recording start
+# Starting is not enough: the estimator must start BEFORE the vehicle moves, with time to settle, not as it lifts off.
+# The gate until 2026-10-05 asked only for the start window and let through a recording with 2.5 s on the ground, whose
+# window ended half a second after takeoff. With the data cut to 3 s before takeoff the initialiser fires at the instant
+# of takeoff and the filter gets 6-8 zero-velocity updates instead of 35 or more: the calibration run's trajectory then
+# starts 5 cm off on average (15 cm worst) against 2.7 cm, reproducibly, while the published calibration stays the
+# same. From 4 s before takeoff on, every result matched the full recording (Orin NX, seven fleet recordings,
+# 2026-10-06, docs/VALIDATION_MATRIX.md section 1). The gate measures the standstill with the initialiser's own test,
+# from the start of the first window that passes; that reads about 0.45 s longer than the time to the PX4 takeoff flag,
+# so the measurements support 4.5 s. 6 s is a deliberate margin on top: the initialiser's window plus the longest arming
+# lead seen on the fleet (3.0 s), so the window that starts the filter holds no motor vibration. It rejects recordings
+# that calibrate normally with less, among them the nxt10 flight of 4 June (4.6 s) used in the paper.
+STATIC_MIN_STILL_S = 6.0      # s of standstill in total: the initialiser's window + settling (run_tool --min-still)
 GRAVITY_Z_MIN = 8.0         # static accel z below -this = gravity down the z axis (PX4 FRD published as FLU): inverted axis.
 GRAVITY_NORM_TOL = 1.5      # |static accel| must be within this of 9.81 (catches unit errors)
 TIMING_DROP_RATE = 0.03     # fraction of dropped frames above this → flag (fleet ≤1.5%, nxt1 ≈8%)
@@ -85,16 +97,18 @@ def _excitation(A):
     return float(np.sqrt(((A - A.mean(0)) ** 2).sum() / max(len(A) - 1, 1))) if len(A) > 5 else float('inf')
 
 
-def static_start_gate(bag, imu_topic=None, config=None, init_window=None, init_thresh=None):
+def static_start_gate(bag, imu_topic=None, config=None, init_window=None, init_thresh=None, min_still=None):
     rec = _rec(bag)
     W, tau = _init_params(config)
     W = init_window if init_window else W; tau = init_thresh if init_thresh else tau
+    need = STATIC_MIN_STILL_S if min_still is None else float(min_still)
+    settle = max(0.0, need - W)     # standstill required after the initialiser's window
     T, G, A = [], [], []
     t0 = None
     for t, g, a in rec.imu():
         if t0 is None:
             t0 = t
-        if t - t0 > STATIC_START_MAX_S + 0.5:
+        if t - t0 > STATIC_START_MAX_S + settle + 0.5:
             break
         T.append(t - t0)
         G.append(g)
@@ -141,10 +155,30 @@ def static_start_gate(bag, imu_topic=None, config=None, init_window=None, init_t
         grav_reason = 'gravity check failed (a=%+.2f,%+.2f,%+.2f)' % tuple(a_mean)
 
     static_ok = found is not None
+    # settling: the same test must keep passing until `settle` after the first window that passed
+    still_until = None
+    if static_ok:
+        still_until = found[0]
+        for t in np.arange(found[0] + 0.05, found[0] + settle + 1e-9, 0.05):
+            h1 = (T > t - W) & (T <= t - W / 2); h2 = (T > t - W / 2) & (T <= t)
+            m = h1 | h2
+            if t > T[-1] or max(_excitation(A[h1]), _excitation(A[h2])) >= tau or \
+                    (float(np.linalg.norm(G[m].std(0))) if m.sum() > 5 else float('inf')) >= STATIC_GYRO_SPREAD:
+                break
+            still_until = float(t)
+    standstill = (still_until - (found[0] - W)) if static_ok else 0.0
+    settle_ok = bool(static_ok and standstill >= need - 0.05)
+    still_reason = ('the vehicle stays still for only %.1f s (%.1f s needed: the estimator takes %.1f s of standstill to '
+                    'start and needs %.1f s more to settle before the vehicle moves; its start window ends %.2f s into the '
+                    'data and the stillness ends at %.2f s)'
+                    % (standstill, need, W, settle, found[0], still_until)) if static_ok and not settle_ok else ''
     reason = ('no %.1f s still window ending within the first %.0f s (initialiser test: accelerometer excitation < %.2f '
               'm/s^2 in both halves, gyro spread < %.2f rad/s; best window ending %.2f s: %.2f m/s^2, %.3f rad/s)'
-              % (W, STATIC_START_MAX_S, tau, STATIC_GYRO_SPREAD, best[0], best[1], best[2])) if not static_ok else grav_reason
-    return {'pass': bool(static_ok and grav_ok), 'init_window_s': W, 'init_imu_thresh': tau,
+              % (W, STATIC_START_MAX_S, tau, STATIC_GYRO_SPREAD, best[0], best[1], best[2])) if not static_ok else (still_reason or grav_reason)
+    advice = ('re-record, leaving the vehicle untouched for at least %g s before takeoff' % need) if static_ok and not settle_ok \
+        else 're-record starting on the ground'
+    return {'pass': bool(static_ok and settle_ok and grav_ok), 'init_window_s': W, 'init_imu_thresh': tau,
+            'min_still_s': need, 'standstill_s': round(standstill, 2), 'advice': advice,   # standstill_s is counted up to min_still only
             'init_window_end_s': round(ref[0], 2), 'accel_excitation': round(ref[1], 3), 'gyro_spread': round(ref[2], 4),
             'reason': reason, 'static_accel_mean': [round(float(v), 4) for v in a_mean],
             'static_accel_norm': round(a_norm, 4), 'gravity_ok': grav_ok}
@@ -267,11 +301,13 @@ def main():
     ap.add_argument('--chain', default=None, help='chain yaml (needed for image gate circle geometry)')
     ap.add_argument('--gates', default='static,timing')
     ap.add_argument('--config', default=None, help='estimator yaml the loop will run (init_window_time, init_imu_thresh)')
+    ap.add_argument('--min-still', type=float, default=None,
+                    help='seconds of standstill the recording must begin with (default %g)' % STATIC_MIN_STILL_S)
     ap.add_argument('--json', default=None)
     a = ap.parse_args()
     res = {'bag': a.bag}
     if 'static' in a.gates:
-        res['static'] = static_start_gate(a.bag, config=a.config)
+        res['static'] = static_start_gate(a.bag, config=a.config, min_still=a.min_still)
     if 'timing' in a.gates:
         res['timing'] = timing_gate(a.bag)
     if 'image' in a.gates:

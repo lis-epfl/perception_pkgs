@@ -318,6 +318,14 @@ def main():
                          'live up to this long after takeoff, however long the vehicle waited on the '
                          'ground first. Not combinable with --window. A recording without a '
                          'land-detector stream, or without a takeoff, is used whole.' % TAKEOFF_WINDOW_S)
+    ap.add_argument('--min-still', type=float, default=None,
+                    help='seconds of standstill the recording must begin with, checked by the static-start gate '
+                         '(default 6): the estimator takes init_window_time (3 s) of standstill to start, and the '
+                         'rest is settling time before the vehicle moves. A recording with less is rejected '
+                         '(GATE-FAIL). 6 s carries a margin: results matched the full recording from 4.5 s on, '
+                         'so 4.5 is safe for rerunning an older recording (the nxt10 flight of 4 June has '
+                         '4.6 s). 3 reproduces the gate as it was until 2026-10-05 (start window only), which '
+                         'lets the estimator start as the vehicle lifts off.')
     ap.add_argument('--window', type=float, default=None,
                     help='a FIXED span instead of the takeoff rule: seconds of the recording to use, '
                          'measured from the instant every stream is live, wherever the takeoff falls '
@@ -358,6 +366,8 @@ def main():
         ap.error('--max-pass must be >= 1; got %d' % a.max_pass)
     if a.pass_timeout is not None and a.pass_timeout <= 0:
         ap.error('--pass-timeout must be > 0 seconds; got %g' % a.pass_timeout)
+    if a.min_still is not None and a.min_still <= 0:
+        ap.error('--min-still must be > 0 seconds; got %g' % a.min_still)
     if a.after_takeoff is not None and a.after_takeoff <= 0:
         ap.error('--after-takeoff must be > 0 seconds; got %g' % a.after_takeoff)
     if a.after_takeoff is not None and a.window is not None:
@@ -439,9 +449,9 @@ def main():
     # the static-start test must match the initialiser of the config the warm-start loop will run
     _gate_cfg = (f'{OVR}/configs/estimator_calib.yaml' if a.calib_config in (None, 'calib') else
                  os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml') if a.calib_config == 'flight' else a.calib_config)
-    report['gate_static'] = static_start_gate(_wrec, config=_gate_cfg)
+    report['gate_static'] = static_start_gate(_wrec, config=_gate_cfg, min_still=a.min_still)
     if not report['gate_static']['pass']:
-        report['verdict'] = 'GATE-FAIL: ' + report['gate_static']['reason'] + ' — re-record starting on the ground'
+        report['verdict'] = 'GATE-FAIL: ' + report['gate_static']['reason'] + ' — ' + report['gate_static'].get('advice', 're-record starting on the ground')
         write_json(report, os.path.join(a.out, 'report.json'))
         log(report['verdict'])
         return 1

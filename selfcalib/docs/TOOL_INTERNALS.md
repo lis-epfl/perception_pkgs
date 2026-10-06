@@ -27,7 +27,8 @@ python3 tool/run_tool.py --drone <name> --bag <recording> \
     --template <any fleet chain yaml> --imu-chain <imu chain yaml> \
     --out tool/e2e_<name> [--gt <gt.tum>] [--fleet-exclude <name>] [--domain 70]
 ```
-Recording requirements enforced by the gates: starts on the ground with ≥1.5 s static; ≥15 s of
+Recording requirements enforced by the gates: starts on the ground with ≥6 s of standstill (3 s for
+the estimator to start + 3 s to settle, `--min-still`); ≥15 s of
 flight (§4.5 floor); clean lenses (image gate); sane timestamps (timing gate — a flag here
 predicts the PLATFORM-DEFECT diagnosis, not a calibration failure).
 

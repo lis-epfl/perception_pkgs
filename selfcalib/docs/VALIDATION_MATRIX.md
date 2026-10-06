@@ -4,18 +4,65 @@ Implements and validates every §6 component of the paper. All tests on real stu
 marked synthetic. Thresholds cited here are the ones shipped in the code.
 
 ## 1. Static-start gate (`gates.static_start_gate`)
-Requires ≥1.5 s contiguous static IMU (0.5 s bins: gyro std < 0.03 rad/s, accel std < 0.20 m/s²
-per axis) within the first 12 s.
+*Rewritten 2026-09-23 to test what the estimator's static initialiser needs; standstill
+requirement added 2026-10-06. The 2026-07-07 rule (1.5 s of stillness within the first 12 s) and
+its table no longer apply.*
 
-| recording | expected | result |
-|---|---|---|
-| bags/nxt3_raw_4cam_basin | PASS | PASS (12.0 s static) |
-| bags/nxt6_raw_4cam | PASS | PASS (12.0 s) |
-| bags/nxt10_raw_4cam | PASS | PASS (7.0 s) |
-| nxt1 s2 / s3 | PASS | PASS (8.5 / 9.5 s) |
-| bags/nxt3_raw_4cam (cut: static phase removed) | **FAIL** | **FAIL** (0.0 s static) |
+Counted from the instant every stream is live, the gate passes when
+(a) a window of `init_window_time` (3 s) that the initialiser would accept ends within the first
+5 s — accelerometer excitation below `init_imu_thresh` (1.5 m/s²) in both halves, gyro spread
+below 0.2 rad/s — and
+(b) the same test keeps passing until 6 s after that window began (`STATIC_MIN_STILL_S`,
+`run_tool.py --min-still`). Idling motors do not break it (0.2–1.1 m/s² on the fleet; arming is
+1.8–3.0 s before takeoff).
 
-The cut bag is the real negative control from the study's bag-swap incident (§7 round 5).
+**What the measurements support, and the margin.** Orin NX, released tool, data cut to start N
+seconds before the PX4 takeoff flag (2026-10-06). Seven fleet recordings (nxt3, nxt6, nxt10); two
+runs where two values are given. Calibration distance = from the full-recording run, in the
+stopping rule's tolerance units (median, max; the rule allows 2).
+
+| data starts before takeoff | zero-velocity updates before motion | first pose off, cm | error after mount correction, cm | ATE, cm | calibration distance |
+|---|---|---|---|---|---|
+| 3 s | 6–8 | 4.9, 5.6 | 5.8, 6.4 | 2.67, 2.68 | 0.52, 0.91 / 0.55, 0.74 |
+| 4 s | 35–38 | 3.0 | 4.1 | 2.66 | 0.57, 0.89 |
+| 5 s | 60–67 | 2.8 | 4.0 | 2.77 | 0.49, 1.03 |
+| 6 s | 91–96 | 2.7 | 3.9 | 2.71 | 0.47, 0.59 |
+| 8 s | 144–156 | 2.7 | 3.9 | 2.61 | 0.39, 0.62 |
+| full recording (4.1–11.1 s) | 40–244 | 2.7 | 3.8, 3.9 | 2.58, 2.65 | second run: 0.41, 0.73 |
+
+With 3 s the initialiser fires at the instant of takeoff. Every run stays HEALTHY in two passes
+and the published calibration is unchanged within run-to-run spread, but the calibration run's
+trajectory starts worse, reproducibly per recording. (The error after mount correction pins the
+trajectory to its first pose; over 53 runs it follows the first-pose error with a correlation of
+0.98.) From 4 s before takeoff nothing differs from the full recording. The standstill the gate
+measures reads about 0.45 s longer than the time to the takeoff flag, so the measurements support
+4.5 s. **6 s is a margin on top**: the initialiser's window plus the longest arming lead seen on
+the fleet (3.0 s), so that the window that starts the filter holds no motor vibration.
+
+Two things the number does not rest on:
+- **Flight configuration.** With the calibration fixed and the flight priors, the standstill
+  length made no difference on the same recordings: ATE 3.37 / 3.18 / 3.68 cm at 3 / 4 / 6 s
+  against 3.29 / 3.46 / 3.46 cm for the full recording (deterministic runs).
+- **nxt1.** The vehicle with the camera-timing defect (§2) is erratic at every standstill length.
+  On 23 June b its calibration runs gave ATE 7–11 cm at 6 s and more, 8–43 cm at 4–5 s and
+  15–17 cm at 3 s; its flight-configuration runs went the other way (34 cm with the full
+  standstill, 9 cm at 3 s).
+
+**The gate on the available recordings.**
+
+| recording | standstill, s | gate until 2026-10-05 | gate at 6 s |
+|---|---|---|---|
+| nxt3 / nxt6, 4 June | 11.6 / 9.2 | PASS | PASS |
+| nxt10, 4 June | 4.6 | PASS | **FAIL** — a paper study flight; calibrates normally with `--min-still 4.5` (HEALTHY, two passes, ATE 1.8 and 2.2 cm in two runs) |
+| nxt3 / nxt6, 23 June a | 10.3 / 8.6 | PASS | PASS |
+| nxt3 / nxt6, 23 June b | 9.3 / 7.5 | PASS | PASS |
+| nxt1, 23 June a / b | 5.7 / 7.5 | PASS | **FAIL** / PASS |
+| nxt3 / nxt6 / nxt10, 3 June (15 Hz) | 6.8 / 4.7 / 3.0 | PASS | PASS / **FAIL** / **FAIL** |
+| same data cut to 3, 4, 5 s before takeoff | 3.4–5.6 | PASS | **FAIL** (all) |
+| same data cut to 6, 8 s before takeoff | ≥ 6 | PASS | PASS (all) |
+
+The 3 June nxt10 recording shows what the earlier gate let through: 2.5 s on the ground, and a
+start window that ended half a second after takeoff.
 
 ## 2. Timing-health gate (`gates.timing_gate`)
 Naive inter-frame jitter flags healthy vehicles (dropped frames look like jitter). Shipped
