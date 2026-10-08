@@ -211,6 +211,32 @@ within `--max-pass` passes (`FLY-AGAIN`) · `3` `--gt` file missing · `4` an es
 (raise `--pass-timeout`) · `5` an estimator pass produced no harvest (read
 `--out/calib/out/run.log`). Anything non-zero also writes `report.json` with the reason.
 
+### Optional: a calibration that is also right for stereo depth
+
+The default run gives a calibration that tracks well. It can still leave the cameras several
+millimetres from where they sit relative to each other, which tracking does not notice and
+stereo depth does. Two additions to the estimator correct this. Both are off by default; switch
+them on in the environment of the run, and use about a minute of flight:
+
+```bash
+export OV_XCAM=1 OV_XCAM_PRESET=rt                        # match features between neighbouring cameras
+export OV_PRIOR_NONRAD_SIG=0.002 OV_NONRAD_SKEW_FIXED=1   # estimate two more lens terms per camera
+export OV_GROUP_CAMS=1            # on a desktop only; on the vehicle campaign.env already sets it
+python3 tool/run_tool.py ... --after-takeoff 60
+```
+
+Measured with this tool on the flight computer (60 s after takeoff): the four optical centres
+come out 0.5 and 0.9 mm off a square on two vehicles, against 27 and 7 mm with the default run,
+and stereo depth at 2-9 m is biased by about 1 % (six recordings, three vehicles). Tracking error
+does not change. About 50 s of flight are needed (the default 20 s are not enough), and the run
+takes about 2.6 minutes instead of 1.2. `../vio/README.md` lists the switches.
+
+The two lens terms are not in the chain file, which has no field for them. The run writes them
+to `--out/<drone>_published_terms.txt`, and `deploy_vio.py` puts them into the flight folder as
+`lens_terms.env`. **They are part of the calibration**: source that file wherever the chain is
+used, in flight and for depth (the MANIFEST gives the line). The chain without its lens terms
+is not the calibrated lens model.
+
 ### Ground truth is optional and found automatically
 
 Calibration itself never needs ground truth. When it *is* available, two extra things come

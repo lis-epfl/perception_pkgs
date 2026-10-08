@@ -12,6 +12,7 @@ folder layout the VIO estimator expects:
     <out>/kalibr_imucam_chain.yaml  the published calibration (intrinsics + extrinsics + t_d)
     <out>/kalibr_imu_chain.yaml     the IMU chain the calibration ran with
     <out>/mount.json                mount rotation, if solved   (NOT an estimator input)
+    <out>/lens_terms.env            OV_NONRADIAL, if the calibration estimated lens terms
     <out>/MANIFEST.txt              what each file is and the command to fly it
 
 The estimator resolves `relative_config_imu` / `relative_config_imucam` RELATIVE TO THE
@@ -93,6 +94,10 @@ def main():
         raise SystemExit('[deploy] ERROR: IMU chain not found: %s\n'
                          '  (run_tool.py copies the --imu-chain it used to calib/)' % imu)
     mount_json = os.path.join(cal, '%s_mount.json' % drone)
+    # Present only when the calibration ran with OV_PRIOR_NONRAD_SIG: two lens terms per camera,
+    # which the chain format cannot hold. The estimator reads them from OV_NONRADIAL.
+    terms_txt = os.path.join(cal, '%s_published_terms.txt' % drone)
+    terms = open(terms_txt).read().strip() if os.path.isfile(terms_txt) else None
 
     vio = resolve_vio_root(a.vio_root)
     flight_cfg = os.path.join(vio, 'vio_deploy', 'config', 'estimator_flight.yaml')
@@ -138,6 +143,11 @@ def main():
     shutil.copy(imu, os.path.join(a.out, 'kalibr_imu_chain.yaml'))
     if mount is not None:
         shutil.copy(mount_json, os.path.join(a.out, 'mount.json'))
+    if terms:
+        # quoted: the value holds ';', which a sourcing shell would otherwise end the line at
+        open(os.path.join(a.out, 'lens_terms.env'), 'w').write("OV_NONRADIAL='%s'\n" % terms)
+        log('lens terms: %d cameras -> lens_terms.env (part of this calibration: source it to fly)'
+            % len(terms.split(';')))
 
     # ---- 5. verify the deployed folder is self-consistent before declaring success ----
     problems = []
@@ -174,7 +184,7 @@ FILES
   kalibr_imu_chain.yaml      IMU noise densities + IMU-intrinsics blocks.
   campaign.env               the OV_* environment of the campaign numbers (aarch64 only).
   mount.json                 mount rotation M. NOT read by the estimator -- apply it to the
-                             OUTPUT trajectory (selfcalib/tool/mount.py, apply()).%s
+                             OUTPUT trajectory (selfcalib/tool/mount.py, apply()).%s%s
 
 All three YAML files must stay in THIS directory together: the estimator resolves
 relative_config_imu / relative_config_imucam relative to the config file's own location.
@@ -184,7 +194,7 @@ FLY IT
   # algorithm gates every quoted fleet number was measured with. Never on a desktop.
   [ "$(uname -m)" = aarch64 ] && { set -a; source %s/campaign.env; set +a; }
 
-  # offline replay of a recording
+%s  # offline replay of a recording
   set -a; source <vio>/vio_deploy/config/flight_stiffness.env; set +a
   bash <vio>/vio_deploy/scripts/run_serial.sh BAG %s/estimator_flight.yaml OUT %d false 42 DOMAIN
 
@@ -198,7 +208,15 @@ it the estimator runs with loose calibration priors, which is the CALIBRATION op
 point, not the flight one.
 """ % (drone, cal, verdict, dep_toff,
        '' if mount is not None else '  (mount.json absent: that calibration had no ground truth)',
-       os.path.abspath(a.out), os.path.abspath(a.out), ncam, os.path.abspath(a.out))
+       '' if not terms else
+       '\n  lens_terms.env             two lens terms per camera (OV_NONRADIAL), estimated with this\n'
+       '                             calibration and part of it: the chain alone is not the\n'
+       '                             calibrated lens model.',
+       os.path.abspath(a.out),
+       '' if not terms else
+       '  # this calibration has lens terms: source them for the replay and for the live node\n'
+       '  set -a; source %s/lens_terms.env; set +a\n\n' % os.path.abspath(a.out),
+       os.path.abspath(a.out), ncam, os.path.abspath(a.out))
     open(os.path.join(a.out, 'MANIFEST.txt'), 'w').write(manifest)
 
     log('deployed -> %s' % os.path.abspath(a.out))

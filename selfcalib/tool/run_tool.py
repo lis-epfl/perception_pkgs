@@ -219,7 +219,7 @@ def _redirect_scratch(cfg_txt, dirpath):
     return cfg_txt
 
 
-def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s):
+def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s, nonradial=None):
     """Run the published calibration under the FLIGHT config, exactly as it will be deployed.
 
     This is what the ATE certificate must measure. The warm-start passes run the
@@ -261,6 +261,8 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
         if line and not line.startswith('#') and '=' in line:
             k, v = line.split('=', 1)
             env[k.strip()] = v.strip()
+    if nonradial:
+        env['OV_NONRADIAL'] = nonradial
     bag_arg = ','.join(rec.uris)
     cp = subprocess.run(['bash', run_serial, bag_arg, f'{outdir}/estimator_flight.yaml',
                          f'{outdir}/out', str(ncam), 'false', '42', str(a.domain)],
@@ -505,7 +507,7 @@ def main():
     # Guard the documented footgun: flight priors leaking in from the caller's shell
     # would pin the calibration at its seed, and it fails by reporting a suspiciously
     # LOW self-consistency residual rather than by erroring.
-    _leaked = sorted(k for k in os.environ if k.startswith('OV_PRIOR'))
+    _leaked = sorted(k for k in os.environ if k.startswith('OV_PRIOR') and k != 'OV_PRIOR_NONRAD_SIG')
     if _leaked:
         log('WARNING: %s set in the environment — these tether the calibration to its seed. '
             'Unsetting for the warm-start passes.' % ','.join(_leaked))
@@ -540,6 +542,7 @@ def main():
     timeout_s = a.pass_timeout if a.pass_timeout else max(1800.0, 20.0 * bag_seconds(a.bag))
     harvests = []
     prev = None
+    _nonrad = None          # 'p1,p2,s;...' per camera, carried from pass to pass when the estimator reports lens terms
     steps = []              # per-type movement from the previous pass, in envelopes
     for p in range(1, a.max_pass + 1):
         log('pass %d/%d' % (p, a.max_pass))
@@ -549,8 +552,10 @@ def main():
         try:
             # A fleet recording spans two files (IMU and cameras are recorded
             # separately), so hand the estimator every URI bagio resolved.
-            _env = {k: v for k, v in os.environ.items() if not k.startswith('OV_PRIOR')}
+            _env = {k: v for k, v in os.environ.items() if not k.startswith('OV_PRIOR') or k == 'OV_PRIOR_NONRAD_SIG'}
             _env.update(_campaign)
+            if _nonrad:
+                _env['OV_NONRADIAL'] = _nonrad      # lens terms of the previous pass (estimator built with the non-radial patch)
             cp = subprocess.run(['bash', run_serial, ','.join(_rec.uris),
                                  f'{rd}/estimator_config.yaml', f'{rd}/out', str(ncam), a.calib_stereo,
                                  '42', str(a.domain)], capture_output=True, timeout=timeout_s, env=_env)
@@ -571,6 +576,8 @@ def main():
             write_json(report, os.path.join(a.out, 'report.json'))
             return 5
         cj = json.load(open(cjp))
+        if all('nonrad' in cj['cams'][str(k)] for k in range(ncam)) and os.environ.get('OV_PRIOR_NONRAD_SIG'):
+            _nonrad = ';'.join(','.join('%.17g' % v for v in cj['cams'][str(k)]['nonrad']) for k in range(ncam))
         hp = os.path.join(a.out, 'harvest_pass%d.calib.json' % p)
         shutil.copy(f'{rd}/out/estimate_tum.txt.calib.json', hp)
         shutil.copy(f'{rd}/out/estimate_tum.txt', os.path.join(a.out, 'estimate_pass%d.tum' % p))
@@ -615,6 +622,10 @@ def main():
     pub = os.path.join(a.out, '%s_published_chain.yaml' % a.drone)
     write_chain(a.template, cams_pub, toff_pub, pub)
     report['published'] = pub
+    if _nonrad:
+        # The chain format has no field for the lens terms yet: publish them beside the chain, as the value of OV_NONRADIAL.
+        open(os.path.join(a.out, '%s_published_terms.txt' % a.drone), 'w').write(_nonrad + '\n')
+        report['published_nonradial'] = _nonrad
     report['published_toff'] = toff_pub
     report['published_from_pass'] = len(harvests)
     report['steps'] = steps
@@ -643,7 +654,7 @@ def main():
     if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
-            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s)
+            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad)
             cert_kind = 'frozen-deployment'
             log('deployment check: flight config + flight_stiffness.env priors over the same recording')
         except Exception as e:
