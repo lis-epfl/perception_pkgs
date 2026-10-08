@@ -31,6 +31,8 @@ void ov_nvjpg_watermark(double) {}
 bool ov_nvjpg_readback(int, unsigned char *) { return false; }
 bool ov_nvjpg_readback_ts(int, double, unsigned char *, int *, int *) { return false; }
 bool ov_nvjpg_readback_cpu_ts(int, double, unsigned char *, int *, int *) { return false; }
+void ov_nvjpg_host_copy(bool) {}
+bool ov_nvjpg_host_get(int, double, unsigned char *, int, int) { return false; }
 std::string ov_nvjpg_stats() { return "nvjpg: unavailable (built without the Jetson multimedia API)"; }
 
 } // namespace ov_core

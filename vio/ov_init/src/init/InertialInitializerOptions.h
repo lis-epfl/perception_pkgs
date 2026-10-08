@@ -316,6 +316,7 @@ struct InertialInitializerOptions {
         if (dist_model == "equidistant") {
           camera_intrinsics.insert({i, std::make_shared<ov_core::CamEqui>(matrix_wh.at(0), matrix_wh.at(1))});
           camera_intrinsics.at(i)->set_value(cam_calib);
+          camera_intrinsics.at(i)->set_nonradial(ov_core::CamBase::nonradial_from_env((size_t)i)); // fixed non-radial terms (logged by VioManagerOptions)
         } else if (dist_model == "ds" || dist_model == "pinhole-ds" || dist_model == "double_sphere") {
           // Double-sphere model (Usenko et al. 2018). 6 intrinsics: fx, fy, cx, cy, xi, alpha.
           camera_intrinsics.insert({i, std::make_shared<ov_core::CamDS>(matrix_wh.at(0), matrix_wh.at(1))});

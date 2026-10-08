@@ -63,6 +63,7 @@
 #include <omp.h>
 #include <Eigen/Core>   // pulls in ov_core::CameraData / ImuData
 #include "state/State.h"
+#include "state/StateHelper.h" // marginal covariance of the calibration states (non-radial terms)
 #include "state/Propagator.h"
 #include "track/nvjpg_decode.h"
 
@@ -761,10 +762,22 @@ int main(int argc, char **argv) {
       if (!first) std::fprintf(cf, ",");
       first = false;
       std::fprintf(cf, "\"%d\":{\"intr\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],"
-        "\"R_CtoI\":[%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f],\"p_CinI\":[%.9f,%.9f,%.9f]}",
+        "\"R_CtoI\":[%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f],\"p_CinI\":[%.9f,%.9f,%.9f]",
         cid, intr(0),intr(1),intr(2),intr(3),intr(4),intr(5),intr(6),intr(7),
         R_CtoI(0,0),R_CtoI(0,1),R_CtoI(0,2),R_CtoI(1,0),R_CtoI(1,1),R_CtoI(1,2),R_CtoI(2,0),R_CtoI(2,1),R_CtoI(2,2),
         p_CinI(0),p_CinI(1),p_CinI(2));
+      if (st->_do_calib_cam_nonradial) {
+        // Non-radial terms as calibration states: values, their standard deviations, and the standard deviations of
+        // the 8 intrinsics (square roots of the covariance diagonal). Absent when the terms are fixed.
+        Eigen::VectorXd q = st->_cam_nonradial.at(cid)->value();
+        Eigen::MatrixXd Pq = ov_msckf::StateHelper::get_marginal_covariance(st, {st->_cam_nonradial.at(cid)});
+        Eigen::MatrixXd Pi = ov_msckf::StateHelper::get_marginal_covariance(st, {kv.second});
+        std::fprintf(cf, ",\"nonrad\":[%.12e,%.12e,%.12e],\"nonrad_sig\":[%.6e,%.6e,%.6e]", q(0), q(1), q(2),
+                     std::sqrt(Pq(0,0)), std::sqrt(Pq(1,1)), std::sqrt(Pq(2,2)));
+        std::fprintf(cf, ",\"intr_sig\":[%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e]", std::sqrt(Pi(0,0)), std::sqrt(Pi(1,1)),
+                     std::sqrt(Pi(2,2)), std::sqrt(Pi(3,3)), std::sqrt(Pi(4,4)), std::sqrt(Pi(5,5)), std::sqrt(Pi(6,6)), std::sqrt(Pi(7,7)));
+      }
+      std::fprintf(cf, "}");
     }
     std::fprintf(cf, "}");
     {

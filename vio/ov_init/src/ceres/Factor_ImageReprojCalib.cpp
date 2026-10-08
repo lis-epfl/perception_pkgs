@@ -87,6 +87,7 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   } else if (is_fisheye) {
     ov_core::CamEqui cam(0, 0);
     cam.set_value(camera_vals);
+    cam.set_nonradial(nonradial); // fixed non-radial terms of this camera (zero = unmodified path)
     uv_dist = cam.distort_d(uv_norm);
     if (jacobians) {
       cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);

@@ -57,6 +57,7 @@ Simulator::Simulator(VioManagerOptions &params_) {
     } else if (tmp_cast != nullptr) {
       params.camera_intrinsics.insert({tmp.first, std::make_shared<ov_core::CamEqui>(tmp.second->w(), tmp.second->h())});
       params.camera_intrinsics.at(tmp.first)->set_value(params_.camera_intrinsics.at(tmp.first)->get_value());
+      params.camera_intrinsics.at(tmp.first)->set_nonradial(params_.camera_intrinsics.at(tmp.first)->get_nonradial()); // fixed non-radial terms
     } else {
       params.camera_intrinsics.insert({tmp.first, std::make_shared<ov_core::CamRadtan>(tmp.second->w(), tmp.second->h())});
       params.camera_intrinsics.at(tmp.first)->set_value(params_.camera_intrinsics.at(tmp.first)->get_value());

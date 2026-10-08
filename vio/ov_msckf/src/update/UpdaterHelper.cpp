@@ -45,6 +45,200 @@ thread_local bool g_msckf_scratch_tl = false;
 thread_local std::vector<double> g_sc_w;
 }
 #include <vector>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+
+// OV_XCAM_DIFF=1 (default OFF): differential rows for a feature that two cameras observe at the same timestamp, i.e. a pair made
+// by the cross-camera association (ov_core/src/track/xcam_assoc.inc). Without that association (OV_XCAM unset, stereo tracking, a
+// tracker that has none) the switch does nothing but warn: xcam_diff_setup() leaves the rows ordinary.
+//
+// The ordinary rows give every observation independent noise of sigma_pix, so the position of the two observations RELATIVE to
+// each other counts as sqrt(2) sigma_pix. The association registers the pair photometrically to a fraction of a pixel, and that
+// relative position is what calibrates the pose between the two cameras. Model, with a = reference camera and b = the other one:
+//   a's observation  p = proj_a(X) + d      d = drift of a's track, sigma_pix per axis
+//   b's observation  q = proj_b(X') + m     X' = the surface point that a actually shows, m = noise of the registration, sigma_m per axis
+// X' = X + E s with A E s = d, where A = d proj_a / d p_FinG (2 x 3) and E spans the plane that faces camera a (the complement
+// of A's null direction, which moves the point along a's ray). Hence q - proj_b(X) = J d + m with J = (B E)(A E)^-1 = B A^T (A A^T)^-1
+// (B = d proj_b / d p_FinG; the rows of A span that plane). J is formed in EUCLIDEAN space: A = H_fa D^-1, B = H_fb D^-1 with
+// D = d p_FinG / d lambda of the feature representation. In the PARAMETER space of an anchored inverse-depth feature the complement
+// of H_fa's null direction is not that plane, and H_fb H_fa^T (H_fa H_fa^T)^-1 is wrong along the epipolar direction. So
+//   rows_b - J rows_a     (H_f, H_x and the residual alike)
+// carries the noise m alone, independent of d. Scaled by sigma_pix / sigma_m it replaces the rows of b; the rows of a stay.
+// This is the exact whitening of the pair's joint noise by an invertible transform: the callers' R = sigma_pix^2 I stays right,
+// and the nullspace projection, the chi-square tests and the compression work on the rows as on any others.
+namespace {
+struct XcamDiff {
+  bool on = false;
+  double sig_m = 0.35; // OV_XCAM_DIFF_SIG: noise of b's observation relative to a's (px, per axis)
+  double ratio = 0.0;  // sigma_pix / sig_m; 0 until UpdaterHelper::xcam_diff_setup() has told the pixel noise, and for good when the
+                       // cross-camera association of the tracker does not run (the rows stay ordinary)
+  double gate = 0.0;   // OV_XCAM_DIFF_GATE: a pair whose r_b - J r_a is longer than this many sig_m is not registered any more and keeps
+                       // its ordinary rows (0 = no limit)
+  // statistics of r_b - J r_a before the scaling (px, per axis); the Jacobians may be built on several threads
+  std::mutex mtx;
+  long pairs = 0, skipped = 0, gated = 0, seen = 0;
+  double sum2 = 0.0;
+  std::vector<float> rsv; // reservoir for the robust standard deviation
+  uint64_t lcg = 88172645463325252ULL;
+  XcamDiff() {
+    const char *e = std::getenv("OV_XCAM_DIFF");
+    on = e && *e == '1';
+    if (!on)
+      return;
+    if (const char *s = std::getenv("OV_XCAM_DIFF_SIG")) {
+      if (atof(s) > 0)
+        sig_m = atof(s);
+      else
+        std::fprintf(stderr, "[xcam-warn] OV_XCAM_DIFF_SIG='%s' is not a positive number: %.2f px is used\n", s, sig_m);
+    }
+    if (const char *s = std::getenv("OV_XCAM_DIFF_GATE"))
+      gate = std::max(0.0, atof(s));
+  }
+  // np pairs transformed, ns left as they were and ng beyond the gate in one call; v = the components of the differential residuals
+  // of the transformed pairs
+  void note(long np, long ns, long ng, const std::vector<float> &v) {
+    const size_t cap = 20000;
+    std::lock_guard<std::mutex> lk(mtx);
+    pairs += np;
+    skipped += ns;
+    gated += ng;
+    for (float x : v) {
+      sum2 += (double)x * (double)x;
+      seen++;
+      if (rsv.size() < cap) {
+        rsv.push_back(x);
+        continue;
+      }
+      lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+      const uint64_t j = (lcg >> 33) % (uint64_t)seen;
+      if (j < cap)
+        rsv[j] = x;
+    }
+  }
+  ~XcamDiff() {
+    if (!on || !(ratio > 0)) // not set, or set without the association of the tracker (xcam_diff_setup() has said so)
+      return;
+    double robust = 0.0;
+    if (!rsv.empty()) {
+      for (float &x : rsv)
+        x = std::abs(x);
+      std::nth_element(rsv.begin(), rsv.begin() + rsv.size() / 2, rsv.end());
+      robust = 1.4826 * rsv[rsv.size() / 2];
+    }
+    std::fprintf(stderr, "[xcam-diff] pairs=%ld skipped=%ld rms_px=%.4f robust_px=%.4f ratio=%.4f sigma_m_px=%.3f gate=%.2f gated=%ld\n", pairs,
+                 skipped, seen > 0 ? std::sqrt(sum2 / (double)seen) : 0.0, robust, ratio, sig_m, gate, gated);
+  }
+};
+XcamDiff g_xd;
+
+// The differential rows of every two-camera pair of one feature, see above. H_f, H_x and res are the finished ordinary rows,
+// dpfg_dlambda (3 x 3) is the derivative of the point's global position with respect to the feature parameters (H_f = dz/dp_FinG * dpfg_dlambda).
+void xcam_diff_rows(const UpdaterHelper::UpdaterHelperFeature &feature, const Eigen::MatrixXd &dpfg_dlambda, Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x,
+                    Eigen::VectorXd &res) {
+
+  // Back to Euclidean space, once per call. Not invertible (an entry is not finite): every pair keeps its ordinary rows
+  const Eigen::Matrix3d Dlam = dpfg_dlambda;
+  const Eigen::Matrix3d Dinv = Dlam.inverse();
+  const bool dinv_ok = Dinv.allFinite();
+
+  // Every observation with its first row, in the order in which the rows were filled; then by timestamp and camera
+  struct Obs {
+    double t;
+    size_t cam, ncam; // the camera and how many observations of this feature it has in total
+    int row;
+  };
+  std::vector<Obs> obs;
+  int c = 0;
+  for (auto const &pair : feature.timestamps) {
+    for (size_t m = 0; m < pair.second.size(); m++, c++)
+      obs.push_back({pair.second.at(m), pair.first, pair.second.size(), 2 * c});
+  }
+  std::sort(obs.begin(), obs.end(), [](const Obs &x, const Obs &y) { return x.t < y.t || (x.t == y.t && x.cam < y.cam); });
+
+  long np = 0, ns = 0, ng = 0;
+  std::vector<float> dres;
+  for (size_t i = 0, j = 0; i < obs.size(); i = j) {
+
+    // The observations [i, j) share one timestamp. Reference = the camera with the most observations (tie: lower camera id)
+    size_t a = i;
+    for (j = i + 1; j < obs.size() && obs[j].t == obs[i].t; j++) {
+      if (obs[j].ncam > obs[a].ncam)
+        a = j;
+    }
+
+    // Each other camera against the reference
+    for (size_t b = i; b < j; b++) {
+      if (obs[b].cam == obs[a].cam)
+        continue;
+      if (!dinv_ok) {
+        ns++;
+        continue;
+      }
+      const int ra = obs[a].row, rb = obs[b].row;
+      const Eigen::Matrix<double, 2, 3> H_fa = H_f.block(ra, 0, 2, 3), H_fb = H_f.block(rb, 0, 2, 3);
+      // derivatives of the two observations with respect to the point's global position
+      const Eigen::Matrix<double, 2, 3> A = H_fa * Dinv, B = H_fb * Dinv;
+
+      // The pair stays as it is when A has no full rank or anything is not finite (a NaN fails the comparison as well)
+      const Eigen::Matrix2d G = A * A.transpose();
+      if (!(G.determinant() > 1e-12 * G(0, 0) * G(1, 1))) {
+        ns++;
+        continue;
+      }
+      const Eigen::Matrix2d J = B * A.transpose() * G.inverse();
+      const Eigen::Matrix<double, 2, 3> d_f = (H_fb - J * H_fa) * g_xd.ratio;
+      const Eigen::MatrixXd d_x = (H_x.middleRows(rb, 2) - J * H_x.middleRows(ra, 2)) * g_xd.ratio;
+      const Eigen::Vector2d d_r = res.segment(rb, 2) - J * res.segment(ra, 2);
+      if (!d_f.allFinite() || !d_x.allFinite() || !d_r.allFinite()) {
+        ns++;
+        continue;
+      }
+      if (g_xd.gate > 0 && d_r.norm() > g_xd.gate * g_xd.sig_m) {
+        ng++;
+        continue;
+      }
+      H_f.block(rb, 0, 2, 3) = d_f;
+      H_x.middleRows(rb, 2) = d_x;
+      res.segment(rb, 2) = d_r * g_xd.ratio;
+      np++;
+      dres.push_back((float)d_r(0));
+      dres.push_back((float)d_r(1));
+    }
+  }
+  if (np + ns + ng > 0)
+    g_xd.note(np, ns, ng, dres);
+}
+} // namespace
+
+void UpdaterHelper::xcam_diff_setup(double sigma_pix_msckf, double sigma_pix_slam, bool assoc_on, int assoc_maint, bool assoc_snap) {
+  if (!g_xd.on)
+    return;
+
+  // The weight is for pairs that the cross-camera association has registered. Without it a feature with two cameras at one timestamp
+  // comes from somewhere else (stereo tracking) and nothing has registered it: the rows stay ordinary.
+  if (!assoc_on) {
+    g_xd.ratio = 0.0;
+    std::fprintf(stderr, "[xcam-warn] OV_XCAM_DIFF=1 without the cross-camera association (it needs OV_XCAM=1, the KLT tracker and no stereo "
+                         "tracking): no pair is registered, every row stays ordinary\n");
+    return;
+  }
+  // The weight assumes that a pair is registered when it is formed (OV_XCAM_SNAP), registered again while it lives (OV_XCAM_MAINT) and
+  // checked by its residual (OV_XCAM_DIFF_GATE). The tested setting has all three; each one that is missing is named.
+  const bool no_maint = assoc_maint <= 0, no_snap = !assoc_snap, no_gate = !(g_xd.gate > 0);
+  if (no_maint || no_snap || no_gate)
+    std::fprintf(stderr, "[xcam-warn] OV_XCAM_DIFF=1 without%s%s%s%s%s: the pairs are weighted as registered to %.2f px; the tested setting is "
+                         "OV_XCAM_SNAP=1 OV_XCAM_MAINT=4 OV_XCAM_DIFF_GATE=3\n",
+                 no_snap ? " registration when a pair is formed (OV_XCAM_SNAP=0)" : "", no_snap && (no_maint || no_gate) ? "," : "",
+                 no_maint ? " re-registration (OV_XCAM_MAINT=0)" : "", no_maint && no_gate ? "," : "", no_gate ? " a gate (OV_XCAM_DIFF_GATE=0)" : "", g_xd.sig_m);
+  g_xd.ratio = sigma_pix_msckf / g_xd.sig_m;
+  if (sigma_pix_slam != sigma_pix_msckf)
+    std::fprintf(stderr, "[xcam-warn] OV_XCAM_DIFF=1: the SLAM pixel noise (%.3f) differs from the MSCKF one (%.3f); the differential rows are scaled with the MSCKF one in both updates\n",
+                 sigma_pix_slam, sigma_pix_msckf);
+  std::fprintf(stderr, "[xcam-cfg] diff=1 sigma_m_px=%.3f sigma_pix=%.3f ratio=%.4f gate=%.2f\n", g_xd.sig_m, sigma_pix_msckf, g_xd.ratio, g_xd.gate);
+}
 
 void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                                         std::vector<Eigen::MatrixXd> &H_x, std::vector<std::shared_ptr<Type>> &x_order) {
@@ -236,6 +430,14 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       map_hx.insert({distortion, total_hx});
       x_order.push_back(distortion);
       total_hx += distortion->size();
+    }
+
+    // If the non-radial terms of this camera are calibration states
+    if (state->_do_calib_cam_nonradial) {
+      std::shared_ptr<Vec> nonrad = state->_cam_nonradial.at(pair.first);
+      map_hx.insert({nonrad, total_hx});
+      x_order.push_back(nonrad);
+      total_hx += nonrad->size();
     }
 
     // Loop through all measurements for this specific camera
@@ -463,10 +665,24 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         H_x.block(2 * c, map_hx[distortion], 2, distortion->size()) = dz_dzeta;
       }
 
+      // Derivative of measurement in respect to the non-radial terms (p1, p2, skew)
+      if (state->_do_calib_cam_nonradial) {
+        Eigen::MatrixXd dz_dq;
+        state->_cam_intrinsics_cameras.at(pair.first)->compute_nonradial_jacobian(uv_norm, dz_dq);
+        if (ov_core::CamBase::nonradial_skew_fixed_from_env())
+          dz_dq.col(2).setZero(); // skew held at its start value: zero Jacobian column = zero gain (OV_NONRAD_SKEW_FIXED)
+        std::shared_ptr<Vec> nonrad = state->_cam_nonradial.at(pair.first);
+        H_x.block(2 * c, map_hx[nonrad], 2, nonrad->size()) = dz_dq;
+      }
+
       // Move the Jacobian and residual index forward
       c++;
     }
   }
+
+  // OV_XCAM_DIFF: a pair of two cameras at one timestamp gets differential rows (needs the three-parameter feature)
+  if (g_xd.on && g_xd.ratio > 0 && jacobsize == 3 && feature.timestamps.size() > 1)
+    xcam_diff_rows(feature, dpfg_dlambda, H_f, H_x, res);
 }
 
 void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {

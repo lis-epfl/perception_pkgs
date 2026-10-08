@@ -113,6 +113,25 @@ public:
                                         Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<ov_type::Type>> &x_order);
 
   /**
+   * @brief OV_XCAM_DIFF=1: tells get_feature_jacobian_full the pixel noise of its callers
+   *
+   * The differential rows of a two-camera pair are scaled so that the callers' R = sigma_pix^2 I stays right.
+   * One value serves both updaters (the MSCKF one); a different SLAM value is reported once. Does nothing with the switch unset.
+   *
+   * The rows are differential only when the cross-camera association of the tracker runs (assoc_on): nothing else registers a pair
+   * of two cameras to a fraction of a pixel (stereo tracking does not). Otherwise one "[xcam-warn]" and every row stays ordinary.
+   * One more "[xcam-warn]" that names each piece of the tested setting that is missing: no registration when a pair is formed
+   * (OV_XCAM_SNAP), no re-registration (OV_XCAM_MAINT), no gate (OV_XCAM_DIFF_GATE).
+   *
+   * @param sigma_pix_msckf Pixel noise of the MSCKF updater
+   * @param sigma_pix_slam Pixel noise of the SLAM updater
+   * @param assoc_on The tracker's cross-camera association runs (ov_core::TrackBase::xcam_settings())
+   * @param assoc_maint Its re-registration interval in frame-sets, as it uses it (OV_XCAM_MAINT after the preset; 0 = off)
+   * @param assoc_snap It moves a relabelled point onto the matched position (OV_XCAM_SNAP)
+   */
+  static void xcam_diff_setup(double sigma_pix_msckf, double sigma_pix_slam, bool assoc_on, int assoc_maint, bool assoc_snap);
+
+  /**
    * @brief This will project the left nullspace of H_f onto the linear system.
    *
    * Please see the @ref update-null for details on how this works.

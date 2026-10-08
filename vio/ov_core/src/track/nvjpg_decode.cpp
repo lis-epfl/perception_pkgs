@@ -42,6 +42,10 @@ struct Slot {
   // another frame.  So the surface is copied out, device-to-device, under the decode lock.
   void *d_own = nullptr;
   size_t p_own = 0;
+  // OV_XCAM_READBACK: pinned host copy of d_own (tight, h_w * h_h bytes), written on the decode thread; valid for the staged picture only
+  unsigned char *h_own = nullptr;
+  int h_w = 0, h_h = 0;
+  bool h_valid = false;
   const void *d_y = nullptr;
   size_t pitch = 0;
   int w = 0, h = 0;
@@ -85,6 +89,8 @@ struct State {
   // counters
   std::atomic<long> n_stage{0}, n_take{0}, n_miss{0}, n_block{0}, n_abandon{0}, n_fail{0};
   std::atomic<long> n_acqfail{0};   // R18: acquire gave up -> caller decoded on the CPU
+  std::atomic<bool> host_copy{false}; // OV_XCAM_READBACK: also copy every picture to pinned host memory (ov_nvjpg_host_copy)
+  std::atomic<long> n_hcopy{0}, n_hfail{0}, n_hget{0};
   double block_ms = 0.0;
   double max_block_ms = 0.0;
   std::mutex m;
@@ -460,7 +466,29 @@ const unsigned char *ov_nvjpg_stage(int cam_id, double ts, const unsigned char *
       }
       cudaError_t ce = cudaMemcpy2DAsync(sl0.d_own, sl0.p_own, d_y, pitch, (size_t)dw, (size_t)dh,
                                          cudaMemcpyDeviceToDevice, s.cpy);
+      // OV_XCAM_READBACK: the host copy rides on the same non-blocking stream, behind the copy-out, and the one
+      // synchronise below covers both. A failure here costs the host copy only, never the picture.
+      bool hc = false;
+      sl0.h_valid = false;
+      if (ce == cudaSuccess && s.host_copy.load(std::memory_order_relaxed)) {
+        if (!sl0.h_own || sl0.h_w != (int)dw || sl0.h_h != (int)dh) {
+          if (sl0.h_own) cudaFreeHost(sl0.h_own);
+          sl0.h_own = nullptr;
+          void *hp = nullptr;
+          if (cudaHostAlloc(&hp, (size_t)dw * dh, cudaHostAllocDefault) == cudaSuccess) sl0.h_own = (unsigned char *)hp;
+          sl0.h_w = (int)dw;
+          sl0.h_h = (int)dh;
+        }
+        if (sl0.h_own)
+          hc = cudaMemcpy2DAsync(sl0.h_own, (size_t)dw, sl0.d_own, sl0.p_own, (size_t)dw, (size_t)dh,
+                                 cudaMemcpyDeviceToHost, s.cpy) == cudaSuccess;
+        if (!hc) s.n_hfail++;
+      }
       if (ce == cudaSuccess) ce = cudaStreamSynchronize(s.cpy);
+      if (hc && ce == cudaSuccess) {
+        sl0.h_valid = true;
+        s.n_hcopy++;
+      }
       if (ce != cudaSuccess) {
         std::fprintf(stderr, "[nvjpg]: FATAL D2D copy-out: %s\n", cudaGetErrorString(ce));
         std::exit(EXIT_FAILURE);
@@ -591,6 +619,23 @@ bool ov_nvjpg_readback_ts(int cam_id, double ts, unsigned char *dst, int *w, int
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
+void ov_nvjpg_host_copy(bool on) { S().host_copy.store(on); }
+
+bool ov_nvjpg_host_get(int cam_id, double ts, unsigned char *dst, int w, int h) {
+  State &s = S();
+  if (!s.on || !dst) return false;
+  // The copy (1 MB, about 0.1 ms) stays under the state lock: a staged slot cannot be recycled, but this keeps the
+  // host buffer safe against any later change of that rule. No CUDA call on this path.
+  std::lock_guard<std::mutex> lk(s.m);
+  auto it = s.stage.find({cam_id, ts});
+  if (it == s.stage.end()) return false;
+  const Slot &sl = s.slot[it->second / s.ring][it->second % s.ring];
+  if (!sl.h_valid || !sl.h_own || sl.h_w != w || sl.h_h != h) return false;
+  std::memcpy(dst, sl.h_own, (size_t)w * (size_t)h);
+  s.n_hget++;
+  return true;
+}
+
 bool ov_nvjpg_selftest(const unsigned char *jpg, size_t n) {
   State &s = S();
   if (!s.on) return false;
@@ -628,10 +673,12 @@ std::string ov_nvjpg_stats() {
   std::snprintf(b, sizeof(b),
                 "[nvjpg]: on ring=%d lookahead=%d acq_ms=%.0f bufs_registered=%zu staged=%ld "
                 "taken=%ld miss=%ld ring_blocks=%ld block_ms=%.2f max_block_ms=%.2f "
-                "cpu_fallback=%ld abandoned=%ld decode_fail=%ld distinct_bufs=%zu",
+                "cpu_fallback=%ld abandoned=%ld decode_fail=%ld distinct_bufs=%zu "
+                "host_copy=%d host_copied=%ld host_copy_fail=%ld host_read=%ld",
                 s.ring, s.lookahead, s.acq_ms, s.egl.size(), (long)s.n_stage, (long)s.n_take,
                 (long)s.n_miss, (long)s.n_block, s.block_ms, s.max_block_ms,
-                (long)s.n_acqfail, (long)s.n_abandon, (long)s.n_fail, s.n_surf_ids.size());
+                (long)s.n_acqfail, (long)s.n_abandon, (long)s.n_fail, s.n_surf_ids.size(),
+                (int)s.host_copy.load(), (long)s.n_hcopy, (long)s.n_hfail, (long)s.n_hget);
   return std::string(b);
 }
 

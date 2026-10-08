@@ -47,10 +47,12 @@
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
+#include "update/UpdaterHelper.h"
 #include "update/UpdaterMSCKF.h"
 #include "update/PreJac.h"
 #include "update/UpdaterSLAM.h"
 #include "update/UpdaterZeroVelocity.h"
+#include "update/UpdaterRigShape.h"
 #include "utils/vprof.h"
 #include <thread>
 #include <condition_variable>
@@ -213,6 +215,35 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+// ---- OV_XCAM_STATS (>= 1): how many features that enter / survive each update carry measurements from two cameras
+// Read-only; one line at exit. ----
+namespace {
+struct XcamUpdStats {
+  int level = 0;
+  long n[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  long upd = 0;
+  XcamUpdStats() {
+    const char *e = std::getenv("OV_XCAM_STATS");
+    level = (e && *e) ? std::atoi(e) : 0;
+  }
+  static void count(const std::vector<std::shared_ptr<ov_core::Feature>> &v, long &a, long &a2) {
+    for (const auto &f : v) {
+      int c = 0;
+      for (const auto &kv : f->timestamps)
+        if (!kv.second.empty()) c++;
+      a++;
+      if (c >= 2) a2++;
+    }
+  }
+  ~XcamUpdStats() {
+    if (level > 0)
+      std::fprintf(stderr, "[xcam-upd] updates=%ld msckf_in=%ld msckf_in_2cam=%ld msckf_used=%ld msckf_used_2cam=%ld slam_in=%ld slam_in_2cam=%ld slam_used=%ld slam_used_2cam=%ld slaminit_in=%ld slaminit_in_2cam=%ld slaminit_ok=%ld slaminit_ok_2cam=%ld\n",
+                   upd, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11]);
+  }
+};
+XcamUpdStats g_xus;
+} // namespace
+
 // Wall-clock breakdown of feed_measurement_camera. record_timing_information covers
 // only frames where an EKF update fires (update_min_dt gates it), so it misses the
 // tracking done on every other frame -- on a fleet recording that was 285 of 451
@@ -230,6 +261,23 @@ struct VScoped {
   explicit VScoped(const char *key) : k(key), t0(_now()) {}
   ~VScoped() { ov_msckf::g_vio_stage_secs[k] += _now() - t0; ov_msckf::g_vio_stage_calls[k] += 1; }
 };
+
+// OV_RIG_DIST / OV_RIG_PLANAR after a zero-velocity update. That is a filter update too: once the feature updates have correlated the
+// camera poses with the IMU state it moves the camera centres, and its branch returns before the call of update_again() at the end of
+// do_feature_propagate_update(). So the rig shape can follow it here as it follows a feature update: the mean-only snap of the centres
+// onto the shape (with OV_RIG_REAPPLY=1 nothing: the rows are applied again at feature updates only). Before the first application the
+// updater is idle and nothing happens. Called only where the update worker is drained or joined.
+// OFF unless OV_RIG_AFTER_ZUPT is exactly 1: the results reported for flight windows of 20 to 60 s were made without this call (the
+// centres then stay off the shape, by up to about 1 mm, from a zero-velocity update to the next feature update, and a calibration
+// taken after a landing is not exactly on the shape); the whole-flight runs with the shape held were made with it. The call is
+// deterministic. With it the 20 s results differ from those without it, recording by recording, as they do for any small change,
+// with no shift on average. Use OV_RIG_AFTER_ZUPT=1 where the run ends at standstill (whole flights).
+inline void rig_again_after_zupt(const std::shared_ptr<ov_msckf::UpdaterRigShape> &rig, const std::shared_ptr<ov_msckf::State> &state,
+                                 const std::shared_ptr<ov_msckf::Propagator> &propagator) {
+  static const bool on = [] { const char *e = std::getenv("OV_RIG_AFTER_ZUPT"); return e && e[0] == '1' && e[1] == '\0'; }();
+  if (rig != nullptr && on && rig->update_again(state, true))
+    propagator->invalidate_cache();
+}
 } // namespace
 
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
@@ -282,6 +330,21 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
     state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
     state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+    // Non-radial terms: start value from the camera object (OV_NONRADIAL). If they are calibration states, tell the
+    // camera object, so that it keeps the non-radial code path (and its Jacobian) even at zero.
+    {
+      Eigen::VectorXd nr0 = params.camera_intrinsics.at(i)->get_nonradial();
+      state->_cam_nonradial.at(i)->set_value(nr0);
+      state->_cam_nonradial.at(i)->set_fej(nr0);
+      if (state->_do_calib_cam_nonradial) {
+        state->_cam_intrinsics_cameras.at(i)->set_nonradial_estimated(true);
+        std::printf("[nonradial]: cam%d p1, p2, skew are CALIBRATION STATES, start %.10e %.10e %.10e, prior sigma %.3e (OV_PRIOR_NONRAD_SIG)\n", i,
+                    nr0(0), nr0(1), nr0(2), ov_core::CamBase::nonradial_prior_sigma_from_env());
+        if (ov_core::CamBase::nonradial_skew_fixed_from_env())
+          std::printf("[nonradial]: cam%d skew HELD at its start value %.10e (OV_NONRAD_SKEW_FIXED): only p1, p2 are estimated\n", i, nr0(2));
+        std::fflush(stdout);
+      }
+    }
   }
 
   //===================================================================================
@@ -361,12 +424,20 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
   updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
 
+  // OV_XCAM_DIFF: the differential rows of a two-camera pair are scaled for the pixel noise the updaters use. They are only right for
+  // pairs that the cross-camera association of the tracker has registered, so the tracker says whether it runs and how it is set.
+  const ov_core::TrackBase::XcamSettings xcam_set = trackFEATS->xcam_settings();
+  UpdaterHelper::xcam_diff_setup(params.msckf_options.sigma_pix, params.slam_options.sigma_pix, xcam_set.on, xcam_set.maint, xcam_set.snap);
+
   // If we are using zero velocity updates, then create the updater
   if (params.try_zupt) {
     updaterZUPT = std::make_shared<UpdaterZeroVelocity>(params.zupt_options, params.imu_noises, trackFEATS->get_feature_database(),
                                                         propagator, params.gravity_mag, params.zupt_max_velocity,
                                                         params.zupt_noise_multiplier, params.zupt_max_disparity);
   }
+
+  // OV_RIG_DIST / OV_RIG_PLANAR: the known shape of the camera rig as a measurement of the camera poses (null when not asked for)
+  updaterRIG = UpdaterRigShape::from_env();
 
   // ---------------- OV_PIPELINE: arm, or refuse with a named reason --------------------
   // Every refusal below is a state the pipeline provably cannot make safe.  A refusal
@@ -519,6 +590,7 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     }
     if (did_zupt_update) {
       assert(state->_timestamp == timestamp);
+      rig_again_after_zupt(updaterRIG, state, propagator);
       propagator->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
@@ -671,6 +743,16 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // ever in flight and nothing downstream of the drain can see a half-updated state.
   const bool do_pipe = _pipe_on && is_initialized_vio;
 
+  // OV_XCAM (cross-camera association in the tracker): the tracker has no extrinsics of its own; they are calibration
+  // states. Hand over the CURRENT estimates only where nothing is writing the state: here in the sequential path (the
+  // update worker is joined above), at the drain point in the pipeline path, after the join in the async path.
+  static const bool xcam_on = [] { const char *e = std::getenv("OV_XCAM"); return e && *e == '1'; }();
+  auto xcam_push_ext = [this] {
+    for (auto const &kv : state->_calib_IMUtoCAM)
+      trackFEATS->set_cam_extrinsics(kv.first, kv.second->Rot(), kv.second->pos());
+  };
+  if (xcam_on && !do_pipe && !do_async) xcam_push_ext();
+
   // Start timing
   rT1 = boost::posix_time::microsec_clock::local_time();
 
@@ -740,6 +822,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
         }
         if (did_zupt_update) {
           assert(state->_timestamp == message.timestamp);
+          rig_again_after_zupt(updaterRIG, state, propagator);
           { VPROF("1.track/TOTAL"); VScoped _s("KLT tracking"); trackFEATS->feed_new_camera(m_rest); }
           propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
           updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
@@ -810,6 +893,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     if (_pipe_oldest_time > state->_timestamp) _pipe_oldest_time = -1;
     maybe_refresh_fisheye_masks(message);  // one frame late; mask drift is slow (flight-only)
     trackFEATS->snapshot_calib();          // race-free: nothing is writing CamBase now
+    if (xcam_on) xcam_push_ext();          // same drain point: the extrinsics the tracker uses from the next frame on
     if (pose_sink) pose_sink();            // the pose of the update that just completed
   }
   if (!do_pipe && det_defer) {           // OV_DETERMINISTIC: commit the per-camera buckets
@@ -819,6 +903,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   if (async_update()) {
     g_upd.join();                          // update(N) finishes while we tracked N+1 (no-op pre-init)
     trackFEATS->flush_pending();           // commit deferred measurements (also during init!)
+    if (xcam_on && do_async) xcam_push_ext(); // async path: the worker is joined, the next one is not launched yet
     maybe_refresh_fisheye_masks(message);  // one frame late in async mode; mask drift is slow
   }
 
@@ -843,6 +928,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
+      rig_again_after_zupt(updaterRIG, state, propagator);
       propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
@@ -1135,6 +1221,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (state->_timestamp != message.timestamp) {
     { VPROF("2.propagate_clone"); VScoped _s("propagate+clone"); propagator->propagate_and_clone(state, message.timestamp); }
   }
+
+  // OV_RIG_DIST / OV_RIG_PLANAR: first application of the rig shape, with the snap of the camera centres. It has to come before the
+  // filter's first feature update, and this is the first call that gets here: nothing has used the camera positions yet. No
+  // precomputed MSCKF system (OV_PREJAC) can hold the old positions either: such a system is only made by prejac_launch at the END
+  // of a call that went through its feature updates, i.e. after this point of that call, and the EKF update that follows the snap
+  // moves the state epoch like every other one.
+  if (updaterRIG != nullptr && updaterRIG->update_first(state))
+    propagator->invalidate_cache();
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // If we have not reached max clones, we should just return...
@@ -1580,7 +1674,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   { VScoped _s("MSCKF update"); {
     _ut.mark(0);
     const auto _tm0 = std::chrono::steady_clock::now();
+    if (g_xus.level > 0) XcamUpdStats::count(featsup_MSCKF, g_xus.n[0], g_xus.n[1]);
     updaterMSCKF->update(state, featsup_MSCKF);
+    if (g_xus.level > 0) { XcamUpdStats::count(featsup_MSCKF, g_xus.n[2], g_xus.n[3]); g_xus.upd++; }
     const double _tm = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tm0).count();
     if (upd_budget > 0.0 && g_sched_pred > 0.5)
       cal_scale = std::min(4.0, std::max(0.25, 0.9 * cal_scale + 0.1 * (cal_scale * _tm / g_sched_pred)));
@@ -1601,7 +1697,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
     // Do the update
     _ut.mark(1);
+    if (g_xus.level > 0) XcamUpdStats::count(featsup_TEMP, g_xus.n[4], g_xus.n[5]);
     { VScoped _s("SLAM update"); updaterSLAM->update(state, featsup_TEMP); }
+    if (g_xus.level > 0) XcamUpdStats::count(featsup_TEMP, g_xus.n[6], g_xus.n[7]);
     _ut.mark(2);
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
     propagator->invalidate_cache();
@@ -1609,7 +1707,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
   _ut.mark(2);
+  if (g_xus.level > 0) XcamUpdStats::count(feats_slam_DELAYED, g_xus.n[8], g_xus.n[9]);
   { VScoped _s("SLAM delayed_init"); updaterSLAM->delayed_init(state, feats_slam_DELAYED); }
+  if (g_xus.level > 0) XcamUpdStats::count(feats_slam_DELAYED, g_xus.n[10], g_xus.n[11]);
   _ut.mark(3);
   rT6 = boost::posix_time::microsec_clock::local_time();
 
@@ -1666,6 +1766,16 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Finally marginalize the oldest clone if needed.
   { VPROF("9.db/marginalize_old_clone"); VScoped _s("marginalize_old_clone"); StateHelper::marginalize_old_clone(state); }
   _ut.mark(4);
+
+  // OV_RIG_DIST / OV_RIG_PLANAR: the rig shape again. The feature updates above moved the cameras with pictures of far points only.
+  // This is the last state write of the call: the pose snapshot and the precompute worker below see its result, and the tracker gets
+  // the camera poses again before it next uses them (xcam_push_ext).
+  // By default (OV_RIG_REAPPLY unset or 0) it is no EKF update but a mean-only snap of the camera centres onto the shape, after every
+  // OV_RIG_EVERY-th call that gets here (also the sub-updates of one clone tick); the snap moves the state epoch of the precomputed
+  // systems itself. With OV_RIG_REAPPLY=1 it is a new EKF update with all rows, on every OV_RIG_EVERY-th update with a new state
+  // timestamp.
+  if (updaterRIG != nullptr && updaterRIG->update_again(state))
+    propagator->invalidate_cache();
 
   // OV_ASYNC_EMIT: last state write of this sub-update is done -- hand the emitter a snapshot.
   ov_publish_snap(state, propagator->gravity());

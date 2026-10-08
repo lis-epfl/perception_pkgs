@@ -111,6 +111,11 @@ State::State(StateOptions &options) {
     current_id += _calib_dt_CAMtoIMU->size();
   }
 
+  // Non-radial terms (p1, p2, skew) as calibration states: only together with the intrinsics and only if
+  // OV_PRIOR_NONRAD_SIG > 0. Otherwise they stay the fixed constants of the camera objects.
+  const double sig_nonrad = ov_core::CamBase::nonradial_prior_sigma_from_env();
+  _do_calib_cam_nonradial = (_options.do_calib_camera_intrinsics && sig_nonrad > 0.0);
+
   // Loop through each camera and create extrinsic and intrinsics
   for (int i = 0; i < _options.num_cameras; i++) {
 
@@ -136,6 +141,15 @@ State::State(StateOptions &options) {
       intrin->set_local_id(current_id);
       _variables.push_back(intrin);
       current_id += intrin->size();
+    }
+
+    // Non-radial terms of this camera (always allocated, a state only when calibrated)
+    auto nonrad = std::make_shared<Vec>(3);
+    _cam_nonradial.insert({i, nonrad});
+    if (_do_calib_cam_nonradial) {
+      nonrad->set_local_id(current_id);
+      _variables.push_back(nonrad);
+      current_id += nonrad->size();
     }
   }
 
@@ -182,6 +196,11 @@ State::State(StateOptions &options) {
       _Cov.block(_cam_intrinsics.at(i)->id(), _cam_intrinsics.at(i)->id(), 4, 4) = std::pow(sig_if, 2) * Eigen::MatrixXd::Identity(4, 4);
       _Cov.block(_cam_intrinsics.at(i)->id() + 4, _cam_intrinsics.at(i)->id() + 4, 4, 4) =
           std::pow(sig_id, 2) * Eigen::MatrixXd::Identity(4, 4);
+    }
+  }
+  if (_do_calib_cam_nonradial) {
+    for (int i = 0; i < _options.num_cameras; i++) {
+      _Cov.block(_cam_nonradial.at(i)->id(), _cam_nonradial.at(i)->id(), 3, 3) = std::pow(sig_nonrad, 2) * Eigen::MatrixXd::Identity(3, 3);
     }
   }
 }

@@ -179,6 +179,22 @@ public:
   /// Camera intrinsics camera objects
   std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> _cam_intrinsics_cameras;
 
+  /// Non-radial terms (p1, p2, skew) of each camera. In the state vector only if _do_calib_cam_nonradial.
+  std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _cam_nonradial;
+
+  /// True if the non-radial terms are calibration states (calib_cam_intrinsics and OV_PRIOR_NONRAD_SIG > 0)
+  bool _do_calib_cam_nonradial = false;
+
+  /// After a state update: hand the estimated non-radial terms to the camera objects (no-op if they are fixed)
+  void push_nonradial_to_cameras() {
+    if (!_do_calib_cam_nonradial)
+      return;
+    for (auto const &nr : _cam_nonradial) {
+      Eigen::Vector3d q = nr.second->value().block(0, 0, 3, 1);
+      _cam_intrinsics_cameras.at(nr.first)->set_nonradial(q);
+    }
+  }
+
   /// Gyroscope IMU intrinsics (scale imperfection and axis misalignment)
   std::shared_ptr<ov_type::Vec> _calib_imu_dw;
 

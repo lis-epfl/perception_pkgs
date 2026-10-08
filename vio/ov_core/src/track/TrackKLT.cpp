@@ -37,11 +37,16 @@
 #include "vprof.h"
 #include "clahe_cuda.h"
 #include "gpu_track.h"
+#include "nvjpg_decode.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 // mean track length = observations / features-created; the single number that says whether
@@ -239,9 +244,50 @@ struct UndistStats {
   }
 } g_undist_stats;
 } // namespace
+// OV_XCAM=1: cross-camera association after the per-camera feeds of a grouped message (xcam_assoc.inc). Default OFF.
+static bool xcam_enabled() {
+  static const bool v = [] { const char *e = std::getenv("OV_XCAM"); return e && *e == '1'; }();
+  return v;
+}
 static int det_every_cfg() {
   static const int v = [] { const char *e = std::getenv("OV_DETECT_EVERY"); return e ? atoi(e) : 1; }();
   return v;
+}
+// OV_XCAM_READBACK: host pixels for GPU-decoded frames, see the end of xcam_assoc.inc
+static void xcam_host_hook(size_t cam_id, double ts, const cv::Mat &im);
+// OV_DETECT_EVERY_CPU=N (TEST ONLY, default off): the cadence of the GPU detector (OV_DETECT_EVERY with OV_DETECT_STAGGER,
+// OV_DETECT_ADAPT and OV_DETECT_BURST_MIN, counter mode) applied to the CPU detector, to reproduce on a workstation the bursts of new
+// points of the flight path. Returns true when this camera's detection is to be skipped on this frame.
+static int det_every_cpu_cfg() {
+  static const int v = [] { const char *e = std::getenv("OV_DETECT_EVERY_CPU"); return e ? atoi(e) : 1; }();
+  return v;
+}
+static bool det_cpu_cadence_skip(size_t cam_id, size_t npts_now) {
+  const int det_every = det_every_cpu_cfg();
+  if (det_every <= 1)
+    return false;
+  static const bool stagger = [] { const char *e = std::getenv("OV_DETECT_STAGGER"); return e && *e == '1'; }();
+  const double adapt_frac = det_adapt_frac();
+  std::lock_guard<std::mutex> lk(g_det_mtx);
+  double &m = g_det_ema[cam_id];
+  const double npts = (double)npts_now;
+  bool burst = adapt_frac > 0.0 && m > 0.0 && npts < adapt_frac * m;
+  const int bmin = det_burst_min();
+  if (burst && bmin > 0) {
+    const long fn = g_frame_no.load(std::memory_order_relaxed);
+    auto itb = g_det_last_burst.find(cam_id);
+    if (itb != g_det_last_burst.end() && fn - itb->second < (long)bmin)
+      burst = false;
+    else
+      g_det_last_burst[cam_id] = fn;
+  }
+  m = (m == 0.0) ? npts : 0.95 * m + 0.05 * npts;
+  const int phase = stagger ? (int)((cam_id * (size_t)det_every) / 4) : 0;
+  if (burst) {
+    g_det_ctr[cam_id] = -phase;
+    return false;
+  }
+  return ((++g_det_ctr[cam_id] + phase) % det_every) != 0;
 }
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
@@ -323,6 +369,8 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
     // Lock this data feed for this camera
     size_t cam_id = message.sensor_ids.at(msg_id);
     std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
+    if (xcam_enabled())
+      xcam_host_hook(cam_id, message.timestamp, message.images.at(msg_id)); // OV_XCAM_READBACK: before gpu_prepare takes the device surface
 
     // Histogram equalize (skipped entirely in GPU mode -- done on the device below)
     cv::Mat img;
@@ -429,6 +477,18 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
     }
   }
 
+  // OV_XCAM: remember where this frame-set's deferred observations will start in the pending buffers
+  const bool xc_run = xcam_enabled() && !use_stereo;
+  std::vector<size_t> xc_pend_base;
+  size_t xc_pend_base_shared = 0;
+  if (xc_run) {
+    std::lock_guard<std::mutex> lkp(pending_mtx);
+    xc_pend_base.resize(PEND_NCAM);
+    for (size_t c = 0; c < PEND_NCAM; c++)
+      xc_pend_base[c] = pending_by_cam[c].size();
+    xc_pend_base_shared = pending_obs.size();
+  }
+
   // Either call our stereo or monocular version
   // If we are doing binocular tracking, then we should parallize our tracking
   if (num_images == 1) {
@@ -451,6 +511,19 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
   } else {
     PRINT_ERROR(RED "[ERROR]: invalid number of images passed %zu, we only support mono or N stereo pairs (even N)", num_images);
     std::exit(EXIT_FAILURE);
+  }
+
+  // OV_XCAM: cross-camera association, after the per-camera feeds and before the detect-ahead block
+  if (xc_run) {
+    if (num_images >= 2) {
+      xcam_associate(message, xc_pend_base, xc_pend_base_shared);
+    } else {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        std::fprintf(stderr, "[xcam-warn] OV_XCAM=1 but the cameras arrive one per message (set OV_GROUP_CAMS=1): no association is done\n");
+      }
+    }
   }
 
   // Submit-ahead (OV_DETECT_AHEAD=1): a camera whose cadence fires NEXT frame detects on the
@@ -513,6 +586,8 @@ void TrackKLT::preseed_gpu(const CameraData &message) {
     const cv::Mat &im = message.images.at(msg_id);
     const cv::Mat &mk = message.masks.at(msg_id);
     if (im.empty() || im.type() != CV_8UC1) continue;
+    if (xcam_enabled())
+      xcam_host_hook(cam_id, message.timestamp, im); // OV_XCAM_READBACK: before gpu_prepare takes the device surface
     if (!ov_core::gpu_prepare(cam_id, im.data, im.cols, im.rows, im.step,
                               mk.empty() ? nullptr : mk.data, mk.empty() ? 0 : mk.step,
                               histogram_method == HistogramMethod::CLAHE, 10.0f, message.timestamp))
@@ -608,8 +683,18 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   int n_old_fit = -1;
   if (oldfit_on && !ids_left_old.empty()) {
     size_t k = 0;
-    while (k < ids_left_old.size() && ids_left_old[k] <= max_old_id)
-      k++;
+    if (xcam_enabled()) {
+      // OV_XCAM: a camera may hold an id issued by another camera, so "every new id > every old id" no longer holds.
+      // The survivors are the pre-detection list (ids_last, untouched until the end of this function) with some entries
+      // erased, in the same order, followed by the new points: count them by walking both lists.
+      const std::vector<size_t> &pre = ids_last[cam_id];
+      for (size_t o = 0; o < pre.size() && k < ids_left_old.size(); o++)
+        if (pre[o] == ids_left_old[k])
+          k++;
+    } else {
+      while (k < ids_left_old.size() && ids_left_old[k] <= max_old_id)
+        k++;
+    }
     n_old_fit = (int)k;
   }
 
@@ -1098,6 +1183,8 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   int num_featsneeded = num_features - (int)pts0.size();
   if (num_featsneeded < std::min(20, (int)(min_feat_percent * num_features)))
     return;
+  if (det_every_cpu_cfg() > 1 && det_cpu_cadence_skip(cam_id, pts0.size())) // OV_DETECT_EVERY_CPU (test only)
+    return;
 
   // This is old extraction code that would extract from the whole image
   // This can be slow as this will recompute extractions for grid areas that we have max features already
@@ -1229,14 +1316,21 @@ bool TrackKLT::init_calib_snapshot() {
       return false;
     }
     c->set_value(kv.second->get_value());
+    c->set_nonradial_estimated(kv.second->get_nonradial_estimated()); // no-op unless the terms are calibration states
+    c->set_nonradial(kv.second->get_nonradial()); // non-radial terms (constants unless they are calibration states)
     calib_snap[kv.first] = c;
   }
   return !calib_snap.empty();
 }
 
 void TrackKLT::snapshot_calib() {
-  for (auto &kv : calib_snap)
+  for (auto &kv : calib_snap) {
     kv.second->set_value(camera_calib.at(kv.first)->get_value());
+    if (camera_calib.at(kv.first)->get_nonradial_estimated()) { // terms are calibration states: refresh them like the 8 intrinsics
+      kv.second->set_nonradial_estimated(true);
+      kv.second->set_nonradial(camera_calib.at(kv.first)->get_nonradial());
+    }
+  }
 }
 
 
@@ -2107,3 +2201,4 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   }
 }
 
+#include "xcam_assoc.inc"

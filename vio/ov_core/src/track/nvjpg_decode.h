@@ -69,6 +69,14 @@ bool ov_nvjpg_readback(int slot, unsigned char *dst);
 bool ov_nvjpg_readback_ts(int cam_id, double ts, unsigned char *dst, int *w, int *h);
 bool ov_nvjpg_readback_cpu_ts(int cam_id, double ts, unsigned char *dst, int *w, int *h);
 
+/// OV_XCAM_READBACK support. While on, every picture is ALSO copied to pinned host memory on the decode thread, on the
+/// decoder's own non-blocking stream right after the copy-out, so a consumer can read host pixels without a CUDA call
+/// (ov_nvjpg_readback_ts copies on the default stream and waits for every blocking stream of the tracker). Default off.
+void ov_nvjpg_host_copy(bool on);
+/// Copy the host copy of (cam,ts) into dst (tight, w*h bytes) while the slot is still STAGED. False when there is none
+/// (switch off when the picture was decoded, CPU-decoded picture, slot already taken) or when the size differs.
+bool ov_nvjpg_host_get(int cam_id, double ts, unsigned char *dst, int w, int h);
+
 /// "[nvjpg]: on ring=3 fds_cached=12 ring_blocks=0 ..." for the run log.
 std::string ov_nvjpg_stats();
 

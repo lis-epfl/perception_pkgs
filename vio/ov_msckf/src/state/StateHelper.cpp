@@ -251,6 +251,7 @@ void StateHelper::ekf_update_impl(std::shared_ptr<State> state, const std::vecto
         if (state->_options.do_calib_camera_intrinsics)
           for (auto const &calib : state->_cam_intrinsics)
             state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
+        state->push_nonradial_to_cameras();
         return;
       }
     }
@@ -476,6 +477,7 @@ void StateHelper::ekf_update_impl(std::shared_ptr<State> state, const std::vecto
       if (state->_options.do_calib_camera_intrinsics)
         for (auto const &calib : state->_cam_intrinsics)
           state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
+      state->push_nonradial_to_cameras();
       (void)mm;
       return;
     }
@@ -544,6 +546,7 @@ void StateHelper::ekf_update_impl(std::shared_ptr<State> state, const std::vecto
       state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
     }
   }
+  state->push_nonradial_to_cameras();
 }
 
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,

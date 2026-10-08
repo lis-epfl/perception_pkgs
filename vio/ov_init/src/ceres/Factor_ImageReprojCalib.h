@@ -51,6 +51,10 @@ public:
   // If distortion model is fisheye or radtan
   bool is_fisheye = false;
 
+  // Fixed non-radial terms (p1, p2, skew) of the fisheye model for this camera; constants, zero by default.
+  // Set by the creator of the factor right after construction (see DynamicInitializer).
+  Eigen::Vector3d nonradial = Eigen::Vector3d::Zero();
+
   // If distortion model is double-sphere (takes precedence over is_fisheye).
   bool is_ds = false;
 

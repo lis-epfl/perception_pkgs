@@ -23,6 +23,10 @@
 #define OV_CORE_CAM_BASE_H
 
 #include <Eigen/Eigen>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -180,6 +184,127 @@ public:
   /// Gets the complete intrinsic vector
   Eigen::MatrixXd get_value() { return camera_values; }
 
+  /**
+   * @brief Sets the FIXED non-radial terms (tangential p1, p2 and skew s) of the camera model.
+   *
+   * They are constants: never estimated, never part of the 8-vector of intrinsics. Only the
+   * fisheye model (CamEqui) uses them, the other models ignore them. All three zero (the
+   * default) keeps every function on its unmodified code path.
+   * @param q (p1, p2, s)
+   */
+  void set_nonradial(const Eigen::Vector3d &q) {
+    camera_nonradial = q;
+    has_nonradial = nonradial_estimated || (q(0) != 0.0 || q(1) != 0.0 || q(2) != 0.0);
+  }
+
+  /**
+   * @brief Declares the non-radial terms CALIBRATION STATES of the filter (OV_PRIOR_NONRAD_SIG > 0).
+   * The model functions then take the non-radial code path even while all three terms are zero
+   * (their Jacobian is needed there). Never called when the terms are fixed.
+   */
+  void set_nonradial_estimated(bool on) {
+    nonradial_estimated = on;
+    has_nonradial = on || (camera_nonradial(0) != 0.0 || camera_nonradial(1) != 0.0 || camera_nonradial(2) != 0.0);
+  }
+
+  /// True if the non-radial terms are calibration states
+  bool get_nonradial_estimated() const { return nonradial_estimated; }
+
+  /**
+   * @brief OV_NONRAD_SKEW_FIXED set to anything but empty or 0: while the non-radial terms are calibration states,
+   * the skew (third term) is held at its start value. Done by zeroing its column of the measurement Jacobian
+   * (UpdaterHelper), so that its Kalman gain is exactly zero; the state vector keeps its layout. Unset = unchanged.
+   */
+  static bool nonradial_skew_fixed_from_env() {
+    static const bool fixed = [] {
+      const char *e = std::getenv("OV_NONRAD_SKEW_FIXED");
+      return !(e == nullptr || *e == '\0' || std::string(e) == "0");
+    }();
+    return fixed;
+  }
+
+  /**
+   * @brief Prior standard deviation of the non-radial terms when they are calibration states.
+   * OV_PRIOR_NONRAD_SIG unset, empty, zero or negative = 0 = the terms are fixed constants.
+   */
+  static double nonradial_prior_sigma_from_env() {
+    static const double sig = [] {
+      const char *e = std::getenv("OV_PRIOR_NONRAD_SIG");
+      if (e == nullptr || *e == '\0')
+        return 0.0;
+      char *end = nullptr;
+      double v = std::strtod(e, &end);
+      if (end == e || !std::isfinite(v)) {
+        std::fprintf(stderr, "[nonradial]: OV_PRIOR_NONRAD_SIG ('%s') is not a number -- aborting\n", e);
+        std::exit(EXIT_FAILURE);
+      }
+      return v > 0.0 ? v : 0.0;
+    }();
+    return sig;
+  }
+
+  /**
+   * @brief Jacobian of the distorted pixel with respect to the non-radial terms (p1, p2, s).
+   * Zero for the models that have no such terms.
+   * @param uv_norm Normalized coordinates we wish to distort
+   * @param H_dz_dq 2x3 derivative of the raw pixel in respect to (p1, p2, s)
+   */
+  virtual void compute_nonradial_jacobian(const Eigen::Vector2d &uv_norm, Eigen::MatrixXd &H_dz_dq) {
+    (void)uv_norm;
+    H_dz_dq = Eigen::MatrixXd::Zero(2, 3);
+  }
+
+  /// Gets the fixed non-radial terms (p1, p2, s)
+  Eigen::Vector3d get_nonradial() const { return camera_nonradial; }
+
+  /**
+   * @brief Non-radial terms of one camera from the environment.
+   *
+   * OV_NONRADIAL="p1,p2,s;p1,p2,s;p1,p2,s;p1,p2,s" lists cameras 0, 1, 2, ... in order. Unset or
+   * empty = all zero; a camera that is not listed (or an empty entry) = zero. The variable is
+   * parsed once per process. A malformed entry stops the process: a silently ignored typo would
+   * fly the plain model while the operator believes otherwise.
+   * @param cam_id Camera index
+   * @return (p1, p2, s)
+   */
+  static Eigen::Vector3d nonradial_from_env(size_t cam_id) {
+    static const std::vector<Eigen::Vector3d> table = [] {
+      std::vector<Eigen::Vector3d> t;
+      const char *e = std::getenv("OV_NONRADIAL");
+      if (e == nullptr)
+        return t;
+      std::string all(e);
+      size_t a = 0;
+      while (a <= all.size()) {
+        size_t b = all.find(';', a);
+        if (b == std::string::npos)
+          b = all.size();
+        std::string ent = all.substr(a, b - a);
+        Eigen::Vector3d q = Eigen::Vector3d::Zero();
+        if (ent.find_first_not_of(" \t\r\n") != std::string::npos) {
+          const char *p = ent.c_str();
+          for (int j = 0; j < 3; j++) {
+            char *end = nullptr;
+            q(j) = std::strtod(p, &end);
+            bool ok = (end != p);
+            while (ok && (*end == ' ' || *end == '\t'))
+              end++;
+            ok = ok && (j < 2 ? *end == ',' : *end == '\0') && std::isfinite(q(j));
+            if (!ok) {
+              std::fprintf(stderr, "[nonradial]: OV_NONRADIAL entry %zu ('%s') is not 'p1,p2,s' -- aborting\n", t.size(), ent.c_str());
+              std::exit(EXIT_FAILURE);
+            }
+            p = end + 1;
+          }
+        }
+        t.push_back(q);
+        a = b + 1;
+      }
+      return t;
+    }();
+    return cam_id < table.size() ? table[cam_id] : Eigen::Vector3d(Eigen::Vector3d::Zero());
+  }
+
   /// Gets the camera matrix
   cv::Matx33d get_K() { return camera_k_OPENCV; }
 
@@ -204,6 +329,15 @@ protected:
 
   /// Camera distortion in OpenCV format
   cv::Vec4d camera_d_OPENCV;
+
+  /// Fixed non-radial terms (p1, p2, s), see set_nonradial()
+  Eigen::Vector3d camera_nonradial = Eigen::Vector3d::Zero();
+
+  /// True if any non-radial term is non-zero (then, and only then, the model functions leave their original path)
+  bool has_nonradial = false;
+
+  /// True if the non-radial terms are calibration states of the filter (see set_nonradial_estimated())
+  bool nonradial_estimated = false;
 
   /// Width of the camera (raw pixels)
   int _width;

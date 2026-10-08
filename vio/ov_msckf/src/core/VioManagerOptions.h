@@ -307,6 +307,19 @@ struct VioManagerOptions {
           camera_intrinsics.insert({i, std::make_shared<ov_core::CamRadtan>(matrix_wh.at(0), matrix_wh.at(1))});
           camera_intrinsics.at(i)->set_value(cam_calib);
         }
+        // Fixed non-radial terms of the fisheye model (OV_NONRADIAL, parsed once; unset = zero = plain model).
+        // Plain printf: this line must reach the log at every verbosity.
+        {
+          Eigen::Vector3d nr = ov_core::CamBase::nonradial_from_env((size_t)i);
+          bool nr_used = (dist_model == "equidistant");
+          if (nr_used)
+            camera_intrinsics.at(i)->set_nonradial(nr);
+          Eigen::Vector3d nr_now = camera_intrinsics.at(i)->get_nonradial();
+          std::printf("[nonradial]: cam%d p1 = %.10e  p2 = %.10e  skew = %.10e  (%s)\n", i, nr_now(0), nr_now(1), nr_now(2),
+                      !nr_used ? (nr.isZero(0) ? "model has no such terms" : "OV_NONRADIAL IGNORED: not an equidistant camera")
+                               : (nr_now.isZero(0) ? "all zero: unmodified fisheye code path" : "fixed, from OV_NONRADIAL"));
+          std::fflush(stdout);
+        }
         camera_extrinsics.insert({i, cam_eigen});
       }
       parser->parse_config("update_min_dt", update_min_dt, false);

@@ -83,6 +83,37 @@ its seed.
 `run_serial.sh` exit codes: `64` usage/bad DOMAIN · `66` missing bag or config · `69` missing
 ROS or workspace · `70` ran but produced no trajectory · otherwise the estimator's own code.
 
+## Optional calibration switches
+
+Three additions for the calibration replay, read from the environment. All are off when unset,
+and the estimator's output is then byte-identical to the build without them (checked on a
+desktop and on the Orin NX).
+
+| env var | what it does | tested value |
+|---|---|---|
+| `OV_XCAM` | A feature found in one camera is searched in each neighbouring camera and tracked there under the same id, so the filter's ordinary multi-camera update ties the cameras together. Needs `OV_GROUP_CAMS=1` and `use_stereo` false. `OV_XCAM_PRESET=rt` selects the cheaper settings: about 2 ms per set of four images on the Orin NX. | `1` |
+| `OV_PRIOR_NONRAD_SIG` | Two more lens terms per camera become calibration states with this initial standard deviation (Kannala-Brandt cameras only). `OV_NONRAD_SKEW_FIXED=1` holds the third term, which flight data cannot determine. | `0.002` |
+| `OV_NONRADIAL` | The lens terms as fixed values, `p1,p2,s` per camera joined by `;` (quote it). The tool hands them from pass to pass and publishes them; set it wherever a calibration made with them is used. | from the tool |
+| `OV_RIG_DIST`, `OV_RIG_PLANAR`, `OV_RIG_SIG_MM`, ... | The known shape of the rig as a prior on the camera positions (`ov_msckf/src/update/UpdaterRigShape.h`). | see below |
+
+Matching and lens terms do different jobs and both are needed: the lens terms put the cameras
+in the right place, the matching fixes the rotations between them. They need about 50 s of
+flight. They improve the geometry of the rig, not the tracking error, so in flight the matching
+can stay off; a calibration made with lens terms must be flown with `OV_NONRADIAL` set.
+
+The rig prior is for calibration windows that must stay at 20-30 s, where the pictures cannot
+fix the distances between the cameras. Tested for the fleet's 149.6 mm square, as a prior of
+1 mm with a 1 degree prior on the viewing direction:
+
+```bash
+export OV_RIG_DIST=0-1:149.6,1-2:149.6,2-3:149.6,3-0:149.6,0-2:211.566,1-3:211.566
+export OV_RIG_PLANAR=0,1,2,3 OV_RIG_SIG_MM=1 OV_RIG_EVERY=0
+export OV_RIG_RADIAL_DEG=0 OV_RIG_RADIAL_SIG_DEG=1 OV_RIG_TILT_SIG_DEG=1
+```
+
+It makes the four sides of a 20 s calibration more equal; it does not improve the angles
+between the cameras or the stereo depth, and from 60 s on it should be left out.
+
 ## What was pruned
 
 `PRUNED.txt` records it: the fork's experiment harness (alternative KLT trackers,

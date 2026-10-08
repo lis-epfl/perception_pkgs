@@ -191,6 +191,15 @@ protected:
 
   void flush_pending() override;
 
+  /// OV_XCAM=1: cross-camera association after the per-camera feeds of one grouped message (see TrackKLT.cpp).
+  void xcam_associate(const CameraData &message, const std::vector<size_t> &pend_base, size_t pend_base_shared);
+
+public:
+  /// OV_XCAM: the settings of that association as it uses them (see TrackBase; defined in xcam_assoc.inc).
+  XcamSettings xcam_settings() const override;
+
+protected:
+
   // ---- OV_PIPELINE calibration snapshot -------------------------------------------------
   // calib_snap is EMPTY unless init_calib_snapshot() succeeded; empty => every read falls
   // back to the live camera_calib objects, so the gate-OFF path is byte-identical.

@@ -27,7 +27,10 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <map>
 #include <unordered_map>
+
+#include <Eigen/Core>
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <opencv2/core/core.hpp>
@@ -186,6 +189,24 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+  /// OV_XCAM (cross-camera association): the tracker has no extrinsics of its own. The estimator hands over the CURRENT
+  /// camera poses (R_ItoC, p_IinC per camera) at a point where nothing is writing the state. Unused unless OV_XCAM=1.
+  void set_cam_extrinsics(size_t cam_id, const Eigen::Matrix3d &R_ItoC, const Eigen::Vector3d &p_IinC) {
+    xcam_R_ItoC[cam_id] = R_ItoC;
+    xcam_p_IinC[cam_id] = p_IinC;
+  }
+
+  /// OV_XCAM: how the cross-camera association of this tracker is set, for the estimator (OV_XCAM_DIFF weights the pairs it makes).
+  /// on = it runs in this tracker (OV_XCAM=1 and no stereo tracking); maint = the re-registration interval in frame-sets as the
+  /// association uses it (OV_XCAM_MAINT after the preset; 0 = off); snap = OV_XCAM_SNAP as it uses it.
+  struct XcamSettings {
+    bool on = false;
+    int maint = 0;
+    bool snap = false;
+  };
+  /// Default: a tracker without the association.
+  virtual XcamSettings xcam_settings() const { return XcamSettings(); }
+
 
 protected:
   /// Camera object which has all calibration in it
@@ -197,6 +218,10 @@ protected:
 
   /// If we are a fisheye model or not
   std::map<size_t, bool> camera_fisheye;
+
+  /// OV_XCAM: current extrinsics per camera (see set_cam_extrinsics). 3x3 / 3x1 blocks only (no 4x4, no aligned types).
+  std::map<size_t, Eigen::Matrix3d> xcam_R_ItoC;
+  std::map<size_t, Eigen::Vector3d> xcam_p_IinC;
 
   /// Number of features we should try to track frame to frame
   int num_features;

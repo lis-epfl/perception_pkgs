@@ -57,6 +57,7 @@ class StateHelper;
 class UpdaterMSCKF;
 class UpdaterSLAM;
 class UpdaterZeroVelocity;
+class UpdaterRigShape;
 class Propagator;
 
 /**
@@ -303,6 +304,9 @@ protected:
 
   /// Our zero velocity tracker
   std::shared_ptr<UpdaterZeroVelocity> updaterZUPT;
+
+  /// The known shape of the camera rig as a measurement (OV_RIG_DIST / OV_RIG_PLANAR; null when not asked for)
+  std::shared_ptr<UpdaterRigShape> updaterRIG;
 
   /// This is the queue of measurement times that have come in since we starting doing initialization
   /// After we initialize, we will want to prop & update to the latest timestamp quickly
