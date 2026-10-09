@@ -117,7 +117,9 @@ all identical.
 ### Flight mode
 
 Reference build vs stripped build, same bag / chain / seed, `flight_stiffness.env` sourced,
-ASLR disabled on both sides so the comparison is meaningful:
+ASLR disabled on both sides so the comparison is meaningful (the file then held the five
+priors only; to repeat this with today's file, unset `OV_XCAM`, `OV_XCAM_PRESET`,
+`OV_PRIOR_NONRAD_SIG` and `OV_NONRAD_SKEW_FIXED` after sourcing it):
 
 ```
 estimate_tum.txt  ->  BYTE-IDENTICAL (1841 poses each)
@@ -168,7 +170,8 @@ worth knowing, both benign:
 
 With deployment as the bar, everything not needed to build and run the two shipped
 binaries (`run_serial_msckf` for calibration, `run_subscribe_msckf` for live flight VIO)
-was removed:
+was removed (state of the trim: the live node of the vehicle is now `run_online_msckf`,
+added later, and `run_subscribe_msckf` is not the flight node, see `vio/README.md`):
 
 | removed | detail |
 |---|---|

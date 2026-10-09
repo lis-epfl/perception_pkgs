@@ -22,6 +22,8 @@ pipeline (both per-pass trajectories, ATE, and published chain).
 Deployment trim (after the code prune): ROS 1 support, the 8 test/simulation executables,
 dataset benchmark scripts, and doc configs were removed at file level. The build produces
 exactly two binaries: run_serial_msckf (calibration) and run_subscribe_msckf (flight VIO).
+(State of the trim. The live node of the vehicle is now run_online_msckf, added later;
+run_subscribe_msckf is not the flight node. See README.md.)
 The package is ROS 2 (ament) only; CMakeLists fails clearly otherwise.
 
 TrackAruco (removed 2026-08-11)

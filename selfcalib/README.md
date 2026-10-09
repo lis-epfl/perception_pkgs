@@ -209,14 +209,16 @@ See `../WORKFLOW.md` for the full four-step walkthrough.
 **Exit codes**: `0` success · `1` gate failure (re-record) · `2` the stopping rule never held
 within `--max-pass` passes (`FLY-AGAIN`) · `3` `--gt` file missing · `4` an estimator pass timed out
 (raise `--pass-timeout`) · `5` an estimator pass produced no harvest (read
-`--out/calib/out/run.log`). Anything non-zero also writes `report.json` with the reason.
+`--out/calib/out/run.log`) · `6` `OV_PRIOR_NONRAD_SIG` in the environment is not a number (no
+`report.json`). Every other non-zero code also writes `report.json` with the reason.
 
 ### Optional: a calibration that is also right for stereo depth
 
 The default run gives a calibration that tracks well. It can still leave the cameras several
 millimetres from where they sit relative to each other, which tracking does not notice and
-stereo depth does. Two additions to the estimator correct this. Both are off by default; switch
-them on in the environment of the run, and use about a minute of flight:
+stereo depth does. Two additions to the estimator correct this. Both are off by default in a
+calibration (flight has both on, see `../vio/README.md`); switch them on in the environment
+of the run, and use about a minute of flight:
 
 ```bash
 export OV_XCAM=1 OV_XCAM_PRESET=rt                        # match features between neighbouring cameras
@@ -232,10 +234,12 @@ does not change. About 50 s of flight are needed (the default 20 s are not enoug
 takes about 2.6 minutes instead of 1.2. `../vio/README.md` lists the switches.
 
 The two lens terms are not in the chain file, which has no field for them. The run writes them
-to `--out/<drone>_published_terms.txt`, and `deploy_vio.py` puts them into the flight folder as
-`lens_terms.env`. **They are part of the calibration**: source that file wherever the chain is
-used, in flight and for depth (the MANIFEST gives the line). The chain without its lens terms
-is not the calibrated lens model.
+to `--out/<drone>_published_terms.txt`, and `deploy_vio.py` puts them into the flight folder
+twice: as the last line of the folder's `flight_stiffness.env`, which every flight sources, and
+alone as `lens_terms.env`. **They are part of the calibration**: wherever the chain is used, in
+flight and for depth, they must come with it (the MANIFEST gives the lines). The chain without
+its lens terms is not the calibrated lens model. In flight the estimator starts from them and
+keeps refining them under a narrow prior; a calibration without lens terms starts them at zero.
 
 ### Ground truth is optional and found automatically
 
@@ -327,10 +331,24 @@ The estimator is one binary with two operating points, and this package only eve
 priors leave the calibration states mobile so the warm-start iterations can converge away
 from the seed.
 
-Flight mode — the tightened priors, `estimator_flight.yaml` and `flight_stiffness.env` —
-lives in the `vio/` package and is documented in `../vio/README.md`.
+Flight mode — `estimator_flight.yaml` and `flight_stiffness.env` (the tightened priors and,
+since 2026-10-09, the two lens terms as states and the matching between cameras) — lives in
+the `vio/` package and is documented in `../vio/README.md`. The calibration passes of this
+package have neither of the two unless you export them (section above), so the last
+calibration pass is the flight trajectory only up to them. `--frozen-check` adds one pass that
+runs the published calibration with the flight settings, if the recording has ground truth
+(without it the option does nothing and says so). On the vehicle that pass is the flight
+operating point; on a desktop it runs the CPU tracker and matches between cameras only if you
+export `OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched.
 
 **This matters operationally:** `run_serial.sh` passes your shell environment through, so
 flight variables leaking into a calibration run silently pin the calibration at its seed.
 The convergence gates will flag the non-convergence, but the root cause is the environment.
-Check with `env | grep OV_PRIOR` before a calibration run — it should print nothing.
+Check with `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` before a calibration run — it should
+print nothing (or exactly your own exports for a calibration with matching and lens terms).
+`run_tool.py` guards its own passes: it unsets the flight priors, the flight value of the
+lens-term prior, the matching when it came with the flight settings, and an `OV_NONRADIAL`
+left in the shell by a flight folder or another calibration, each with a WARNING, and lists
+them in `report.json` (`calib_passes`). `OV_NONRADIAL` is kept in one case only: you export a
+calibration lens prior in a shell without flight settings, and pass 1 then starts from it
+(the log says so).

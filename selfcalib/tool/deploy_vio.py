@@ -11,8 +11,12 @@ folder layout the VIO estimator expects:
     <out>/estimator_flight.yaml     flight config, copied from the vio package
     <out>/kalibr_imucam_chain.yaml  the published calibration (intrinsics + extrinsics + t_d)
     <out>/kalibr_imu_chain.yaml     the IMU chain the calibration ran with
+    <out>/flight_stiffness.env      the flight settings (stiff calibration priors, lens terms as states,
+                                    matching between cameras), copied from the vio package, plus the
+                                    lens terms of this calibration (OV_NONRADIAL; empty if it has none)
+    <out>/campaign.env              the vehicle's tracker and scheduler switches, copied from the vio package
     <out>/mount.json                mount rotation, if solved   (NOT an estimator input)
-    <out>/lens_terms.env            OV_NONRADIAL, if the calibration estimated lens terms
+    <out>/lens_terms.env            OV_NONRADIAL alone, if the calibration estimated lens terms
     <out>/MANIFEST.txt              what each file is and the command to fly it
 
 The estimator resolves `relative_config_imu` / `relative_config_imucam` RELATIVE TO THE
@@ -29,13 +33,13 @@ travels with the calibration that produced it.
 Usage:
   python3 deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle
 """
-import argparse, json, os, shutil, sys
+import argparse, json, os, re, shlex, shutil, sys, time
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chainio import parse_chain
-from run_tool import resolve_vio_root
+from run_tool import resolve_vio_root, _env_file, _number
 
 
 def log(s):
@@ -49,6 +53,29 @@ def rpy_deg(R):
     roll = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
     yaw = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
     return roll, pitch, yaw
+
+
+def terms_problem(terms, ncam):
+    """Why `terms` is not a value of OV_NONRADIAL for ncam cameras ('p1,p2,s' per camera, joined by ';'), or None."""
+    ents = terms.split(';')
+    if len(ents) != ncam:
+        return '%d entries for %d cameras' % (len(ents), ncam)
+    for i, e in enumerate(ents):
+        v = e.split(',')
+        try:
+            ok = len(v) == 3 and all(abs(float(x)) < 1.0 for x in v)     # also refuses nan and inf
+        except ValueError:
+            ok = False
+        if not ok or not re.fullmatch(r'[0-9eE+\-., ]+', e):
+            return 'entry %d (%r) is not three numbers' % (i, e[:60])
+    return None
+
+
+def put(path, text):
+    """Write a file of the flight folder, replacing whatever an earlier deployment left there (even read-only)."""
+    if os.path.lexists(path):
+        os.remove(path)
+    open(path, 'w').write(text)
 
 
 def main():
@@ -97,15 +124,34 @@ def main():
     # Present only when the calibration ran with OV_PRIOR_NONRAD_SIG: two lens terms per camera,
     # which the chain format cannot hold. The estimator reads them from OV_NONRADIAL.
     terms_txt = os.path.join(cal, '%s_published_terms.txt' % drone)
-    terms = open(terms_txt).read().strip() if os.path.isfile(terms_txt) else None
+    terms = (open(terms_txt).read().strip() or None) if os.path.isfile(terms_txt) else None
+    # They become the values the flight estimator starts from, so they must be the ones this run published: a file left
+    # by an earlier run in the same folder, or an emptied one, is refused.
+    rep_terms = (rep.get('published_nonradial') or '').strip() or None
+    if terms != rep_terms:
+        raise SystemExit('[deploy] ERROR: %s %s.\n'
+                         '  The lens terms are part of the calibration. If the file was left out when the calibration\n'
+                         '  output was copied, copy it; otherwise run the calibration again into an empty --out.'
+                         % (terms_txt, 'holds lens terms, but report.json of this run published none' if not rep_terms else
+                            'is missing or empty, but report.json of this run published lens terms' if not terms else
+                            'holds lens terms that differ from the ones report.json of this run published'))
 
     vio = resolve_vio_root(a.vio_root)
     flight_cfg = os.path.join(vio, 'vio_deploy', 'config', 'estimator_flight.yaml')
     if not os.path.isfile(flight_cfg):
         raise SystemExit('[deploy] ERROR: flight config not found: %s' % flight_cfg)
+    stiffness = os.path.join(vio, 'vio_deploy', 'config', 'flight_stiffness.env')
+    if not os.path.isfile(stiffness):
+        raise SystemExit('[deploy] ERROR: flight settings not found: %s' % stiffness)
+    fl_src = _env_file(stiffness)
+    PRIORS = ('OV_PRIOR_DT_SIG', 'OV_PRIOR_EXTR_Q_SIG', 'OV_PRIOR_EXTR_T_SIG', 'OV_PRIOR_INTR_F_SIG', 'OV_PRIOR_INTR_D_SIG')
+    if not all(k in fl_src for k in PRIORS):
+        raise SystemExit('[deploy] ERROR: %s lacks one of the five flight priors (%s)' % (stiffness, ', '.join(PRIORS)))
 
     # ---- 3. read the values back and show them ----
     cams, toff = parse_chain(chain)
+    if terms and terms_problem(terms, len(cams)):
+        raise SystemExit('[deploy] ERROR: lens terms in %s: %s' % (terms_txt, terms_problem(terms, len(cams))))
     log('camera-IMU time offset t_d: %+.6f s' % toff)
     log('per-camera calibrated values (from %s):' % os.path.basename(chain))
     print('        %-4s %10s %10s %10s %10s   %-28s %-24s'
@@ -143,11 +189,28 @@ def main():
     shutil.copy(imu, os.path.join(a.out, 'kalibr_imu_chain.yaml'))
     if mount is not None:
         shutil.copy(mount_json, os.path.join(a.out, 'mount.json'))
+    elif os.path.lexists(os.path.join(a.out, 'mount.json')):
+        os.remove(os.path.join(a.out, 'mount.json'))            # of an earlier calibration deployed into --out
+    # The flight settings travel with the calibration: the folder gets its own copy of flight_stiffness.env, ending with
+    # the lens terms of THIS calibration, so that one sourced file gives a flight everything it needs on every platform.
+    # The line is written even when there are no terms (empty = zero), so that sourcing this folder after another one
+    # cannot leave the other calibration's terms in the shell. Quoted: the value holds ';'.
+    put(os.path.join(a.out, 'flight_stiffness.env'),
+        '# COPY written by deploy_vio.py on %s for %s, from %s\n'
+        '# (calibration: %s). Source THIS file to fly: its last line holds the lens terms of that calibration.\n#\n'
+        % (time.strftime('%Y-%m-%d'), drone, stiffness, cal)
+        + open(stiffness).read().rstrip('\n') + '\n\n'
+        '# ADDED BY deploy_vio.py: the two lens terms per camera of THIS calibration, the values the flight estimator\n'
+        '# starts from (empty: the calibration has none, they start at zero).\n'
+        "OV_NONRADIAL='%s'\n" % (terms or ''))
     if terms:
-        # quoted: the value holds ';', which a sourcing shell would otherwise end the line at
-        open(os.path.join(a.out, 'lens_terms.env'), 'w').write("OV_NONRADIAL='%s'\n" % terms)
-        log('lens terms: %d cameras -> lens_terms.env (part of this calibration: source it to fly)'
+        put(os.path.join(a.out, 'lens_terms.env'), "OV_NONRADIAL='%s'\n" % terms)
+        log('lens terms: %d cameras -> last line of flight_stiffness.env (and lens_terms.env); part of this calibration'
             % len(terms.split(';')))
+    else:
+        if os.path.lexists(os.path.join(a.out, 'lens_terms.env')):
+            os.remove(os.path.join(a.out, 'lens_terms.env'))    # of an earlier calibration deployed into --out
+        log('lens terms: none in this calibration; in flight they start at zero')
 
     # ---- 5. verify the deployed folder is self-consistent before declaring success ----
     problems = []
@@ -167,11 +230,28 @@ def main():
                       ('relative_config_imucam', 'kalibr_imucam_chain.yaml')):
         if '%s: "%s"' % (key, want) not in cfg:
             problems.append('%s in the flight config does not point at %s' % (key, want))
+    fl = _env_file(os.path.join(a.out, 'flight_stiffness.env'))
+    if fl.get('OV_NONRADIAL', None) != (terms or ''):
+        problems.append('flight_stiffness.env does not end with the lens terms of this calibration')
+    if {k: v for k, v in fl.items() if k != 'OV_NONRADIAL'} != {k: v for k, v in fl_src.items() if k != 'OV_NONRADIAL'}:
+        problems.append('flight_stiffness.env of the folder does not set what %s sets' % stiffness)
     if problems:
         raise SystemExit('[deploy] ERROR: deployed folder failed verification:\n  - '
                          + '\n  - '.join(problems))
 
     ncam = len(dep_cams)
+    out_abs = os.path.abspath(a.out); q = shlex.quote(out_abs)
+    # what the copied flight settings hold (the vio package may be older or newer than this tool)
+    states = (_number(fl.get('OV_PRIOR_NONRAD_SIG')) or 0.0) > 0.0
+    matching = fl.get('OV_XCAM', '')[:1] == '1'
+    holds = ['calibration priors x0.10']
+    holds.append('the two lens terms per camera as calibration states' if states else 'the lens terms as fixed values')
+    holds.append('matching of features between neighbouring cameras' if matching else 'no matching between cameras')
+    # the topics of the recording the calibration was made on = the vehicle's own
+    layout = []
+    cfg_cal = os.path.join(cal, 'calib', 'estimator_config.yaml')
+    if os.path.isfile(cfg_cal):
+        layout = [l.rstrip() for l in open(cfg_cal) if re.match(r'(imu_topic|imu_msg_type|cam_msg_type|cam_topic\d+):', l)]
     manifest = """VIO flight configuration for %s
 generated by selfcalib/tool/deploy_vio.py from %s
 calibration verdict: %s
@@ -182,6 +262,10 @@ FILES
                              distortion coefficients, T_imu_cam extrinsics, and the
                              camera-IMU time offset timeshift_cam_imu = %+.9f s.
   kalibr_imu_chain.yaml      IMU noise densities + IMU-intrinsics blocks.
+  flight_stiffness.env       the flight settings (from the vio package):
+                             %s.
+                             Its last line holds the lens terms of THIS calibration
+                             (%s).
   campaign.env               the OV_* environment of the campaign numbers (aarch64 only).
   mount.json                 mount rotation M. NOT read by the estimator -- apply it to the
                              OUTPUT trajectory (selfcalib/tool/mount.py, apply()).%s%s
@@ -190,33 +274,47 @@ All three YAML files must stay in THIS directory together: the estimator resolve
 relative_config_imu / relative_config_imucam relative to the config file's own location.
 
 FLY IT
+  # the flight settings of this folder, on every platform. REQUIRED.
+  set -a; source %s/flight_stiffness.env; set +a
   # on the vehicle (aarch64) ALSO source the campaign switches -- the GPU tracker, scheduler and
   # algorithm gates every quoted fleet number was measured with. Never on a desktop.
   [ "$(uname -m)" = aarch64 ] && { set -a; source %s/campaign.env; set +a; }
+  # check: this must print %d lines. If it prints none, the file was not found and the estimator
+  # would fly with loose priors.
+  env | grep OV_PRIOR
 
-%s  # offline replay of a recording
-  set -a; source <vio>/vio_deploy/config/flight_stiffness.env; set +a
+  # offline replay of a recording (on a desktop first: export OV_GROUP_CAMS=1, which hands the
+  # estimator the four images of an instant as one set, as on the vehicle)
   bash <vio>/vio_deploy/scripts/run_serial.sh BAG %s/estimator_flight.yaml OUT %d false 42 DOMAIN
 
   # live on the vehicle
-  set -a; source <vio>/vio_deploy/config/flight_stiffness.env; set +a
-  ros2 run ov_msckf run_subscribe_msckf %s/estimator_flight.yaml
+  ros2 run ov_msckf run_online_msckf %s/estimator_flight.yaml
+
+TOPICS: both programs read the topics from estimator_flight.yaml, which names none as
+deployed. They then read /imu0 (sensor_msgs/Imu) and /cam<N>/image_raw (sensor_msgs/Image).
+Any other vehicle, the fleet's included, needs its topics added to that file first.
+%s
+Without them the live node starts and receives nothing, and a replay writes no trajectory.
 
 flight_stiffness.env is REQUIRED: it tightens the calibration priors x0.10 so the online
 calibration stays tethered to this chain instead of random-walking during flight. Without
 it the estimator runs with loose calibration priors, which is the CALIBRATION operating
-point, not the flight one.
-""" % (drone, cal, verdict, dep_toff,
+point, not the flight one. Source the copy in THIS folder: it also hands the estimator the
+lens terms of this calibration, which the chain file cannot hold.
+
+The matching between cameras runs where the four images of an instant reach the estimator
+as one set: in run_online_msckf, and in a replay with OV_GROUP_CAMS=1 (campaign.env sets it
+on the vehicle). run_subscribe_msckf feeds one camera per message and reads neither the PX4
+IMU nor compressed images: it is not the flight node.
+""" % (drone, cal, verdict, dep_toff, (';\n' + 29 * ' ').join(holds),
+       'empty: it has none' if not terms else 'two numbers and a held third per camera',
        '' if mount is not None else '  (mount.json absent: that calibration had no ground truth)',
        '' if not terms else
-       '\n  lens_terms.env             two lens terms per camera (OV_NONRADIAL), estimated with this\n'
-       '                             calibration and part of it: the chain alone is not the\n'
-       '                             calibrated lens model.',
-       os.path.abspath(a.out),
-       '' if not terms else
-       '  # this calibration has lens terms: source them for the replay and for the live node\n'
-       '  set -a; source %s/lens_terms.env; set +a\n\n' % os.path.abspath(a.out),
-       os.path.abspath(a.out), ncam, os.path.abspath(a.out))
+       '\n  lens_terms.env             the same lens terms alone (OV_NONRADIAL), for whatever else\n'
+       '                             uses this chain: without them it is not the calibrated lens model.',
+       q, q, sum(1 for k in fl if k.startswith('OV_PRIOR')), q, ncam, q,
+       ('The recording this calibration was made on used these (add them as they are):\n' + '\n'.join('  ' + l for l in layout)) if layout else
+       'Add imu_topic, imu_msg_type, cam_msg_type and cam_topic0..%d (the recording this calibration\nwas made on used the defaults).' % (ncam - 1))
     open(os.path.join(a.out, 'MANIFEST.txt'), 'w').write(manifest)
 
     log('deployed -> %s' % os.path.abspath(a.out))

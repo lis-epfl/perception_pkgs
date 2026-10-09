@@ -10,11 +10,11 @@ selfcalib/    the self-calibration package — the tool, and its OWN calibration
 ## Why they are split
 
 The estimator is one binary with two operating points. What separates them is the config
-and five environment variables, not the code:
+and the environment variables of `flight_stiffness.env`, not the code:
 
 | | config | calibration priors |
 |---|---|---|
-| **flight** (in `vio/`) | `vio_deploy/config/estimator_flight.yaml` + `flight_stiffness.env` | tethered (x0.10) — the online calibration can absorb a small per-flight offset but cannot random-walk |
+| **flight** (in `vio/`) | `vio_deploy/config/estimator_flight.yaml` + `flight_stiffness.env` | tethered (x0.10) — the online calibration can absorb a small per-flight offset but cannot random-walk. Since 2026-10-09 the same file also keeps two lens terms per camera as states and matches features between neighbouring cameras (`vio/README.md`) |
 | **calibration** (in `selfcalib/`) | `configs/estimator_calib.yaml`, `OV_PRIOR_*` unset | loose (stock) — the states must be mobile enough for the warm-start iterations to converge |
 
 Keeping the estimator in one place is the point. If each package carried its own copy they
@@ -58,12 +58,17 @@ python3 selfcalib/tool/run_tool.py \
 python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle
 #    → prints intrinsics / extrinsics / t_d / mount, writes the folder the estimator wants
 
-# 4. fly
-set -a; source vio/vio_deploy/config/flight_stiffness.env; set +a      # REQUIRED
+# 4. fly (the folder's own flight settings; its MANIFEST.txt gives every line)
+set -a; source flight_myvehicle/flight_stiffness.env; set +a           # REQUIRED
+[ "$(uname -m)" = aarch64 ] && { set -a; source flight_myvehicle/campaign.env; set +a; }   # vehicle only
+# replay of a recording (on a desktop first: export OV_GROUP_CAMS=1)
 bash vio/vio_deploy/scripts/run_serial.sh BAG flight_myvehicle/estimator_flight.yaml OUT 4 false 42 70
-# live on the vehicle:
-ros2 run ov_msckf run_subscribe_msckf flight_myvehicle/estimator_flight.yaml
+# live on the vehicle (its topics must be in estimator_flight.yaml: MANIFEST.txt lists them)
+ros2 run ov_msckf run_online_msckf flight_myvehicle/estimator_flight.yaml
 ```
+
+A folder deployed before 2026-10-09 has no `flight_stiffness.env` of its own: deploy it again
+(`deploy_vio.py` on the same calibration output), or follow that folder's own MANIFEST.
 
 Step 2+3 exists because the estimator resolves its chain files **relative to its config** and
 by literal filename: a chain called `myvehicle_published_chain.yaml` sitting elsewhere is

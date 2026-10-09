@@ -18,6 +18,9 @@
 # (uniform settings, no per-vehicle or per-flight tuning).
 # USE WITH configs/flight_stiffness.env sourced into the environment — the
 # tightened calibration priors are half of what makes this config work.
+# (The numbers of this header were taken with the five priors of that file. Since 2026-10-09
+# it also keeps two lens terms per camera as states and matches features between cameras,
+# about 3 ms more per set of images: vio/README.md, "Matching and lens terms in flight".)
 # For CALIBRATION runs use configs/estimator_calib.yaml with OV_PRIOR_* UNSET.
 # See README section "Two configurations: calibration mode vs flight mode".
 # ============================================================================

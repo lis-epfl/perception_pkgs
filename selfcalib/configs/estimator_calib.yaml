@@ -4,6 +4,12 @@
 # vio_deploy/config/estimator_flight.yaml -- keep it that way; the warm-start loop and flight
 # share one estimator operating point, which is what lets the frozen certification pass be
 # skipped (the settled-parent pass IS the deployment trajectory).
+# Since 2026-10-09 flight adds two things through flight_stiffness.env that the default
+# calibration passes do not have: the two lens terms per camera as states and the matching of
+# features between neighbouring cameras. The settled pass then differs from the deployment
+# trajectory by the stiff priors and by those two (what they change: vio/README.md, "Matching
+# and lens terms in flight"). --frozen-check adds a pass with the flight settings: exactly on
+# the vehicle; on a desktop the CPU tracker, and the matching only with OV_GROUP_CAMS=1.
 #
 # CAMPAIGN OPERATING POINT (Sep 2026). Every quoted fleet number came from this yaml: raw VIO
 # fleet POSTG 3.50 cm (deterministic serial oracle) / 3.57 cm (online, 3 draws), online

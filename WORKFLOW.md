@@ -62,6 +62,8 @@ usage error exits before that.
 out_myvehicle/
   myvehicle_published_chain.yaml   ← THE CALIBRATION (intrinsics, extrinsics, time offset)
   myvehicle_mount.json             ← mount rotation M, only if ground truth was available
+  myvehicle_published_terms.txt    ← the two lens terms per camera, only after a calibration
+                                   that estimated them; part of the calibration (step 3 needs it)
   report.json                      verdict + all three certificates + what was detected.
                                    Valid JSON (jq-parseable). Note `diagnosis.ate.postg_m`
                                    is `null` when the recording has fewer than 20
@@ -109,7 +111,11 @@ flight_myvehicle/
   estimator_flight.yaml       flight config (from the vio package)
   kalibr_imucam_chain.yaml    ← the published chain, renamed
   kalibr_imu_chain.yaml       ← the IMU chain
+  flight_stiffness.env        the flight settings (from the vio package); its last line holds
+                              the lens terms of this calibration (empty if it has none)
+  campaign.env                the vehicle's tracker and scheduler switches (from the vio package)
   mount.json                  mount rotation (if solved)
+  lens_terms.env              the lens terms alone (only if the calibration estimated them)
   MANIFEST.txt                what each file is, and the exact command to fly it
 ```
 
@@ -125,27 +131,53 @@ and nothing flags it. That is the entire reason this step is a tool and not a no
 ## Step 4 — fly
 
 ```bash
-set -a; source vio/vio_deploy/config/flight_stiffness.env; set +a   # REQUIRED
+set -a; source flight_myvehicle/flight_stiffness.env; set +a        # REQUIRED
+# on the vehicle (aarch64) also the tracker and scheduler switches; never on a desktop
+[ "$(uname -m)" = aarch64 ] && { set -a; source flight_myvehicle/campaign.env; set +a; }
 
-# offline replay of a recording
+# offline replay of a recording (on a desktop first: export OV_GROUP_CAMS=1, which hands the
+# estimator the four images of an instant as one set, as on the vehicle)
 bash vio/vio_deploy/scripts/run_serial.sh BAG flight_myvehicle/estimator_flight.yaml OUT 4 false 42 70
 
 # live on the vehicle
-ros2 run ov_msckf run_subscribe_msckf flight_myvehicle/estimator_flight.yaml
+ros2 run ov_msckf run_online_msckf flight_myvehicle/estimator_flight.yaml
 ```
+
+Both programs read the topics from `estimator_flight.yaml`, which names none as deployed:
+they then read `/imu0` (`sensor_msgs/Imu`) and `/cam<N>/image_raw` (`sensor_msgs/Image`). For
+any other vehicle, the fleet's included, first add `imu_topic`, `imu_msg_type`, `cam_msg_type`
+and `cam_topic0..N` to that file; `MANIFEST.txt` lists the ones of the recording the
+calibration was made on. Without them the live node starts and receives nothing, and a replay
+writes no trajectory.
+
+A flight folder deployed before 2026-10-09 has no `flight_stiffness.env` of its own. Run
+`deploy_vio.py` again on its calibration output (the calibration is not repeated), or do what
+that folder's MANIFEST says: source `vio/vio_deploy/config/flight_stiffness.env` and then, if
+the folder has one, its `lens_terms.env`. If `source` answers `No such file or directory`,
+nothing was set and the estimator would fly with loose priors.
 
 `flight_stiffness.env` is **not optional**. It tightens the calibration priors ×0.10 so the
 online calibration stays tethered to the chain you just deployed. Without it you are running
 the *calibration* operating point in flight, with loose priors that let the calibration
-random-walk. Check with `env | grep OV_PRIOR` — flying should print five variables;
-calibrating should print none.
+random-walk. Source the copy in the flight folder: it also carries the lens terms of that
+calibration. Check with `env | grep OV_PRIOR` — flying should print six variables. Before a
+calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` should print nothing, or exactly your
+own exports for a calibration with matching and lens terms.
+
+Since 2026-10-09 the same file keeps two lens terms per camera as calibration states in
+flight and matches features between neighbouring cameras. What that changes, measured on the
+flight computer, and how to switch it off: `vio/README.md`, "Matching and lens terms in
+flight". The live node of the vehicle is `run_online_msckf`; `run_subscribe_msckf` reads
+neither the PX4 IMU nor compressed images and does not match between cameras.
 
 ---
 
 ## Where the mount rotation goes
 
 Intrinsics, extrinsics and the time offset are **estimator inputs** — they enter the filter
-through `kalibr_imucam_chain.yaml`. The mount rotation `M` is **not**: the estimator never
+through `kalibr_imucam_chain.yaml` (the two lens terms per camera, when the calibration has
+them, through `OV_NONRADIAL` in the folder's `flight_stiffness.env`). The mount rotation `M`
+is **not**: the estimator never
 reads it. It is applied afterwards, to the estimator's output trajectory:
 
 ```python
