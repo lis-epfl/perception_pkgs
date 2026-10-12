@@ -10,7 +10,9 @@ synthetic-smudge localization / fixed-point publish / 6 diagnosis verdicts / cro
   stamp noise, cross-camera desync), per-camera image-health (per-patch max-gradient-over-flight).
 - `circlefit.py` — the single temporal accumulation pass shared by the image-center prior
   (mean of the frames that changed > 2.4 %, 15 % binary map, fleet-radius disk argmax) and the
-  image-health gate.
+  image-health gate. `image_pass()` runs it with one process per camera. The tool gives it the
+  run's window, cut at 30 s after takeoff when the window is longer (`--image-after-takeoff`;
+  with 0, or a recording without a takeoff, it reads the whole window).
 - `publish.py` — §3.4/§6 robust-mean publisher (median + chordal rotation mean over harvests);
   kept for the study, the tool now publishes the converged pass itself.
 - `evalate.py` — trajectory metrics (toff-corrected; global/POSTG/NOUM), study conventions.

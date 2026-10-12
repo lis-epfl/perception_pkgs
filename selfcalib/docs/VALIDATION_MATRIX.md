@@ -84,7 +84,8 @@ vehicle.
 
 ## 3. Per-camera image-health gate (`gates.image_health_gate` / `circlefit.health_from_acc`)
 64 px patches inside 0.92× the fisheye circle; a patch is healthy if its per-frame p99 |Sobel|
-ever exceeds 25 during the flight; camera flagged if >5 % of in-circle patches stay dead.
+reaches 25 at least once in the frames the image pass reads (the run's window, at most 30 s after
+takeoff by default); camera flagged if >5 % of in-circle patches stay dead.
 - **Specificity:** all 12 fleet cameras (3 bags, full flights): 0 dead patches, no flags.
 - **Sensitivity (synthetic smudge):** blur σ=20 + 65 % local-contrast loss inside a 130 px disk
   injected into nxt3 cam2 only → cam2 flagged with 7 dead patches, all inside the disk
@@ -135,6 +136,18 @@ fit is window-insensitive (first 15 s vs full recording agree to ≤2 px per fle
 `accumulate()`'s full-recording pass is fine as the seed source; no tool change needed. The largest
 errors are radius-transfer artifacts (own-radius worst case 12 px). Threshold 120 px now ≈6× the
 worst healthy error (still valid, more conservative than designed).
+
+**2026-10-12:** the tool's pass now reads the window only up to 30 s after takeoff
+(`--image-after-takeoff`). On the ten fleet recordings with 90 s of flight (40 cameras) the
+centre from 30 s is as far from the calibrated principal point as the one from 90 s (median
+7 px, largest 24 px, against the calibrations of 8 October; single centres differ by up to 6 px
+between the two), and on all eleven every patch of the image check is sharp within those 30 s.
+The 120 px threshold is about 5 times this largest error. On each of the eleven recordings, for
+windows of 20, 30 and 90 s after takeoff, the new pass (counting test, one process per camera,
+read stopped after the window) returns exactly the centres, image check and timing check of the
+pass it replaces (workstation; on the flight computer, ten runs on three vehicles against the
+reports of the released tool). The values are those of the release; their keys in report.json
+now always come in camera order.
 
 ## 6. Mount calibration (`mount.py`) — cross-flight transfer test
 Solve M = R_fit·R_anchor⁻¹ on flight A only; apply to flight B with **no fitting on B**

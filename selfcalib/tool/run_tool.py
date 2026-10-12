@@ -5,7 +5,8 @@ diagnosis verdict.
 
 Data: by default the recording up to 20 s after takeoff (PX4 land detector); --after-takeoff changes
 the 20 s, --window replaces the rule with a fixed span, and a window longer than the recording uses
-all of it. Stopping rule (paper Sec. IV): at pass k >= 2, stop when no parameter type (principal
+all of it. The image pass (image-center prior, image check) reads this data up to 30 s after takeoff
+(--image-after-takeoff). Stopping rule (paper Sec. IV): at pass k >= 2, stop when no parameter type (principal
 point, focal length, mean distortion, rotation, translation, t_d) moved by more than twice the
 full-flight envelope since pass k-1; at most --max-pass (16) passes. The published calibration is
 that last pass.
@@ -24,14 +25,14 @@ there. With ground truth from either source the run additionally produces the AT
 certificate (§6.3) and the mount solve (§6.2, <drone>_mount.json). Without it, both are
 skipped and everything else is unchanged. --no-gt-autodetect turns the search off.
 """
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, json, os, re, shutil, subprocess, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bagio import Recording
 from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual, step_types
 from gates import static_start_gate, timing_gate
-from circlefit import accumulate, fit_centers, health_from_acc, radii_from_chain, radii_from_fleet
+from circlefit import image_pass, usable_cpus, radii_from_chain, radii_from_fleet
 from publish import robust_mean, chordal_mean
 from diagnose import fleet_stats, fleet_members, diagnose
 import gtdetect
@@ -40,10 +41,26 @@ import mount
 OVR = os.environ.get('SCT_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STEP_STOP = 2.0          # stop when every parameter type moved <= 2 full-flight envelopes since the last pass
 TAKEOFF_WINDOW_S = 20.0  # default data: up to this long after takeoff (paper Sec. IV: 20 s of flight)
+IMAGE_TAKEOFF_S = 30.0   # the image pass reads at most this long after takeoff, however long the window is
+IMAGE_MIN_FRAMES = 40    # ... unless a camera then has fewer changed frames than this in its mean image
 
 
 def log(s):
     print('[tool] ' + s, flush=True)
+
+
+def image_window(window, takeoff, after_takeoff, span=None):
+    """Span the image pass reads, in seconds from the instant every stream is live: the recording up to
+    `after_takeoff` seconds after the takeoff, and never past the run's own window (None = the whole
+    recording, `span` seconds long). Without a takeoff, or with after_takeoff 0, it is the run's window."""
+    if takeoff is None or not after_takeoff:
+        return window
+    cut = takeoff + after_takeoff
+    if cut <= 0:
+        return window
+    if window is None:
+        return cut if span is None or cut < span else None
+    return cut if cut < window else window
 
 
 def _json_safe(o):
@@ -473,8 +490,25 @@ def main():
                     help='a FIXED span instead of the takeoff rule: seconds of the recording to use, '
                          'measured from the instant every stream is live, wherever the takeoff falls '
                          'in it. A window longer than the recording uses all of it. Either way the '
-                         'span is applied to the gates, the image-center prior, the warm-start passes '
-                         'and the frozen deployment pass alike.')
+                         'span is applied to the gates, the warm-start passes and the frozen deployment '
+                         'pass alike; the image pass reads it up to --image-after-takeoff.')
+    ap.add_argument('--image-after-takeoff', type=float, default=IMAGE_TAKEOFF_S,
+                    help='seconds of flight the image pass reads (image-center prior and image check), counted '
+                         'from the same takeoff as --after-takeoff (default %g), and never past the window. A '
+                         'longer window is still calibrated on in full; only this pass stops earlier, because '
+                         'more flight does not make its result better: on the ten fleet recordings with 90 s of '
+                         'flight (40 cameras) the centers from 30 s and from 90 s lie equally far from the '
+                         'calibrated principal point (median 7 px, largest 24 px; a single center moves by up '
+                         'to 6 px between the two), and on all eleven every patch of the image check is sharp '
+                         'within the first 30 s. With the default window of 20 s nothing changes. If a camera '
+                         'has fewer than %d changed frames in those seconds (a vehicle that hovers still after '
+                         'takeoff), or the image check flags a camera on them, the pass is repeated on the whole '
+                         'window. 0 = always the whole window, as before 2026-10-12; so does a recording without '
+                         'a takeoff.'
+                         % (IMAGE_TAKEOFF_S, IMAGE_MIN_FRAMES))
+    ap.add_argument('--image-processes', type=int, default=None,
+                    help='processes of the image pass (default: one per camera, at most the CPUs the tool may '
+                         'use). 1 = all cameras in this process, as before 2026-10-12; the result is the same.')
     ap.add_argument('--track-frequency', type=float, default=None,
                     help='KLT tracking rate for the WARM-START passes only, overriding the '
                          'loop config. Default 15: the cameras run at 30 Hz and the throttle '
@@ -517,6 +551,10 @@ def main():
         ap.error('--after-takeoff must be > 0 seconds; got %g' % a.after_takeoff)
     if a.after_takeoff is not None and a.window is not None:
         ap.error('--after-takeoff sizes the takeoff rule and --window replaces it: give one, not both')
+    if not 0 <= a.image_after_takeoff < float('inf'):
+        ap.error('--image-after-takeoff must be >= 0 seconds (0 = the whole window); got %g' % a.image_after_takeoff)
+    if a.image_processes is not None and a.image_processes < 1:
+        ap.error('--image-processes must be >= 1; got %d' % a.image_processes)
     for label, path in (('--bag', a.bag), ('--template', a.template), ('--imu-chain', a.imu_chain)):
         if not os.path.exists(path):
             ap.error('%s does not exist: %s' % (label, path))
@@ -590,8 +628,9 @@ def main():
     _rec0 = Recording.open(a.bag)
     _span = _rec0.span_after_anchor()
     _after = TAKEOFF_WINDOW_S if a.after_takeoff is None else a.after_takeoff
+    # a fixed span does not ask for the takeoff; the image pass still ends --image-after-takeoff after it
+    _tk = _rec0.px4_takeoff() if a.window is None or a.image_after_takeoff else None
     if a.window is None:
-        _tk = _rec0.px4_takeoff()
         if _tk is None:
             log('window: no takeoff found (no PX4 land-detector stream, or no takeoff) — using the whole recording')
         else:
@@ -608,12 +647,12 @@ def main():
 
     # ---- 1. cheap gates ----
     log('gate: static start')
-    # One windowed Recording for every python stage. --window must trim the gates and
-    # the circle fit too, not just the estimator: the circle fit produces the seed's
-    # principal point, so if it read the whole recording while the estimator read 15 s,
-    # the seed would describe data the calibration never saw. It is also where the time
-    # goes -- these stages stream every frame, and on an Orin they cost ~54 s of a
-    # 3 min run regardless of the window.
+    # One windowed Recording for the gates; the image pass uses it too unless the window
+    # runs past takeoff + --image-after-takeoff, when it reads a shorter span of the same
+    # data (section 2). The window must trim the gates and the circle fit, not just the
+    # estimator: the circle fit produces the seed's principal point, so it must never read
+    # data the calibration does not see. Since 2026-10-12 a windowed read of the cameras
+    # stops shortly after the end of the window instead of streaming the file to its end.
     _wrec = Recording.open(a.bag, window=a.window)
     # the static-start test must match the initialiser of the config the warm-start loop will run
     _gate_cfg = (f'{OVR}/configs/estimator_calib.yaml' if a.calib_config in (None, 'calib') else
@@ -630,15 +669,59 @@ def main():
         log('WARNING: timing gate flagged (proceeding — predicts a platform-defect verdict, §6.3)')
 
     # ---- 2. one accumulation pass: circle fit + image health ----
-    log('image pass: activity/mask/gradient accumulation')
+    # It reads the window up to --image-after-takeoff (30 s) after takeoff, one process per camera:
+    # more flight does not make its result better (median 7 px from the calibrated principal point
+    # with 30 s and with 90 s), and on an Orin it was the largest part of a 90 s run.
+    _iwin = image_window(a.window, _tk, a.image_after_takeoff, _span)
+    _iproc = min(a.image_processes or usable_cpus(), len(cam_ids))
     # fleet-shared disk radius: mean image-circle radius of the identical reference vehicles
     _members, _ = fleet_members()
     _fleet = [parse_chain(f'{OVR}/fleet_reference/{d}/theta_star.yaml')[0] for d in _members if d != a.fleet_exclude]
     radii = radii_from_fleet(_fleet) if _fleet else radii_from_chain(tmpl_cams)
-    acc = accumulate(_wrec, cams=cam_ids)
-    centers = fit_centers(acc, radii)
+
+    def _image_pass(window):
+        nonlocal _iproc
+        log('image pass: activity/mask/gradient accumulation (%s, %d process%s)'
+            % ('the window' if window == a.window else 'the first %.2f s: takeoff + %g s' % (window, a.image_after_takeoff),
+               _iproc, '' if _iproc == 1 else 'es'))
+        rec, t0 = (_wrec if window == a.window else Recording.open(a.bag, window=window)), time.time()
+        try:
+            res = image_pass(rec, radii, cams=cam_ids, processes=_iproc, scratch=a.out)
+        except (RuntimeError, OSError) as e:
+            if _iproc == 1:
+                raise
+            log('WARNING: image pass with %d processes failed (%s) — repeating it in this process'
+                % (_iproc, (str(e).strip().splitlines() or [type(e).__name__])[-1][:200]))
+            _iproc = 1
+            res = image_pass(rec, radii, cams=cam_ids, processes=1)
+        log('image pass: %.1f s' % (time.time() - t0))
+        return res
+
+    def _few_frames(centers):
+        """cameras with fewer than IMAGE_MIN_FRAMES changed frames in the mean image (a camera without any frame: 0)"""
+        n = {c: centers[c]['frames_in_mean'] if c in centers else 0 for c in cam_ids}
+        return {c: n[c] for c in cam_ids if n[c] < IMAGE_MIN_FRAMES}
+
+    centers, _health = _image_pass(_iwin)
+    _few, _repeated = _few_frames(centers), False
+    if (_few or not _health['pass']) and _iwin != a.window:
+        # the cut left too little to judge: read the run's whole window, as before the cut existed
+        log('image pass: %s in the first %.2f s — reading the whole window'
+            % ('fewer than %d changed frames in the mean image of camera(s) %s'
+               % (IMAGE_MIN_FRAMES, ', '.join('%d (%d)' % kv for kv in sorted(_few.items()))) if _few
+               else 'image-health gate flagged', _iwin))
+        _iwin, _repeated = a.window, True
+        centers, _health = _image_pass(_iwin)
+        _few = _few_frames(centers)
+    if _few:
+        log('WARNING: the mean image of camera(s) %s holds fewer than %d changed frames — its image center may be '
+            'unreliable (the vehicle hardly moved, the camera rate is low, or the data the image pass read is short)'
+            % (', '.join('%d (%d)' % kv for kv in sorted(_few.items())), IMAGE_MIN_FRAMES))
+    report['image_pass'] = {'window_s': _iwin, 'takeoff_s': None if _tk is None else round(_tk, 3),
+                            'after_takeoff_s': a.image_after_takeoff, 'repeated_on_window': _repeated,
+                            'processes': _iproc, 'few_frames': {str(c): n for c, n in sorted(_few.items())}}
     report['circle_fit'] = centers
-    report['gate_image'] = health_from_acc(acc, centers, radii)
+    report['gate_image'] = _health
     if not report['gate_image']['pass']:
         log('WARNING: image-health gate flagged camera(s) — clean lenses and re-record for best results')
 

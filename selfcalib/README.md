@@ -166,6 +166,8 @@ python3 tool/run_tool.py \
     [--gt gt.tum]                 # optional; omit and the tool looks in the bag itself
     [--after-takeoff S]           # seconds of flight to use after the PX4 takeoff (default 20)
     [--window S]                  # or a fixed span from the first instant every stream is live
+    [--image-after-takeoff S]     # the image pass stops this long after takeoff (default 30; 0 = whole window)
+    [--image-processes N]         # processes of the image pass (default one per camera)
     [--min-still S]               # standstill the recording must begin with (default 6)
     [--max-pass 16] [--domain 70]
 ```
@@ -177,7 +179,8 @@ all of it) → gates (static start, timing health, image health) → one
 temporal-accumulation pass (image-center prior: every 4th frame enters the mean image only if
 it changed by more than 2.4 % since the previous one; the mean is thresholded at 15 % of its
 brightest pixel and a disk of the fleet-shared radius is correlated with it, argmax = principal
-point) → seed assembly (fleet average + image-center prior) → warm-start loop: run estimator,
+point; the pass reads the window up to 30 s after takeoff, `--image-after-takeoff`, with one
+process per camera) → seed assembly (fleet average + image-center prior) → warm-start loop: run estimator,
 harvest calibration, re-seed, repeat **until, at pass ≥ 2, no parameter type moved by more than
 twice the full-flight envelope since the previous pass** (5 px principal point, 1 % focal
 length, 0.002 mean distortion, 0.7° rotation, 5 cm translation, 12 ms t_d; at most
@@ -231,7 +234,7 @@ Measured with this tool on the flight computer (60 s after takeoff): the four op
 come out 0.5 and 0.9 mm off a square on two vehicles, against 27 and 7 mm with the default run,
 and stereo depth at 2-9 m is biased by about 1 % (six recordings, three vehicles). Tracking error
 does not change. About 50 s of flight are needed (the default 20 s are not enough), and the run
-takes about 2.6 minutes instead of 1.2. `../vio/README.md` lists the switches.
+takes about 1.8 minutes instead of 0.8. `../vio/README.md` lists the switches.
 
 The two lens terms are not in the chain file, which has no field for them. The run writes them
 to `--out/<drone>_published_terms.txt`, and `deploy_vio.py` puts them into the flight folder

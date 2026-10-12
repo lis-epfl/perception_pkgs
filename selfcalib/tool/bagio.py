@@ -45,6 +45,15 @@ SENSOR_COMBINED_SIZE = 52
 # FLU (Forward-Left-Up). The two differ by 180 deg about x.
 FRD_TO_FLU = np.array([1.0, -1.0, -1.0])
 
+# A windowed read of the cameras stops instead of reading the file to its end: once every
+# camera has shown STOP_FRAMES frames in a row stamped more than STOP_MARGIN_S past the end
+# of the window. A recording is read in the order it was logged, so nothing later belongs to
+# the window. The margin covers a frame logged later than frames stamped after it; asking
+# every camera for several frames in a row keeps a few wrong stamps, or one camera's clock
+# running ahead, from ending the read. A camera that falls silent makes it go to the end.
+STOP_MARGIN_S = 1.0
+STOP_FRAMES = 10
+
 
 def _storage_id(uri):
     """mcap vs sqlite3, read from the recording rather than assumed."""
@@ -149,7 +158,7 @@ class Recording:
         # ov_msckf/src/utils/bag_source.h: measured from the instant every stream is
         # live, i.e. max(first IMU stamp, first camera stamp) -- on a fleet recording
         # the camera file starts seconds after the IMU file. If the two disagreed, the
-        # gates and the circle fit would be measuring a different span than the
+        # gates and the circle fit would cut their span at a different instant than the
         # estimator, and the seed would not describe the data being calibrated on.
         self.window = float(window) if window else None
         self._anchor_cache = None
@@ -181,6 +190,22 @@ class Recording:
         return cls(uris=[path], imu_topic='/imu0', imu_type='sensor_msgs/msg/Imu',
                    cam_topics={i: '/cam%d/image_raw' % i for i in range(4)},
                    cam_type='sensor_msgs/msg/Image', window=window)
+
+    def spec(self):
+        """Plain data from which another process opens this same recording, window included
+        (circlefit runs one process per camera). The anchor travels with it, so every process
+        cuts the window at the same instant."""
+        return {'uris': list(self.uris), 'imu_topic': self.imu_topic, 'imu_type': self.imu_type,
+                'cam_topics': {str(c): t for c, t in self.cam_topics.items()},
+                'cam_type': self.cam_type, 'window': self.window, 'anchor': self._anchor()}
+
+    @classmethod
+    def from_spec(cls, spec):
+        rec = cls(uris=spec['uris'], imu_topic=spec['imu_topic'], imu_type=spec['imu_type'],
+                  cam_topics={int(c): t for c, t in spec['cam_topics'].items()},
+                  cam_type=spec['cam_type'], window=spec['window'])
+        rec._anchor_cache = spec['anchor']
+        return rec
 
     # -- introspection ---------------------------------------------------------
     def topics(self):
@@ -227,6 +252,11 @@ class Recording:
         messages, of which the IMU gate wants one. Without it every message is
         fetched and copied before being discarded.
         """
+        for r, _ts in self._reader_topics(topics):
+            yield r
+
+    def _reader_topics(self, topics):
+        """_reader(), with the topics each file's reader is restricted to."""
         wanted = [t for t in topics if t in self._topic_uri]
         by_uri = {}
         for t in wanted:
@@ -236,7 +266,7 @@ class Recording:
             r.open(rosbag2_py.StorageOptions(uri=uri, storage_id=_storage_id(uri)),
                    rosbag2_py.ConverterOptions('', ''))
             r.set_filter(rosbag2_py.StorageFilter(topics=ts))
-            yield r
+            yield r, ts
 
     def _first_stamp(self, topic):
         """Sensor stamp of the first record on a topic, without applying the window."""
@@ -291,12 +321,25 @@ class Recording:
         The payload is returned undecoded so callers that only need stamps (the
         timing gate) never pay for a decode, and callers that subsample (the image
         gate, circlefit) decode only the frames they keep. Use decode() on it.
+
+        With a window, the read stops shortly after its end rather than at the end of
+        the file (STOP_MARGIN_S, STOP_FRAMES): after a 20 s window the remaining frames
+        are most of a fleet recording, and pulling them from the file took longer than
+        pulling the frames that are used. The frames yielded are the same.
         """
         topics = {self.cam_topics[c]: c for c in cams if c in self.cam_topics}
-        for r in self._reader(list(topics)):
+        stop = None if self.window is None else self._anchor() + self.window + STOP_MARGIN_S
+        for r, in_file in self._reader_topics(list(topics)):
+            past = dict.fromkeys(in_file, 0)        # per camera: frames in a row past the stop
             while r.has_next():
                 topic, data, _ = r.read_next()
                 _t = fast_stamp(data)
+                if stop is not None and _t > stop:
+                    past[topic] += 1
+                    if min(past.values()) >= STOP_FRAMES:
+                        break
+                    continue
+                past[topic] = 0
                 if not self._in_window(_t):
                     continue
                 yield topics[topic], _t, data
