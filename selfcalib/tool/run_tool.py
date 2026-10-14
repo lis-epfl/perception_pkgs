@@ -716,6 +716,9 @@ def main():
             % (a.window, _span))
         a.window = None
     report['window_s'] = a.window
+    # the recording's length from the same instant (to the end of the first file to end): what a run with window_s
+    # null read, so that the seconds read after the takeoff are known in either case
+    report['recording_s'] = round(_span, 3) if _span is not None else None
 
     # ---- 1. cheap gates ----
     log('gate: static start')
