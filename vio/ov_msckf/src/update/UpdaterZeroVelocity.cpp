@@ -34,6 +34,8 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cmath>
+#include <cstdlib>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -235,6 +237,22 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
     }
   }
 
+  // OV_ZUPT_MAX_DZ=<metres> (default off, byte-identical): the disparity test alone does not accept an update more
+  // than this far above or below the height at which the last update was accepted. The disparity test compares one
+  // image with the next, so a vehicle that hovers passes it as long as it moves less than about 0.1 m/s: in every
+  // flight of 13 Oct 2026 it accepted updates at 1.5 m height (1 to 28 image sets per flight, true speed up to
+  // 0.13 m/s). An accepted update holds the position and the queued sub-updates of the clone tick are dropped. On
+  // the ground (before the takeoff, and again after the landing) the height is the one of the last accepted update
+  // and nothing changes. The estimate's own height is used: the global frame has gravity along -z.
+  static const double zupt_max_dz = [] { const char *e = std::getenv("OV_ZUPT_MAX_DZ"); return e ? atof(e) : 0.0; }();
+  static bool zupt_z_known = false;
+  static double zupt_z_ref = 0.0;
+  if (zupt_max_dz > 0.0 && disparity_passed && zupt_z_known && std::abs(state->_imu->pos()(2) - zupt_z_ref) > zupt_max_dz) {
+    disparity_passed = false;
+    PRINT_DEBUG(YELLOW "[ZUPT]: disparity passed %.2f m from the height of the last update: not standing\n" RESET,
+                state->_imu->pos()(2) - zupt_z_ref);
+  }
+
   // Check if we are currently zero velocity
   // We need to pass the chi2 and not be above our velocity threshold
   if (!disparity_passed && (chi2 > _options.chi2_multipler * chi2_check || state->_imu->vel().norm() > _zupt_max_velocity)) {
@@ -246,6 +264,8 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
   }
   PRINT_INFO(CYAN "[ZUPT]: accepted |v_IinG| = %.3f (chi2 %.3f < %.3f)\n" RESET, state->_imu->vel().norm(), chi2,
              _options.chi2_multipler * chi2_check);
+  zupt_z_ref = state->_imu->pos()(2); // OV_ZUPT_MAX_DZ: the height the vehicle stands at
+  zupt_z_known = true;
 
   // Do our update, only do this update if we have previously detected
   // If we have succeeded, then we should remove the current timestamp feature tracks

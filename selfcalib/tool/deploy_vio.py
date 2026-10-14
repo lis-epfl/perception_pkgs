@@ -247,6 +247,8 @@ def main():
     holds = ['calibration priors x0.10']
     holds.append('the two lens terms per camera as calibration states' if states else 'the lens terms as fixed values')
     holds.append('matching of features between neighbouring cameras' if matching else 'no matching between cameras')
+    holds.append('the limits for slow flight' if (_number(fl.get('OV_MSCKF_ROWS')) or 0.0) > 0.0
+                 else 'no limits for slow flight (the estimator falls behind while the vehicle hovers)')
     # the topics of the recording the calibration was made on = the vehicle's own
     layout = []
     cfg_cal = os.path.join(cal, 'calib', 'estimator_config.yaml')

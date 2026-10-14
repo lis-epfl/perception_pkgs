@@ -11,7 +11,8 @@ ov_core/      ov_init/      ov_msckf/      pruned OpenVINS
 vio_deploy/                                deployment assets (this package's own)
   config/estimator_flight.yaml               FLIGHT config
   config/flight_stiffness.env                flight settings: x0.10 calibration-prior stiffness,
-                                             lens terms as states, matching between cameras
+                                             lens terms as states, matching between cameras,
+                                             limits for slow flight
   config/campaign.env                        the vehicle's GPU tracker and scheduler switches
   scripts/run_serial.sh                      the ONLY supported estimator invocation
   scripts/build_openvins.sh                  builds this workspace
@@ -59,7 +60,8 @@ set, makes the two lens terms per camera calibration states with that standard d
 
 The same file switches on what flight has had since 2026-10-09 (next section): the lens terms
 as states (the sixth row, with `OV_NONRAD_SKEW_FIXED=1`) and the matching of features between
-neighbouring cameras (`OV_XCAM=1`, `OV_XCAM_PRESET=rt`).
+neighbouring cameras (`OV_XCAM=1`, `OV_XCAM_PRESET=rt`). Since 2026-10-14 it also sets four limits
+for slow flight (the section after that).
 
 **Flight** — `config/estimator_flight.yaml` **with** `config/flight_stiffness.env` sourced.
 The tightened priors tether the online calibration to its published chain. With the five
@@ -200,6 +202,65 @@ To fly as before 2026-10-09, unset the four variables after sourcing the file
 (`unset OV_XCAM OV_XCAM_PRESET OV_PRIOR_NONRAD_SIG OV_NONRAD_SKEW_FIXED`); the lens terms of
 `OV_NONRADIAL` are then fixed values again. An estimator built before commit 6bbaf8c has
 neither addition and ignores the four variables.
+
+## Slow flight
+
+Since 2026-10-14 `flight_stiffness.env` sets four more variables. They keep the estimator on
+time while the vehicle hovers or flies slowly, which the settings before did not.
+
+The filter makes a clone every 0.133 s and keeps 30 of them (4 s). An MSCKF update uses a
+feature when it is lost or when it reaches the end of that window. In cruise flight features
+are lost after 1-2 s and an update has 400-450 measurement rows. In a hover nearly every
+feature lives through the whole window, and all of them reach its end together with the
+features born with them: one update, the sub-update after the lead of a clone tick, then takes
+2500-6300 rows, 57 per feature. On the Orin NX that costs 135-250 ms against 33 ms between two
+sets of images (7.5 ms per 1000 rows to build the system, 15.9 ms per 1000 rows to compress
+it, about 17 ms for the EKF update and 13 ms for the one landmark it initialises). In two
+shadow flights of nxt3 with every set of images complete (13 Oct 2026) the poses left the node
+up to 400 and 533 ms after their images, from 4 s after the takeoff, when the window had
+filled, and again in the slow descent, against 53-63 ms in cruise flight.
+
+| line of `flight_stiffness.env` | what it does |
+|---|---|
+| `OV_MSCKF_MAX_OBS=12` | Of one feature, at most 12 observations per camera go into an MSCKF update, spread evenly over its track, the first and the last always among them. A track through the whole window brings 21 rows instead of 57, as much as a track of cruise flight. |
+| `OV_MSCKF_ROWS=900` | A clone tick takes about 900 rows of window-end features at most, and an update about 900 together with its lost features. A window-end feature that does not fit is alive: it waits and is offered again at the next ticks, each time with one old observation less and one new one more. Lost features are always taken. Needs the line above: a hover brings about 650 rows per tick with it and 1770 without. |
+| `OV_SPREAD_ONE_GATE=1` | One update gate for all cameras instead of one per camera. With one per camera, a set of images that lacks a camera at a clone tick leaves that camera ticking at instants of its own for the rest of the flight: 10.7 ticks per second instead of 7.0 on a recording with 6 % incomplete sets, 14.6 in a live flight with 23 %. |
+| `OV_ZUPT_MAX_DZ=0.3` | No zero-velocity update more than 0.3 m above or below the height of the last accepted one. The update is accepted on image disparity alone (`zupt_max_disparity`), which a vehicle that hovers passes below about 0.1 m/s: in each of the six flights below it was accepted at 1.5 m height, on 1 to 28 sets of images. On the ground, before the takeoff and again after the landing, nothing changes. |
+
+Unset, each of them is off and the estimator's output is byte-identical to that of the build
+without them (deterministic replay of a flight on a desktop).
+
+Measured in replays on a desktop with the vehicle's GPU tracker (`run_serial_msckf` with the
+environment of the flight folder), on six flights of nxt3 of 13 Oct 2026: 21-47 s of flight
+with a 3 s hover after the takeoff and a slow landing; two of the recordings have 3 % and 6 %
+incomplete sets of images, one ends in an upset. Three to six runs per flight and setting.
+Tracking error is the RMS position error after a rigid fit to motion capture, from takeoff on.
+"Pinned" is the error of the trajectory held at its pose at arming and turned by the mount,
+which is what a vehicle that flies on the estimator sees.
+
+| | before | with the four lines |
+|---|---|---|
+| rows per clone tick, mean of the six flights | 779 | 495 |
+| largest update of a flight | 4800-10500 rows | 880-2650 rows (above 900: lost features, in the upset and on the first fast leg) |
+| tracking error, per flight | 2.9, 3.0, 3.0, 3.4, 3.6, 5.2 cm | 2.6, 2.7, 2.6, 3.3, 4.1, 5.2 cm |
+| tracking error, mean of the six | 3.54 cm | 3.41 cm |
+| the same flight run three times: range of the tracking error | 1.1 cm on average, up to 3.4 | 0.5 cm on average, up to 1.0 |
+| pinned error, mean of the six: RMS / largest | 4.95 / 13.3 cm | 4.59 / 11.1 cm |
+| zero-velocity updates between takeoff and landing | 1 to 28 sets of images per flight | none |
+
+(Flights in the order 20:58, 20:31, 17:30, 15:43, 19:56, 16:46. One flight, 19:56, is 0.45 cm
+worse with the four lines, inside the range of its own runs before.)
+
+On the Orin NX of nxt3, the vehicle these flights were flown with, the replay runner in real
+time (`OV_REALTIME=1`) on three of them, 20:31, 20:58 and 19:56, before and with the four
+lines: the largest sub-update 160-275 ms before and 81-87 ms with them; sub-updates over
+100 ms 2-3 per flight before, none with them; sets of images handed to the filter more than
+100 ms late 0.4-0.7 % of those in motion before, none with them, the latest 73-77 ms. The
+runner holds sub-updates back while sets of images wait, which the live node does not, so its
+delays before are smaller than those the flights measured; the durations of the sub-updates
+are what compares. One run of 19:56 with the four lines, made while the Orin was busy with the
+system's update check after a boot, fell behind for 1.5 s, up to 403 ms; the same run on the
+idle Orin did not. No flight hovers longer than 3 s, and none was flown with the four lines.
 
 ## Calibration switches
 

@@ -135,6 +135,44 @@ static void prejac_verify_one(const PreJacEntry &e, const Eigen::MatrixXd &H_x, 
     g_pj_vrel_r = dr / nr;
 }
 
+// OV_MSCKF_MAX_OBS=K (default 0 = off, byte-identical): of one feature, at most K observations per
+// camera go into an MSCKF update. Called right after clean_old_measurements(), so what is counted
+// are the observations at clone times. A track that spans the whole clone window (a feature that
+// stays in view while the vehicle hovers or flies slowly) otherwise brings one observation per
+// clone: 2 * max_clones - 3 rows per feature, 57 at max_clones 30, against 22-24 for the tracks of
+// cruise flight, and the update that takes a hover's tracks reaches 2500-6300 rows (135-250 ms on
+// the Orin NX). The kept observations are spread evenly over the track and always include the
+// first and the last one, so the baseline of the triangulation is unchanged. The feature is
+// consumed by the update as before (to_delete), so thinning its lists here loses nothing else.
+static int msckf_max_obs() {
+  static const int k = [] { const char *e = std::getenv("OV_MSCKF_MAX_OBS"); return e ? atoi(e) : 0; }();
+  return k;
+}
+static void thin_long_track(ov_core::Feature &f, int k) {
+  if (k < 2)
+    return;
+  for (auto &kv : f.timestamps) {
+    std::vector<double> &ts = kv.second;
+    const size_t n = ts.size();
+    if (n <= (size_t)k)
+      continue;
+    auto &uv = f.uvs[kv.first];
+    auto &un = f.uvs_norm[kv.first];
+    if (uv.size() != n || un.size() != n)
+      continue;
+    // r grows by (n-1)/(k-1) > 1 per step: strictly increasing, r >= i, ends at n-1
+    for (int i = 0; i < k; i++) {
+      const size_t r = (size_t)((double)i * (double)(n - 1) / (double)(k - 1) + 0.5);
+      ts[(size_t)i] = ts[r];
+      uv[(size_t)i] = uv[r];
+      un[(size_t)i] = un[r];
+    }
+    ts.resize((size_t)k);
+    uv.resize((size_t)k);
+    un.resize((size_t)k);
+  }
+}
+
 void UpdaterMSCKF::prejac_precompute(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Feature>> &feats, uint64_t epoch) {
 
   if (feats.empty())
@@ -181,7 +219,8 @@ void UpdaterMSCKF::prejac_precompute(std::shared_ptr<State> state, const std::ve
 
     PreJacEntry e;
     e.epoch = epoch;
-    e.nobs = ct;
+    e.nobs = ct;                           // counted before the thinning, as update() counts it
+    thin_long_track(*fp, msckf_max_obs()); // same thinning as step 1 of update()
 
     // Mirrors step 3 EXACTLY, including that single_gaussnewton is attempted even when the
     // linear triangulation failed.
@@ -307,6 +346,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       (*it0)->to_delete = true;
       it0 = feature_vec.erase(it0);
     } else {
+      thin_long_track(**it0, msckf_max_obs()); // OV_MSCKF_MAX_OBS, after the count OV_PREJAC is checked against
       it0++;
     }
   }

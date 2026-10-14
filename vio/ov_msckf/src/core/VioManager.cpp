@@ -209,6 +209,7 @@ inline void ov_publish_snap(const std::shared_ptr<ov_msckf::State> &state, const
 } // namespace
 
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
 
 using namespace ov_core;
@@ -963,6 +964,8 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     const char *e = std::getenv("OV_HYBRID_UPDATE");
     return e && *e == '1';
   }();
+  // OV_SPREAD_ONE_GATE=1 (default off, byte-identical): one gate for all cameras instead of one per camera; see below.
+  static const bool one_gate = [] { const char *e = std::getenv("OV_SPREAD_ONE_GATE"); return e && *e == '1'; }();
   if (hybrid_upd && message.sensor_ids.size() > 1) {
     // OV_UPDATE_STAGGER=1: the cameras are hardware-synced, so all four leads share the same
     // timestamps and their gates all expire on the SAME frame -- updates land as 4-at-once
@@ -985,10 +988,24 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }();
     std::deque<std::pair<double, int>> &upd_queue = _upd_queue;
     if (spread_upd && params.update_min_dt > 0) {
+      // OV_SPREAD_ONE_GATE=1 (default off, byte-identical): one gate for all cameras instead of one per camera.
+      // The per-camera gates open together only as long as every image set is complete. A set that lacks a camera
+      // at a clone tick leaves that camera's gate behind: it opens on the NEXT set, which makes a clone tick of its
+      // own, and from then on the cameras tick at different phases for the rest of the run (measured on a flight
+      // with 6 % incomplete sets: 10.7 clone ticks per second instead of 7.0, in a live flight with 23 % incomplete
+      // sets 14.6). Every extra tick is a propagation, a clone and a round of updates, and the clone window covers
+      // that much less time. With one gate a tick starts update_min_dt after the last tick, for the cameras present
+      // in that set; a camera that is missing gets its sub-update at the next tick.
+      bool gate_open = true;
+      if (one_gate) {
+        for (const auto &kv : _last_update_time_decim)
+          if (message.timestamp < kv.second + params.update_min_dt)
+            gate_open = false;
+      }
       for (size_t ci = 0; ci < message.sensor_ids.size(); ci++) {
         int lead2 = (int)message.sensor_ids[ci];
         auto it2 = _last_update_time_decim.find(lead2);
-        if (it2 != _last_update_time_decim.end() && message.timestamp < it2->second + params.update_min_dt)
+        if (one_gate ? !gate_open : (it2 != _last_update_time_decim.end() && message.timestamp < it2->second + params.update_min_dt))
           continue;
         _last_update_time_decim[lead2] = message.timestamp;
         upd_queue.push_back({message.timestamp, lead2});
@@ -1146,6 +1163,12 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
       if (it != _last_update_time_decim.end() && message.timestamp < it->second + eff_dt) {
         return; // tracked this frame, but skip the EKF update/clone
       }
+      // OV_SPREAD_ONE_GATE: an image set with a single camera comes this way. It waits for the common gate too
+      // (its own gate is behind when its camera missed the last tick, and it would make a clone tick of its own).
+      if (one_gate && hybrid_upd)
+        for (const auto &kv : _last_update_time_decim)
+          if (message.timestamp < kv.second + eff_dt)
+            return;
       _last_update_time_decim[lead] = message.timestamp;
     }
   }
@@ -1181,6 +1204,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     double last = 0;
     double ph[6] = {0, 0, 0, 0, 0, 0};
+    // What the call did, filled in as it goes: clone-tick stamp, lead camera, 1 = the call that made the clone,
+    // SLAM features in the state, lost / window-end candidates, features handed to the MSCKF update, window-end
+    // features left waiting by OV_MSCKF_ROWS, SLAM promotions attempted.
+    double u_t = 0;
+    int u_cam = -1, u_lead = 0, u_nslam = 0, u_lost = 0, u_end = 0, u_used = 0, u_wait = 0, u_promo = 0;
     double mark(int i) {
       double now = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       ph[i] += now - last;
@@ -1194,14 +1222,18 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         std::fprintf(stderr,
                      "[slowupd]: tot=%.1f sel=%.1f msckf=%.1f slam=%.1f init=%.1f marg=%.1f rest=%.1f "
                      "| sys=%.1f cmp=%.1f ekfu=%.1f rows=%ld cols=%ld pjhit=%ld/%ld"
-                     " | sp alloc=%.1f jac=%.1f null=%.1f marg=%.1f chi2=%.1f cpy=%.1f stack=%.1f rsz=%.1f\n",
+                     " | sp alloc=%.1f jac=%.1f null=%.1f marg=%.1f chi2=%.1f cpy=%.1f stack=%.1f rsz=%.1f"
+                     " | upd t=%.6f cam=%d lead=%d nslam=%d nlost=%d nend=%d nused=%d nwait=%d npromo=%d\n",
                      tot, ph[0], ph[1], ph[2], ph[3], ph[4], tot - ph[0] - ph[1] - ph[2] - ph[3] - ph[4],
                      g_dbg_sys_ms, g_dbg_cmp_ms, g_dbg_ekfu_ms, g_dbg_rows, g_dbg_cols,
                      ov_msckf::g_prejac_hit.load() - pjh0, ov_msckf::g_prejac_try.load() - pjt0,
-                     g_sp_alloc, g_sp_jac, g_sp_null, g_sp_marg, g_sp_chi2, g_sp_cpy, g_sp_stack, g_sp_rsz);
+                     g_sp_alloc, g_sp_jac, g_sp_null, g_sp_marg, g_sp_chi2, g_sp_cpy, g_sp_stack, g_sp_rsz,
+                     u_t, u_cam, u_lead, u_nslam, u_lost, u_end, u_used, u_wait, u_promo);
     }
   } _ut;
   VScoped _sall("do_feature_propagate_update (all)");
+  _ut.u_t = message.timestamp;
+  _ut.u_cam = message.sensor_ids.empty() ? -1 : (int)message.sensor_ids.at(0);
 
   //===================================================================================
   // State propagation, and clone augmentation
@@ -1218,6 +1250,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Also augment it with a new clone!
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
+  // The call that moves the state to a new time is the one that makes the clone: the lead of a clone tick.
+  const bool new_tick = (state->_timestamp != message.timestamp);
+  _ut.u_lead = (int)new_tick;
   if (state->_timestamp != message.timestamp) {
     { VPROF("2.propagate_clone"); VScoped _s("propagate+clone"); propagator->propagate_and_clone(state, message.timestamp); }
   }
@@ -1247,6 +1282,23 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     return;
   }
   has_moved_since_zupt = true;
+
+  // OV_MSCKF_ROWS=R (default 0 = off, byte-identical): the row cap of the MSCKF update, described where it is
+  // applied below. Its two per-tick counters start again with every new clone. Like the other schedulers of this
+  // function they are function statics: the function runs on one thread at a time.
+  static const int row_cap = [] { const char *e = std::getenv("OV_MSCKF_ROWS"); return e ? atoi(e) : 0; }();
+  static int tick_rows_left = 0;     // rows the window-end features may still take in this clone tick
+  static bool tick_promoted = false; // a SLAM promotion was already attempted in this clone tick
+  static bool prev_was_lead = false; // the call before this one made a clone as well
+  if (new_tick) {
+    tick_rows_left = row_cap;
+    tick_promoted = false;
+  }
+  // The lead leaves the window-end features and the promotion to the sub-updates that follow it. When the call
+  // before this one was a lead too, nothing follows the leads (one camera per tick: per-camera gates that fell out
+  // of phase, or a single camera), and this lead does that work itself.
+  const bool lead_defers = new_tick && !prev_was_lead;
+  prev_was_lead = new_tick;
 
   //===================================================================================
   // Disparity-aware (two-way) clone marginalization decision (VINS-Mono style)
@@ -1298,6 +1350,13 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                                     return true;
                                   }),
                    feats_lost.end()); }
+  // OV_MSCKF_ROWS: the lost features of this call's camera, before the next pruning takes out those that are at the
+  // window end as well. (After the pruning by camera: a camera without an image in this set has every one of its
+  // features "lost" for the moment.)
+  std::unordered_set<Feature *> lost_any;
+  if (row_cap > 0)
+    for (const auto &f : feats_lost)
+      lost_any.insert(f.get());
 
   // We also need to make sure that the max tracks does not contain any lost features
   // This could happen if the feature was lost in the last frame, but has a measurement at the marg timestep
@@ -1408,7 +1467,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Append a new SLAM feature if we have the room to do so
   // Also check that we have waited our delay amount (normally prevents bad first set of slam points)
-  if (state->_options.max_slam_features > 0 && message.timestamp - startup_time >= params.dt_slam_delay &&
+  // OV_MSCKF_ROWS: without the cap every window-end feature is consumed by the sub-update that follows the lead,
+  // so that sub-update is the one that promotes, once per clone tick. With the cap, features wait at the window
+  // end and every sub-update would see candidates: keep the promotion where and as often as it was (not in the
+  // lead, whose pose is the one that is published, and once per tick).
+  const bool promo_gate = (row_cap > 0 && (lead_defers || tick_promoted));
+  if (!promo_gate && state->_options.max_slam_features > 0 && message.timestamp - startup_time >= params.dt_slam_delay &&
       (int)state->_features_SLAM.size() < state->_options.max_slam_features + curr_aruco_tags) {
     // Get the total amount to add, then the max amount that we can add given our marginalize feature array
     int amount_to_add = (state->_options.max_slam_features + curr_aruco_tags) - (int)state->_features_SLAM.size();
@@ -1454,6 +1518,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     if (valid_amount > 0) {
       feats_slam.insert(feats_slam.end(), feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
       feats_maxtracks.erase(feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
+      tick_promoted = true;
+      _ut.u_promo = valid_amount;
     }
   }
 
@@ -1550,6 +1616,98 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     msckf_cap = msckf_cap_env;
   if (ramp_secs > 0.0 && message.timestamp - startup_time < ramp_secs && ramp_msckf < msckf_cap)
     msckf_cap = ramp_msckf;
+  // OV_MSCKF_ROWS=R: a clone tick takes about R measurement rows of window-end features at most, and they share
+  // the R rows of an update with the lost features. What it is for: while the vehicle hovers or flies slowly nearly
+  // every feature stays tracked through the whole clone window, and all of them reach the window end (an
+  // observation at the oldest clone) together with the features born with them. Uncapped, the sub-update that
+  // follows the lead takes them all at once: 2500-6300 rows, 135-250 ms on the Orin NX against 33 ms between image
+  // sets, and the node falls behind for as long as the vehicle is slow.
+  //   - Lost features are all taken, as before: they get no more observations, and when many die at once the
+  //     vehicle is moving hard, which is when the filter needs them. A window-end feature that is lost as well
+  //     counts as lost.
+  //   - The other window-end features are alive. One that is not taken now is offered again at the following
+  //     sub-updates and ticks, each tick with one old observation less and one new one more: it waits, it does not
+  //     grow. They are taken in the sub-updates after the lead only (the lead's pose is the one that is published
+  //     and it used to find none), those that waited longest first, as long as the update stays within R rows with
+  //     the lost ones and the tick has not given R rows of them yet.
+  //   The window-end work of a tick is bounded this way whatever the vehicle does; in cruise flight an update has
+  //   400-450 rows and the cap does not bind. Rows are counted as the update will see them: observations at clone
+  //   times, per camera at most OV_MSCKF_MAX_OBS. Set OV_MSCKF_MAX_OBS with it: a hover brings about
+  //   tracked features x (2 K - 3) / max_clones rows per tick, 650 with 930 features and K = 12 but 1770 without K,
+  //   and with more than R coming in per tick the features are used at a fraction of that rate.
+  _ut.u_lost = (int)feats_lost.size();
+  _ut.u_end = (int)(feats_marg.size() + feats_maxtracks.size());
+  if (row_cap > 0 && !featsup_MSCKF.empty()) {
+    static const int obs_cap = [] { const char *e = std::getenv("OV_MSCKF_MAX_OBS"); return e ? atoi(e) : 0; }();
+    static std::unordered_map<size_t, int> waited; // featid -> sub-updates a window-end feature has waited
+    std::vector<double> ctimes;                    // ascending: _clones_IMU is an ordered map
+    ctimes.reserve(state->_clones_IMU.size());
+    for (const auto &c : state->_clones_IMU)
+      ctimes.push_back(c.first);
+    auto rows_of = [&](const std::shared_ptr<Feature> &f) -> int {
+      int nobs = 0;
+      for (const auto &kv : f->timestamps) {
+        int n = 0;
+        size_t ci = 0;
+        for (double t : kv.second) { // ascending too: the tracker appends
+          while (ci < ctimes.size() && ctimes[ci] < t)
+            ci++;
+          if (ci == ctimes.size())
+            break;
+          if (ctimes[ci] == t)
+            n++;
+        }
+        nobs += (obs_cap >= 2 && n > obs_cap) ? obs_cap : n;
+      }
+      return nobs >= 2 ? 2 * nobs - 3 : 0;
+    };
+    std::unordered_set<Feature *> at_end;
+    for (const auto &f : feats_marg)
+      at_end.insert(f.get());
+    for (const auto &f : feats_maxtracks)
+      at_end.insert(f.get());
+    std::vector<std::shared_ptr<Feature>> keep, cand;
+    int rows = 0;
+    for (size_t i = featsup_MSCKF.size(); i > 0; i--) { // sorted by track length: longest first this way
+      const std::shared_ptr<Feature> &f = featsup_MSCKF[i - 1];
+      if (at_end.count(f.get()) && !lost_any.count(f.get())) {
+        cand.push_back(f);
+        continue;
+      }
+      rows += rows_of(f);
+      keep.push_back(f);
+    }
+    if (!lead_defers) {
+      auto waited_of = [&](const std::shared_ptr<Feature> &f) -> int {
+        auto it = waited.find(f->featid);
+        return it == waited.end() ? 0 : it->second;
+      };
+      std::stable_sort(cand.begin(), cand.end(), [&](const std::shared_ptr<Feature> &a, const std::shared_ptr<Feature> &b) {
+        return waited_of(a) > waited_of(b);
+      });
+      std::unordered_map<size_t, int> still; // only what waits now keeps a count (a track id lives on after its use)
+      for (const std::shared_ptr<Feature> &f : cand) {
+        const int r = rows_of(f);
+        // (a feature that is larger than a whole tick's share is taken when the tick has given nothing yet:
+        //  with a small R it would otherwise wait for ever)
+        if (r > 0 && ((rows > 0 && rows + r > row_cap) || (r > tick_rows_left && tick_rows_left < row_cap))) {
+          still[f->featid] = waited_of(f) + 1;
+          _ut.u_wait++;
+          continue;
+        }
+        rows += r;
+        tick_rows_left -= r;
+        keep.push_back(f);
+      }
+      waited.swap(still);
+    } else {
+      _ut.u_wait = (int)cand.size();
+    }
+    std::sort(keep.begin(), keep.end(), compare_feat);
+    featsup_MSCKF.swap(keep);
+  }
+  // The count caps come after the row cap: before it they would leave only the longest tracks, which are the
+  // waiting window-end features, and a lead would then find nothing it may take.
   if ((int)featsup_MSCKF.size() > msckf_cap)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - msckf_cap);
 
@@ -1673,6 +1831,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
   { VScoped _s("MSCKF update"); {
     _ut.mark(0);
+    _ut.u_used = (int)featsup_MSCKF.size();
+    _ut.u_nslam = (int)state->_features_SLAM.size();
     const auto _tm0 = std::chrono::steady_clock::now();
     if (g_xus.level > 0) XcamUpdStats::count(featsup_MSCKF, g_xus.n[0], g_xus.n[1]);
     updaterMSCKF->update(state, featsup_MSCKF);
