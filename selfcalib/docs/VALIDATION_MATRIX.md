@@ -163,6 +163,8 @@ recoverable constant error on a flight it never saw — mounted-from-A matches o
 best-fit rotation. Confirms §6.2: the offset is constant, not drift.
 
 ## 7. End-to-end driver (`run_tool.py`)
+(Validated before 2026-10-14, when the calibration had neither the matching between cameras nor
+the two lens terms; `--no-matching --no-lens-terms` gives that run.)
 gates → one accumulation pass (circle fit + image health) → leave-one-out fleet seed + own
 circle fit (scenario D, zero own calibration) → warm-start to self-consistency → robust-mean
 publish → diagnosis.

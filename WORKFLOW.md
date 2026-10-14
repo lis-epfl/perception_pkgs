@@ -17,7 +17,10 @@ bash vio/vio_deploy/scripts/build_openvins.sh          # ~6 min → ~/ov_ws_vio
 ```
 
 Both operating points use this one build. Needs Ubuntu 22.04, ROS 2 Humble, and
-`libeigen3-dev libboost-all-dev libceres-dev`.
+`libeigen3-dev libboost-all-dev libceres-dev`. Rebuild after updating the repository: since
+2026-10-14 a calibration matches between cameras and estimates two lens terms by default, which
+needs an estimator built from commit 6bbaf8c on (an older build ignores both, and the run ends
+with a WARNING for each).
 
 ---
 
@@ -62,8 +65,8 @@ usage error exits before that.
 out_myvehicle/
   myvehicle_published_chain.yaml   ← THE CALIBRATION (intrinsics, extrinsics, time offset)
   myvehicle_mount.json             ← mount rotation M, only if ground truth was available
-  myvehicle_published_terms.txt    ← the two lens terms per camera, only after a calibration
-                                   that estimated them; part of the calibration (step 3 needs it)
+  myvehicle_published_terms.txt    ← the two lens terms per camera (written by default; not with
+                                   --no-lens-terms); part of the calibration (step 3 needs it)
   report.json                      verdict + all three certificates + what was detected.
                                    Valid JSON (jq-parseable). Note `diagnosis.ate.postg_m`
                                    is `null` when the recording has fewer than 20
@@ -115,7 +118,7 @@ flight_myvehicle/
                               the lens terms of this calibration (empty if it has none)
   campaign.env                the vehicle's tracker and scheduler switches (from the vio package)
   mount.json                  mount rotation (if solved)
-  lens_terms.env              the lens terms alone (only if the calibration estimated them)
+  lens_terms.env              the lens terms alone (absent if the calibration has none)
   MANIFEST.txt                what each file is, and the exact command to fly it
 ```
 
@@ -161,8 +164,8 @@ online calibration stays tethered to the chain you just deployed. Without it you
 the *calibration* operating point in flight, with loose priors that let the calibration
 random-walk. Source the copy in the flight folder: it also carries the lens terms of that
 calibration. Check with `env | grep OV_PRIOR` — flying should print six variables. Before a
-calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` should print nothing, or exactly your
-own exports for a calibration with matching and lens terms.
+calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` should print nothing, or only switches
+you set on purpose: since 2026-10-14 the calibration sets the matching and the lens terms itself.
 
 Since 2026-10-09 the same file keeps two lens terms per camera as calibration states in
 flight and matches features between neighbouring cameras. What that changes, measured on the

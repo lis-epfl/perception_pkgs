@@ -55,7 +55,7 @@ set, makes the two lens terms per camera calibration states with that standard d
 | `OV_PRIOR_EXTR_T_SIG` | cam-IMU translation (m) | 0.015 | 0.0015 |
 | `OV_PRIOR_INTR_F_SIG` | intrinsics fx/fy/cx/cy (px) | 1.0 | 0.1 |
 | `OV_PRIOR_INTR_D_SIG` | distortion coefficients | 0.005 | 0.0005 |
-| `OV_PRIOR_NONRAD_SIG` | two lens terms per camera | not states (0.002 in a calibration that estimates them) | 0.0002 |
+| `OV_PRIOR_NONRAD_SIG` | two lens terms per camera | not states (a calibration by `selfcalib` sets 0.002) | 0.0002 |
 
 The same file switches on what flight has had since 2026-10-09 (next section): the lens terms
 as states (the sixth row, with `OV_NONRAD_SKEW_FIXED=1`) and the matching of features between
@@ -66,12 +66,13 @@ The tightened priors tether the online calibration to its published chain. With 
 priors of the first rows, the flight settings until 2026-10-08, this pair (uniform, no
 per-vehicle tuning) produced 2.4–4.5 cm SE(3) ATE across an 11-flight, 3-vehicle benchmark.
 
-**Calibration** — `selfcalib/configs/estimator_calib.yaml` with the variables of
-`flight_stiffness.env` **unset**. `selfcalib` never sets them. Loose priors keep the
-calibration states mobile so the warm-start iterations can converge away from the seed. (The
-one exception is the optional calibration with matching and lens terms of
-`../selfcalib/README.md`: there the caller exports `OV_XCAM=1`, `OV_XCAM_PRESET=rt`,
-`OV_NONRAD_SKEW_FIXED=1` and the calibration value `OV_PRIOR_NONRAD_SIG=0.002`.)
+**Calibration** — `selfcalib/configs/estimator_calib.yaml` with the flight priors of
+`flight_stiffness.env` **unset**. Loose priors keep the calibration states mobile so the
+warm-start iterations can converge away from the seed. Since 2026-10-14 `selfcalib` sets the
+matching and the lens terms itself, at calibration values: `OV_XCAM=1`, `OV_XCAM_PRESET=rt`,
+`OV_NONRAD_SKEW_FIXED=1`, `OV_PRIOR_NONRAD_SIG=0.002` (ten times the flight value) and, on a
+desktop, `OV_GROUP_CAMS=1`; `--no-matching` and `--no-lens-terms` switch them off
+(`../selfcalib/README.md`).
 
 The per-vehicle flight folder is produced by the self-calibration package, not written by
 hand — `selfcalib/tool/deploy_vio.py` copies this config next to the calibrated chains under
@@ -107,8 +108,8 @@ Rule of thumb: **calibrating → flight settings unset; flying → source them.*
 `run_serial.sh` passes your shell environment through, so check
 `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` if a run behaves oddly — flight priors leaking
 into a calibration run pin the calibration at its seed. `run_tool.py` takes the flight
-settings out of its own calibration passes and says so; `run_serial.sh` used directly does
-not.
+priors out of its own calibration passes, puts the lens-term prior back to the calibration
+value, and says so; `run_serial.sh` used directly does not.
 
 `run_serial.sh` exit codes: `64` usage/bad DOMAIN · `66` missing bag or config · `69` missing
 ROS or workspace · `70` ran but produced no trajectory · otherwise the estimator's own code.
@@ -116,7 +117,7 @@ ROS or workspace · `70` ran but produced no trajectory · otherwise the estimat
 ## Matching and lens terms in flight
 
 Since 2026-10-09 `flight_stiffness.env` switches on two additions of the estimator in flight.
-Until then only an optional calibration used them (next section).
+Until then only a calibration that asked for them used them (next section).
 
 | lines of `flight_stiffness.env` | what flight does |
 |---|---|
@@ -124,8 +125,8 @@ Until then only an optional calibration used them (next section).
 | `OV_PRIOR_NONRAD_SIG=0.0002`, `OV_NONRAD_SKEW_FIXED=1` | The two lens terms per camera stay calibration states, with a prior ten times narrower than in a calibration. The third term is held. |
 
 The lens terms start at the values of the calibration (`OV_NONRADIAL`, the last line of the
-flight folder's copy of `flight_stiffness.env`), or at zero when the calibration has none,
-which is the case for the default run of `selfcalib`.
+flight folder's copy of `flight_stiffness.env`). They start at zero when the calibration has
+none: one made with `--no-lens-terms`, or by `selfcalib` before 2026-10-14.
 
 The matching runs where the four images of an instant reach the tracker as one set:
 `run_online_msckf`, and a replay with `OV_GROUP_CAMS=1` (`campaign.env` sets it on the
@@ -150,11 +151,11 @@ at the end of the flight, 0 mm being a perfect square.
 | | flight settings until 2026-10-08 | with both on |
 |---|---|---|
 | replay, tracking error, calibrations with lens terms, 6 flights | 2.8–4.2 cm, median 3.8 | 2.4–5.3 cm, median 3.6 |
-| replay, tracking error, default calibrations (no lens terms), 3 flights | 4.3, 3.0, 3.0 cm | 2.9, 2.8, 3.9 cm |
+| replay, tracking error, calibrations without lens terms (the tool's default until 2026-10-13), 3 flights | 4.3, 3.0, 3.0 cm | 2.9, 2.8, 3.9 cm |
 | replay, longest minus shortest side, calibrations with lens terms | 3.2–6.0 mm, median 4.1 | 0.6–5.3 mm, median 2.0 |
-| replay, longest minus shortest side, default calibrations | 31, 15, 35 mm | 5.2, 2.0, 6.4 mm |
+| replay, longest minus shortest side, calibrations without lens terms | 31, 15, 35 mm | 5.2, 2.0, 6.4 mm |
 | live node, tracking error, calibrations with lens terms, 3 flights | 3.3, 2.9, 3.8 cm | 4.2, 2.7, 4.5 cm |
-| live node, tracking error, default calibrations, the same 3 flights | 3.0, 2.6, 3.4 cm | 5.7, 2.6, 3.3 cm |
+| live node, tracking error, calibrations without lens terms, the same 3 flights | 3.0, 2.6, 3.4 cm | 5.7, 2.6, 3.3 cm |
 | live node, the first of these runs once more | 2.6 cm | 2.9 cm |
 | live node, time of the feed thread per set of four images (decoding, tracking, matching; the filter update runs on a second thread): mean (99th percentile) | 14.0–14.2 ms (20–25) | 16.7–17.4 ms (28–31) |
 
@@ -164,7 +165,7 @@ values list the same three flights in the same order.
 
 In the replays tracking does not change beyond the scatter between flights: per flight, both
 on minus the earlier settings, it changes by −1.5 to +1.0 cm, with a median of −0.03 cm over
-the six flights and −0.2 cm over the three with default calibrations.
+the six flights and −0.2 cm over the three with calibrations without lens terms.
 
 In the live node the matching costs accuracy. Each addition was also run alone on the three
 flights with lens-term calibrations: the lens terms as states alone gave 4.0, 2.7, 3.7 cm
@@ -178,7 +179,7 @@ the file.
 
 What changes for the better is the camera geometry that the estimator carries during the
 flight. With a calibration that has lens terms the sides of the square are closer to equal at
-the end of five of the six flights. With a default calibration, whose square has sides 15–35 mm
+the end of five of the six flights. With a calibration without lens terms, whose square has sides 15–35 mm
 apart, they come to within 2–6 mm during the flight.
 
 A set of images costs the feed thread about 3 ms more, all of it from the matching, whose own
@@ -200,12 +201,12 @@ To fly as before 2026-10-09, unset the four variables after sourcing the file
 `OV_NONRADIAL` are then fixed values again. An estimator built before commit 6bbaf8c has
 neither addition and ignores the four variables.
 
-## Optional calibration switches
+## Calibration switches
 
 Three additions, read from the environment. All are off when unset, and the estimator's
 output is then byte-identical to the build without them (checked on a desktop and on the
-Orin NX). Flight sets the first three rows (section above); a calibration uses them only when
-the caller exports them.
+Orin NX). Flight sets the first three rows (section above); since 2026-10-14 a calibration by
+`selfcalib` sets them too, unless switched off (`--no-matching`, `--no-lens-terms`).
 
 | env var | what it does | tested value in a calibration |
 |---|---|---|

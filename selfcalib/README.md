@@ -59,6 +59,10 @@ The estimator belongs to the sibling package:
 bash ../vio/vio_deploy/scripts/build_openvins.sh     # ~6 min → ~/ov_ws_vio
 ```
 
+Rebuild after updating the repository: since 2026-10-14 a calibration matches between cameras
+and estimates two lens terms by default, which needs an estimator built from commit 6bbaf8c on
+(an older build ignores both, and the run ends with a WARNING for each).
+
 This package locates `vio/` via `--vio-root`, then `$VIO_ROOT`, then the sibling `../vio`.
 Side-by-side needs no configuration; `run_tool.py` prints the runner it resolved on startup
 and fails with an explicit message listing all three candidates if it finds none.
@@ -169,6 +173,7 @@ python3 tool/run_tool.py \
     [--image-after-takeoff S]     # the image pass stops this long after takeoff (default 30; 0 = whole window)
     [--image-processes N]         # processes of the image pass (default one per camera)
     [--min-still S]               # standstill the recording must begin with (default 6)
+    [--no-matching] [--no-lens-terms]   # without the matching / the two lens terms (both: the default before 2026-10-14)
     [--max-pass 16] [--domain 70]
 ```
 
@@ -188,7 +193,8 @@ length, 0.002 mean distortion, 0.7° rotation, 5 cm translation, 12 ms t_d; at m
 
 Runtime: roughly (bag length) × (passes) × 1–2× real time, single machine, no GPU.
 
-**Outputs**: `--out/<drone>_published_chain.yaml` (the calibration), `--out/report.json`
+**Outputs**: `--out/<drone>_published_chain.yaml` (the calibration), `--out/<drone>_published_terms.txt`
+(its two lens terms per camera, part of the calibration; absent with `--no-lens-terms`), `--out/report.json`
 (diagnosis + certificates — valid JSON; `diagnosis.ate.postg_m` is `null` when the recording
 has under 20 post-takeoff poses, and the certificate falls back to `global_m`), per-pass
 harvests and logs. With ground truth, also
@@ -215,26 +221,41 @@ within `--max-pass` passes (`FLY-AGAIN`) · `3` `--gt` file missing · `4` an es
 `--out/calib/out/run.log`) · `6` `OV_PRIOR_NONRAD_SIG` in the environment is not a number (no
 `report.json`). Every other non-zero code also writes `report.json` with the reason.
 
-### Optional: a calibration that is also right for stereo depth
+### Matching between cameras and lens terms (on by default)
 
-The default run gives a calibration that tracks well. It can still leave the cameras several
-millimetres from where they sit relative to each other, which tracking does not notice and
-stereo depth does. Two additions to the estimator correct this. Both are off by default in a
-calibration (flight has both on, see `../vio/README.md`); switch them on in the environment
-of the run, and use about a minute of flight:
+A calibration without them tracks well but can leave the cameras several millimetres from
+where they sit relative to each other, which tracking does not notice and stereo depth does.
+Two additions to the estimator correct this, and flight has had both since 2026-10-09
+(`../vio/README.md`). Since 2026-10-14 a calibration run has them too by default: the tool
+sets, in the environment of its passes, whatever of these you have not set yourself:
 
 ```bash
-export OV_XCAM=1 OV_XCAM_PRESET=rt                        # match features between neighbouring cameras
-export OV_PRIOR_NONRAD_SIG=0.002 OV_NONRAD_SKEW_FIXED=1   # estimate two more lens terms per camera
-export OV_GROUP_CAMS=1            # on a desktop only; on the vehicle campaign.env already sets it
-python3 tool/run_tool.py ... --after-takeoff 60
+OV_XCAM=1 OV_XCAM_PRESET=rt                        # match features between neighbouring cameras
+OV_PRIOR_NONRAD_SIG=0.002 OV_NONRAD_SKEW_FIXED=1   # two more lens terms per camera as states
+OV_GROUP_CAMS=1                                    # with the matching only: the four images as one set (campaign.env sets it on the vehicle)
 ```
 
-Measured with this tool on the flight computer (60 s after takeoff): the four optical centres
-come out 0.5 and 0.9 mm off a square on two vehicles, against 27 and 7 mm with the default run,
-and stereo depth at 2-9 m is biased by about 1 % (six recordings, three vehicles). Tracking error
-does not change. About 50 s of flight are needed (the default 20 s are not enough), and the run
-takes about 1.8 minutes instead of 0.8. `../vio/README.md` lists the switches.
+`--no-matching` and `--no-lens-terms` switch them off; with both, a run in a shell that sets
+none of these variables is the default run of the tool before 2026-10-14. Exporting
+`OV_XCAM=0` or `OV_PRIOR_NONRAD_SIG=0` does the same (an empty value counts as unset), and a
+positive `OV_PRIOR_NONRAD_SIG` of your own replaces 0.002. With `--calib-stereo true` the
+cameras cannot be grouped, so the passes do not match. The lens terms exist for
+Kannala-Brandt (`equidistant`) cameras only: with any other model in `--template` they stay
+off and the log says why. An estimator built before commit 6bbaf8c ignores both; the run then
+ends with a WARNING for each. The log says what the passes ran with
+(`calibration passes: matching between cameras ON, lens terms estimated with prior 0.002,
+starting at zero`), and so does `report.json` (`calib_passes`).
+
+Measured with this tool on the flight computer, 60 s after takeoff: with both, the four
+optical centres come out 0.5 and 0.9 mm off a square on two vehicles; without them 12 and 6 mm
+with the same 60 s, and 28 and 9 mm with the default 20 s. Stereo depth at 2-9 m is then
+biased by about 1 % (six recordings, three vehicles). Tracking error does not change. With the
+default 20 s the run still stops after two passes, and the optical centres already come out
+closer to a square (3 mm off on both vehicles, against 28 and 9 mm without them). The angles
+between the cameras, and with them stereo depth, need about 50 s of flight: use
+`--after-takeoff 60` or more for a calibration that stereo depth relies on. With both on, a
+run on the flight computer takes about 50 s with the default 20 s and about 105 s with
+`--after-takeoff 60`. `../vio/README.md` lists the switches.
 
 The two lens terms are not in the chain file, which has no field for them. The run writes them
 to `--out/<drone>_published_terms.txt`, and `deploy_vio.py` puts them into the flight folder
@@ -302,7 +323,7 @@ accumulated drift.
 ## 6. Reading the verdict
 
 - `HEALTHY` — calibration self-consistent, in fleet distribution, (ATE healthy if GT given).
-  Deploy `<drone>_published_chain.yaml`.
+  Deploy it with `tool/deploy_vio.py`, which takes the chain and its lens terms together.
 - `FLY-AGAIN` — the recording, not the vehicle, was inadequate (gate details say which
   gate); record another ordinary flight and rerun.
 - `HARDWARE-CHANGED` — converged cleanly but off the fleet distribution: the vehicle really
@@ -330,28 +351,30 @@ near-limit oscillation without convergence (envelope fitted on too few settled p
 ## Calibration mode vs flight mode
 
 The estimator is one binary with two operating points, and this package only ever drives the
-**calibration** one: `configs/estimator_calib.yaml` with `OV_PRIOR_*` **unset**. Loose stock
+**calibration** one: `configs/estimator_calib.yaml` with the flight priors **unset**. Loose stock
 priors leave the calibration states mobile so the warm-start iterations can converge away
 from the seed.
 
 Flight mode — `estimator_flight.yaml` and `flight_stiffness.env` (the tightened priors and,
 since 2026-10-09, the two lens terms as states and the matching between cameras) — lives in
-the `vio/` package and is documented in `../vio/README.md`. The calibration passes of this
-package have neither of the two unless you export them (section above), so the last
-calibration pass is the flight trajectory only up to them. `--frozen-check` adds one pass that
+the `vio/` package and is documented in `../vio/README.md`. Since 2026-10-14 the calibration
+passes of this package have both of the two as well (section above; the lens terms with a ten
+times wider prior), so the last calibration pass differs from the flight trajectory by the
+stiff priors. `--frozen-check` adds one pass that
 runs the published calibration with the flight settings, if the recording has ground truth
 (without it the option does nothing and says so). On the vehicle that pass is the flight
-operating point; on a desktop it runs the CPU tracker and matches between cameras only if you
-export `OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched.
+operating point; on a desktop it runs the CPU tracker, and it matches between cameras where the
+calibration passes did (the tool groups the cameras on a desktop) or when you export
+`OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched.
 
 **This matters operationally:** `run_serial.sh` passes your shell environment through, so
 flight variables leaking into a calibration run silently pin the calibration at its seed.
 The convergence gates will flag the non-convergence, but the root cause is the environment.
 Check with `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` before a calibration run — it should
-print nothing (or exactly your own exports for a calibration with matching and lens terms).
-`run_tool.py` guards its own passes: it unsets the flight priors, the flight value of the
-lens-term prior, the matching when it came with the flight settings, and an `OV_NONRADIAL`
-left in the shell by a flight folder or another calibration, each with a WARNING, and lists
-them in `report.json` (`calib_passes`). `OV_NONRADIAL` is kept in one case only: you export a
-calibration lens prior in a shell without flight settings, and pass 1 then starts from it
-(the log says so).
+print nothing, or only switches you set on purpose (the tool sets the matching and the lens
+terms itself). `run_tool.py` guards its own passes: it unsets the flight priors, replaces the
+flight value of the lens-term prior by the calibration value 0.002, and unsets an
+`OV_NONRADIAL` left in the shell by a flight folder or another calibration, each with a
+WARNING, and lists them in `report.json` (`calib_passes`). `OV_NONRADIAL` is kept in one case only: you export a
+calibration lens prior of your own (for example `OV_PRIOR_NONRAD_SIG=0.002`) in a shell without
+flight settings, and pass 1 then starts from it (the log says so).

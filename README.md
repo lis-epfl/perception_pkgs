@@ -15,7 +15,7 @@ and the environment variables of `flight_stiffness.env`, not the code:
 | | config | calibration priors |
 |---|---|---|
 | **flight** (in `vio/`) | `vio_deploy/config/estimator_flight.yaml` + `flight_stiffness.env` | tethered (x0.10) — the online calibration can absorb a small per-flight offset but cannot random-walk. Since 2026-10-09 the same file also keeps two lens terms per camera as states and matches features between neighbouring cameras (`vio/README.md`) |
-| **calibration** (in `selfcalib/`) | `configs/estimator_calib.yaml`, `OV_PRIOR_*` unset | loose (stock) — the states must be mobile enough for the warm-start iterations to converge |
+| **calibration** (in `selfcalib/`) | `configs/estimator_calib.yaml`, flight priors unset | loose (stock) — the states must be mobile enough for the warm-start iterations to converge. Since 2026-10-14 the calibration also matches between cameras and keeps the two lens terms as states (prior 0.002; `selfcalib/README.md`) |
 
 Keeping the estimator in one place is the point. If each package carried its own copy they
 would drift, and the day they drift is the day a calibration produced by one version gets
@@ -44,6 +44,7 @@ selfcalib/
 
 ```bash
 # 0. build the estimator once — both operating points use this one build
+#    (rebuild after updating: the calibration's default matching and lens terms need commit 6bbaf8c or later)
 bash vio/vio_deploy/scripts/build_openvins.sh              # ~6 min
 
 # 1. calibrate from an ordinary flight recording (no target, no manual session)

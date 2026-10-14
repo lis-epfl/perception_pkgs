@@ -99,6 +99,9 @@ what the estimator computes, because it produces the same machine code.**
 
 ### Full-pipeline reproduction
 
+(Made with the tool of that time. Since 2026-10-14 the calibration matches between cameras and
+estimates two lens terms by default: repeating this takes `--no-matching --no-lens-terms`.)
+
 `run_tool.py` from this package on the nxt3 basin bag (185 s, 4 cameras), against the study
 package's recorded run in `e2e_test_nxt3/`:
 

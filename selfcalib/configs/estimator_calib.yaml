@@ -4,12 +4,13 @@
 # vio_deploy/config/estimator_flight.yaml -- keep it that way; the warm-start loop and flight
 # share one estimator operating point, which is what lets the frozen certification pass be
 # skipped (the settled-parent pass IS the deployment trajectory).
-# Since 2026-10-09 flight adds two things through flight_stiffness.env that the default
-# calibration passes do not have: the two lens terms per camera as states and the matching of
-# features between neighbouring cameras. The settled pass then differs from the deployment
-# trajectory by the stiff priors and by those two (what they change: vio/README.md, "Matching
-# and lens terms in flight"). --frozen-check adds a pass with the flight settings: exactly on
-# the vehicle; on a desktop the CPU tracker, and the matching only with OV_GROUP_CAMS=1.
+# Since 2026-10-09 flight adds two things through flight_stiffness.env: the two lens terms per
+# camera as states and the matching of features between neighbouring cameras. Since 2026-10-14
+# the calibration passes have both too (run_tool.py sets them; --no-lens-terms, --no-matching),
+# the lens terms with a ten times wider prior. The settled pass then differs from the deployment
+# trajectory by the stiff priors (what the two change: vio/README.md, "Matching and lens terms
+# in flight"). --frozen-check adds a pass with the flight settings: exactly on the vehicle; on a
+# desktop the CPU tracker, matching where the calibration passes matched.
 #
 # CAMPAIGN OPERATING POINT (Sep 2026). Every quoted fleet number came from this yaml: raw VIO
 # fleet POSTG 3.50 cm (deterministic serial oracle) / 3.57 cm (online, 3 draws), online
@@ -30,7 +31,7 @@
 # (uniform settings, no per-vehicle or per-flight tuning).
 # USE WITH configs/flight_stiffness.env sourced into the environment — the
 # tightened calibration priors are half of what makes this config work.
-# For CALIBRATION runs use configs/estimator_calib.yaml with OV_PRIOR_* UNSET.
+# For CALIBRATION runs use configs/estimator_calib.yaml with the flight priors UNSET.
 # See README section "Two configurations: calibration mode vs flight mode".
 # ============================================================================
 

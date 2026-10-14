@@ -35,8 +35,9 @@ flight (ยง4.5 floor); clean lenses (image gate); sane timestamps (timing gate โ€
 predicts the PLATFORM-DEFECT diagnosis, not a calibration failure).
 
 Outputs in `--out`: `report.json` (gates, circle fit, passes, diagnosis, verdict),
-`<drone>_published_chain.yaml` (deployable robust-mean calibration), per-pass harvests and
-trajectory estimates.
+`<drone>_published_chain.yaml` (deployable robust-mean calibration), `<drone>_published_terms.txt`
+(its two lens terms per camera, part of the calibration; absent with `--no-lens-terms`), per-pass
+harvests and trajectory estimates.
 
 ## Fleet reference data used
 `cal/{nxt3,nxt6,nxt10}/theta_star.yaml` (fixed points), `td_center.json` (rig-global toff

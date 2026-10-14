@@ -9,7 +9,8 @@ all of it. The image pass (image-center prior, image check) reads this data up t
 (--image-after-takeoff). Stopping rule (paper Sec. IV): at pass k >= 2, stop when no parameter type (principal
 point, focal length, mean distortion, rotation, translation, t_d) moved by more than twice the
 full-flight envelope since pass k-1; at most --max-pass (16) passes. The published calibration is
-that last pass.
+that last pass. Since 2026-10-14 the passes match features between neighbouring cameras and
+estimate two more lens terms per camera by default (--no-matching, --no-lens-terms).
 
 Usage:
   python3 run_tool.py --drone nxt3 --bag bags/nxt3_raw_4cam_basin \
@@ -146,9 +147,13 @@ def _config_wants_series(cfg_path):
 
 # What flight adds to the calibration operating point is all in vio_deploy/config/flight_stiffness.env: narrower priors
 # (OV_PRIOR_*), the two lens terms as states at the flight prior, and the matching between cameras (FLIGHT_MATCHING). The
-# calibration passes get none of it. A calibration matches between cameras or estimates lens terms only when the caller asks
-# for it (README, "a calibration that is also right for stereo depth").
+# calibration passes get none of the flight priors. Since 2026-10-14 they match between cameras and estimate the two lens
+# terms by default, at the calibration's own values (CALIB_MATCHING, CALIB_LENS); --no-matching and --no-lens-terms switch
+# them off, and so does a value the caller exports (OV_XCAM=0, OV_PRIOR_NONRAD_SIG=0). README, "Matching between cameras
+# and lens terms".
 FLIGHT_MATCHING = ('OV_XCAM', 'OV_XCAM_PRESET')
+CALIB_MATCHING = (('OV_XCAM', '1'), ('OV_XCAM_PRESET', 'rt'))
+CALIB_LENS = (('OV_PRIOR_NONRAD_SIG', '0.002'), ('OV_NONRAD_SKEW_FIXED', '1'))
 
 
 def _env_file(path):
@@ -188,28 +193,40 @@ def _flight_settings(vio_root):
     return _number(fl.get('OV_PRIOR_NONRAD_SIG')), [(k, v) for k, v in fl.items() if not k.startswith('OV_PRIOR')]
 
 
-def _calib_pass_env(environ, campaign, flight_sig, flight_rest=()):
-    """Environment of the calibration passes: the caller's environment and the campaign switches, without what belongs to flight.
+def _calib_pass_env(environ, campaign, flight_sig, flight_rest=(), lens=True, matching=True, group=True,
+                    lens_why='--no-lens-terms'):
+    """Environment of the calibration passes: the caller's environment, the calibration's own switches and the campaign
+    switches, without what belongs to flight.
 
     environ      the caller's environment
     campaign     what _campaign_env() returned (switches of campaign.env the caller has not set; empty off the vehicle)
     flight_sig   OV_PRIOR_NONRAD_SIG of flight_stiffness.env (None if unknown)
     flight_rest  the lines of flight_stiffness.env that are not priors, as (name, value)
+    lens         False: the passes estimate no lens terms (--no-lens-terms, or a camera model without them: lens_why says
+                 which, for the warnings)
+    matching     False (--no-matching): the passes do not match between cameras
+    group        False when the passes run stereo (--calib-stereo true), where the cameras cannot be grouped
     Returns (env, lens_sig, warnings, unset): lens_sig is the OV_PRIOR_NONRAD_SIG the passes run with (None = they estimate
-    no lens terms), warnings the lines to print, unset the names taken out of the caller's environment. Raises ValueError
-    when OV_PRIOR_NONRAD_SIG is set to something that is not a number.
+    no lens terms), warnings the lines to print, unset the names taken out of the caller's environment (a flight lens prior
+    that the calibration value replaces is not in it). Raises ValueError when OV_PRIOR_NONRAD_SIG is set to something that
+    is not a number and the passes estimate the lens terms.
 
+    Lens terms (default ON): OV_PRIOR_NONRAD_SIG = 0.002 and OV_NONRAD_SKEW_FIXED = 1 unless the caller set them. A positive
+    value the caller exports is kept; zero or below switches the lens terms off (an empty value counts as unset). The
+    FLIGHT value is never the caller's choice for a calibration (the number of flight_stiffness.env, or any value below
+    0.001 that arrives together with the other flight priors): it is replaced by 0.002.
+    Matching (default ON for mono passes): OV_XCAM = 1 and OV_XCAM_PRESET = rt unless the caller set them; OV_XCAM set to
+    anything that does not start with 1 switches it off. It runs only where the four images reach the estimator as one set:
+    OV_GROUP_CAMS = 1 is added when the caller and campaign.env leave it unset and the passes run mono.
     Taken out:
-      - every OV_PRIOR_* of the flight stiffness. One prior a calibration may be given on purpose, OV_PRIOR_NONRAD_SIG: a
-        value above zero makes the passes estimate the lens terms (0.002). The FLIGHT value is never on purpose: the number
-        of flight_stiffness.env, or any value below 0.001 that arrives together with the other flight priors.
-      - the matching between cameras, when the shell carries the flight settings and no lens prior of its own: then OV_XCAM
-        came with flight_stiffness.env. The shell carries the flight settings when a flight prior is in it, or when no lens
-        prior is exported and every other line of flight_stiffness.env is there (the priors may have been unset by hand).
-        Exported in any other shell the matching is the caller's choice and stays.
-      - OV_NONRADIAL (lens terms as given values). It stays only as the start of pass 1 of a run that estimates the lens
-        terms, in a shell without flight settings. A run that publishes a chain without lens terms must not have fitted it
-        around those of another calibration.
+      - every OV_PRIOR_* of the flight stiffness (they would pin the calibration at its seed).
+      - when the lens terms are off, OV_PRIOR_NONRAD_SIG; with --no-matching, OV_XCAM and OV_XCAM_PRESET; in stereo, the
+        matching that came with the flight settings.
+      - OV_NONRADIAL (lens terms as given values). It stays only as the start of pass 1 when the caller exported a
+        calibration lens prior of their own, in a shell without flight settings. Anything else is taken to be left over
+        from a flight folder (its flight_stiffness.env or lens_terms.env) or another calibration, and a calibration must
+        not be fitted around the lens terms of another one. The shell carries the flight settings when a flight prior is
+        in it, or when no lens prior is exported and every other line of flight_stiffness.env is there.
     """
     env = {k: v for k, v in environ.items() if not k.startswith('OV_PRIOR')}
     warnings, unset = [], []
@@ -219,38 +236,60 @@ def _calib_pass_env(environ, campaign, flight_sig, flight_rest=()):
         warnings.append('%s set in the environment — these tether the calibration to its seed. '
                         'Unsetting for the warm-start passes.' % ','.join(leaked))
     raw = environ.get('OV_PRIOR_NONRAD_SIG')
-    lens_sig = None
+    default_sig = dict(CALIB_LENS)['OV_PRIOR_NONRAD_SIG']
+    lens_sig, flight_lens, own_sig = None, False, False
     if raw is not None and raw.strip():
         val = _number(raw)
+        if val is None and lens:
+            raise ValueError('OV_PRIOR_NONRAD_SIG=%r is not a number. Unset it (the calibration estimates the lens terms with '
+                             '%s by default), or export 0 or pass --no-lens-terms for a calibration without lens terms.'
+                             % (raw, default_sig))
         if val is None:
-            raise ValueError('OV_PRIOR_NONRAD_SIG=%r is not a number. Unset it for a calibration without lens terms, or '
-                             'export 0.002 to estimate them.' % raw)
-        if (flight_sig is not None and abs(val - flight_sig) <= 1e-12) or (leaked and 0.0 < val < 0.001):
             unset.append('OV_PRIOR_NONRAD_SIG')
-            warnings.append('OV_PRIOR_NONRAD_SIG=%s in the environment is a FLIGHT value (flight_stiffness.env). Unset for the '
-                            'calibration passes, which therefore estimate no lens terms. To calibrate with lens terms, export '
-                            'OV_PRIOR_NONRAD_SIG=0.002 in a clean shell.' % raw.strip())
+            warnings.append('OV_PRIOR_NONRAD_SIG=%r in the environment is not a number; unset for the calibration passes, '
+                            'which estimate no lens terms (%s).' % (raw, lens_why))
+        elif (flight_sig is not None and abs(val - flight_sig) <= 1e-12) or (leaked and 0.0 < val < 0.001):
+            flight_lens = True
+            if lens:
+                lens_sig = default_sig
+                warnings.append('OV_PRIOR_NONRAD_SIG=%s in the environment is a FLIGHT value (flight_stiffness.env). The '
+                                'calibration passes estimate the lens terms with the calibration value %s instead.'
+                                % (raw.strip(), default_sig))
+            else:
+                unset.append('OV_PRIOR_NONRAD_SIG')
+                warnings.append('OV_PRIOR_NONRAD_SIG=%s in the environment is a FLIGHT value (flight_stiffness.env). Unset '
+                                'for the calibration passes, which estimate no lens terms (%s).' % (raw.strip(), lens_why))
         elif val > 0.0:
-            lens_sig = raw.strip()          # zero or below: the estimator holds the terms, the same as unset
-    by_lines = raw is None and bool(flight_rest) and all(environ.get(k) == v for k, v in flight_rest)
-    flight_shell = bool(unset) or by_lines
+            if lens:
+                lens_sig, own_sig = raw.strip(), True
+            else:
+                unset.append('OV_PRIOR_NONRAD_SIG')
+                warnings.append('OV_PRIOR_NONRAD_SIG=%s in the environment, but the calibration passes estimate no lens '
+                                'terms (%s): unset for them.' % (raw.strip(), lens_why))
+        # zero or below: the caller switched the lens terms off; the estimator then holds them, the same as unset
+    elif lens:
+        lens_sig = default_sig
     if lens_sig is not None:
         env['OV_PRIOR_NONRAD_SIG'] = lens_sig
-    if environ.get('OV_XCAM', '')[:1] == '1' and flight_shell and lens_sig is None:
+        for k, v in CALIB_LENS:
+            env.setdefault(k, v)
+    by_lines = raw is None and bool(flight_rest) and all(environ.get(k) == v for k, v in flight_rest)
+    flight_shell = bool(leaked) or flight_lens or by_lines
+    gone = []
+    if not matching or (not group and flight_shell):
         gone = [k for k in FLIGHT_MATCHING if k in env]
         for k in gone:
             del env[k]
-        if unset:
-            warnings.append('%s set in the environment together with flight priors: taken to come from flight_stiffness.env. '
-                            'Unset for the calibration passes, which therefore do not match between cameras. To calibrate with '
-                            'the matching, export it in a clean shell.' % ','.join(gone))
-        else:
-            warnings.append('%s are set exactly as flight_stiffness.env sets them, and no lens prior is exported: taken to come '
-                            'from that file. %s unset for the calibration passes, which therefore do not match between cameras. '
-                            'If you exported the matching yourself, unset OV_NONRAD_SKEW_FIXED (it does nothing without a lens '
-                            'prior) and run again.' % (', '.join(k for k, _ in flight_rest), ','.join(gone)))
         unset += gone
-    if 'OV_NONRADIAL' in env and (lens_sig is None or flight_shell):
+        if gone and not matching:
+            warnings.append('%s in the environment, but --no-matching: unset for the calibration passes.' % ','.join(gone))
+    elif group and not env.get('OV_XCAM', '').strip():
+        env['OV_XCAM'] = dict(CALIB_MATCHING)['OV_XCAM']      # stereo passes cannot group the cameras: no default there
+    if env.get('OV_XCAM', '')[:1] == '1':
+        env.setdefault('OV_XCAM_PRESET', dict(CALIB_MATCHING)['OV_XCAM_PRESET'])
+        if group and 'OV_GROUP_CAMS' not in env and 'OV_GROUP_CAMS' not in campaign:
+            env['OV_GROUP_CAMS'] = '1'      # the matching needs the four images as one set (campaign.env sets it on the vehicle)
+    if 'OV_NONRADIAL' in env and (not own_sig or flight_shell):
         if env['OV_NONRADIAL'].strip():
             unset.append('OV_NONRADIAL')
             warnings.append('OV_NONRADIAL is set in the environment, but this run estimates no lens terms. Unset for the '
@@ -258,7 +297,12 @@ def _calib_pass_env(environ, campaign, flight_sig, flight_rest=()):
                             'those of another calibration.' if lens_sig is None else
                             'OV_NONRADIAL is set in the environment together with flight settings: taken to come from a '
                             'flight folder. Unset for the calibration passes, which start the lens terms at zero. To start '
-                            'them from given values, export OV_NONRADIAL in a clean shell.')
+                            'them from given values, export OV_NONRADIAL together with OV_PRIOR_NONRAD_SIG=0.002 in a '
+                            'clean shell.' if flight_shell else
+                            'OV_NONRADIAL is set in the environment, but no lens prior is exported: taken to be left over '
+                            'from a flight folder (its lens_terms.env) or another calibration. Unset for the calibration '
+                            'passes, which start the lens terms at zero. To start them from given values, export '
+                            'OV_NONRADIAL together with OV_PRIOR_NONRAD_SIG=0.002 in a clean shell.')
         del env['OV_NONRADIAL']
     env.update(campaign)
     return env, lens_sig, warnings, unset
@@ -275,16 +319,19 @@ def _matched_sets(run_log):
     return int(hits[-1]) if hits else 0
 
 
-def _flight_check_env(vio_root, a, nonradial=None):
+def _flight_check_env(vio_root, a, nonradial=None, group=False):
     """Environment of the flight check: the caller's, plus campaign.env on the vehicle, plus every line of
     flight_stiffness.env. The lens terms it starts from are those of THIS calibration, or none (zero): never what the
-    caller's shell or a file holds."""
+    caller's shell or a file holds. group: the tool grouped the cameras of the calibration passes itself (a desktop, or
+    --no-campaign-env), so the flight check groups them too and matches as the passes did."""
     env = dict(os.environ)
     env.update(_campaign_env(vio_root, not getattr(a, 'no_campaign_env', False))[0])
     env.update(_env_file(os.path.join(vio_root, 'vio_deploy', 'config', 'flight_stiffness.env')))
     env.pop('OV_NONRADIAL', None)
     if nonradial:
         env['OV_NONRADIAL'] = nonradial
+    if group and env.get('OV_XCAM', '')[:1] == '1':
+        env.setdefault('OV_GROUP_CAMS', '1')
     return env
 
 
@@ -380,7 +427,7 @@ def _redirect_scratch(cfg_txt, dirpath):
     return cfg_txt
 
 
-def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s, nonradial=None):
+def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s, nonradial=None, group=False):
     """Run the published calibration under the FLIGHT config, exactly as it will be deployed.
 
     This is what the ATE certificate must measure. The warm-start passes run the
@@ -420,7 +467,7 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     shutil.copy(a.imu_chain, f'{outdir}/kalibr_imu_chain.yaml')
     shutil.copy(published_chain, f'{outdir}/kalibr_imucam_chain.yaml')
 
-    env = _flight_check_env(vio_root, a, nonradial)
+    env = _flight_check_env(vio_root, a, nonradial, group)
     bag_arg = ','.join(rec.uris)
     cp = subprocess.run(['bash', run_serial, bag_arg, f'{outdir}/estimator_flight.yaml',
                          f'{outdir}/out', str(ncam), 'false', '42', str(a.domain)],
@@ -456,7 +503,7 @@ def main():
                     help='never look inside the bag for ground truth')
     ap.add_argument('--calib-config', default=None,
                     help="estimator config driving the WARM-START loop. Default 'calib': "
-                         'configs/estimator_calib.yaml with OV_PRIOR_* UNSET. Pass '
+                         'configs/estimator_calib.yaml with the flight priors UNSET. Pass '
                          "'flight' for the untouched flight operating point, or a path. The ATE "
                          'certificate is unaffected -- it always runs flight config + priors.')
     ap.add_argument('--fleet-exclude', default=None)
@@ -469,6 +516,16 @@ def main():
     ap.add_argument('--no-campaign-env', action='store_true',
                     help='do not source vio_deploy/config/campaign.env on aarch64 (CPU tracker, '
                          'different numbers from the campaign)')
+    ap.add_argument('--no-matching', action='store_true',
+                    help='calibration passes without the matching of features between neighbouring cameras '
+                         '(OV_XCAM). The matching is ON by default since 2026-10-14 (README, "Matching between '
+                         'cameras and lens terms"); exporting OV_XCAM=0 does the same.')
+    ap.add_argument('--no-lens-terms', action='store_true',
+                    help='calibration passes without the two lens terms per camera as states '
+                         '(OV_PRIOR_NONRAD_SIG). They are estimated by default since 2026-10-14, with prior 0.002; '
+                         'exporting OV_PRIOR_NONRAD_SIG=0 does the same. Off by itself for a template whose '
+                         'cameras are not Kannala-Brandt. With both switches, a run in a shell that sets none of '
+                         'these variables is the default run of the tool before 2026-10-14.')
     ap.add_argument('--max-pass', type=int, default=16,
                     help='cap on estimator passes (paper: 16). The stopping rule needs at least two.')
     ap.add_argument('--domain', type=int, default=70)
@@ -530,7 +587,8 @@ def main():
                          'static calibration. Turn it on to certify with the flight settings '
                          'exactly: the stiffness priors and, since 2026-10-09, the lens terms as '
                          'states and the matching between cameras (the matching only where the '
-                         'cameras are grouped: on the vehicle, or with OV_GROUP_CAMS=1).')
+                         'cameras are grouped: on the vehicle, on a desktop when the calibration passes '
+                         'matched, or with OV_GROUP_CAMS=1).')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -568,8 +626,17 @@ def main():
     # Guard the documented footgun: flight settings leaking in from the caller's shell. The flight priors would pin the
     # calibration at its seed, and it fails by reporting a suspiciously LOW self-consistency residual rather than by
     # erroring. Done before the gates, so that the warnings come first and every report.json says what the passes ran with.
+    # The two lens terms exist for Kannala-Brandt cameras only (the estimator's other models have no Jacobian for them):
+    # on any other rig the default leaves them off, rather than publishing terms that never moved.
+    _models = sorted(set(re.findall(r'^\s*distortion_model:\s*["\']?(\w+)', open(a.template).read(), re.M)))
+    _lens_why = ('--no-lens-terms' if a.no_lens_terms else None if _models == ['equidistant'] else
+                 'camera model %s: the lens terms exist for Kannala-Brandt (equidistant) cameras only'
+                 % (','.join(_models) or 'not found in --template'))
     try:
-        _pass_env, _lens_sig, _warn, _unset = _calib_pass_env(os.environ, _campaign, *_flight_settings(vio_root))
+        _pass_env, _lens_sig, _warn, _unset = _calib_pass_env(os.environ, _campaign, *_flight_settings(vio_root),
+                                                              lens=_lens_why is None, matching=not a.no_matching,
+                                                              group=a.calib_stereo != 'true',
+                                                              lens_why=_lens_why or '--no-lens-terms')
     except ValueError as e:
         log('ERROR: %s' % e)
         return 6
@@ -579,13 +646,18 @@ def main():
     _xcam = _pass_env.get('OV_XCAM', '')[:1] == '1'
     _matching = _xcam and _pass_env.get('OV_GROUP_CAMS', '')[:1] == '1' and a.calib_stereo != 'true'
     if _xcam and not _matching:
-        log('WARNING: OV_XCAM=1 is set, but the calibration passes will NOT match between cameras: that needs OV_GROUP_CAMS=1 '
-            '(set on the vehicle by campaign.env; export it on a desktop) and --calib-stereo false.')
+        log('WARNING: OV_XCAM=1 is set, but stereo passes (--calib-stereo true) do not match between cameras.'
+            if a.calib_stereo == 'true' else
+            'WARNING: OV_GROUP_CAMS=%s in the environment: the passes get the images one camera at a time and will NOT match '
+            'between cameras. Unset it (the tool then sets 1) or pass --no-matching.' % _pass_env.get('OV_GROUP_CAMS', ''))
+    if _lens_why and not a.no_lens_terms:
+        log('lens terms: off (%s)' % _lens_why)
+    # The tool grouped the cameras itself (a desktop, or --no-campaign-env): the flight check then groups them as well.
+    _tool_grouped = 'OV_GROUP_CAMS' in _pass_env and 'OV_GROUP_CAMS' not in os.environ and 'OV_GROUP_CAMS' not in _campaign
     _start_env = bool(_lens_sig) and bool(_pass_env.get('OV_NONRADIAL', '').strip())
-    if _matching or _lens_sig:
-        log('calibration passes: matching between cameras %s, lens terms %s'
-            % ('ON' if _matching else 'off', ('estimated with prior %s, starting at %s' % (
-                _lens_sig, 'the values of OV_NONRADIAL in the environment' if _start_env else 'zero')) if _lens_sig else 'not estimated'))
+    log('calibration passes: matching between cameras %s, lens terms %s'
+        % ('ON' if _matching else 'off', ('estimated with prior %s, starting at %s' % (
+            _lens_sig, 'the values of OV_NONRADIAL in the environment' if _start_env else 'zero')) if _lens_sig else 'not estimated'))
     report['calib_passes'] = {'matching_between_cameras': _matching, 'lens_terms_prior': float(_lens_sig) if _lens_sig else None,
                               'lens_terms_start': ('environment' if _start_env else 'zero') if _lens_sig else None,
                               'unset_from_environment': _unset}
@@ -746,14 +818,15 @@ def main():
     # The two operating points differ in the estimator internals (max_slam 250 vs 0,
     # num_pts 3000 vs 2000, track_frequency 40 vs 29, chi2 0.7 vs 1.0,
     # init_window_time 3.0 vs 1.0), and the calibration states stay mobile either way
-    # because OV_PRIOR_* is never exported here -- only frozen_pass() exports it.
+    # because the flight priors are never exported here (the passes get only the loose lens-term prior,
+    # OV_PRIOR_NONRAD_SIG=0.002) -- only frozen_pass() exports them.
     # Pass --calib-config flight to run the untouched flight operating point.
     _calib_cfg = f'{OVR}/configs/estimator_calib.yaml'
     if a.calib_config == 'flight':
         _calib_cfg = os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')
     elif a.calib_config and a.calib_config != 'calib':
         _calib_cfg = a.calib_config
-    log('warm-start loop config: %s (OV_PRIOR_* unset, use_stereo=%s)' % (os.path.basename(_calib_cfg), a.calib_stereo))
+    log('warm-start loop config: %s (flight priors unset, use_stereo=%s)' % (os.path.basename(_calib_cfg), a.calib_stereo))
     report['calib_config'] = _calib_cfg
     cfg_txt = open(_calib_cfg).read()
     for key, fname in (('record_timing_filepath', 'traj_timing.txt'),
@@ -854,7 +927,11 @@ def main():
     report['calib_passes']['matched_sets_of_images'] = _sets
     if _matching and _sets == 0:
         log('WARNING: the matching between cameras was asked for, but the estimator matched on no set of images in the last '
-            'pass (an estimator built before the matching was added?).')
+            'pass (an estimator built before commit 6bbaf8c? Rebuild it).')
+    report['calib_passes']['lens_terms_estimated'] = bool(_nonrad) if _lens_sig else None
+    if _lens_sig and not _nonrad:
+        log('WARNING: the lens terms were asked for, but the estimator reported none: the chain is published without them '
+            '(an estimator built before commit 6bbaf8c? Rebuild it).')
     # Falling through without converging used to return here with a bare verdict and no
     # certificates -- on exactly the drone that most needs triage. Carry on to the
     # diagnosis using the last pass, and force the verdict afterwards.
@@ -902,22 +979,23 @@ def main():
     est_cert, cert_kind = est, 'calibration-pass'
     # OFF by default: the last pass ran the flight yaml from a calibration that moved less
     # than two envelopes, so its trajectory is the one the flight stack would produce, up to
-    # what flight_stiffness.env adds: the stiffness priors and, since 2026-10-09, the lens
-    # terms as states and the matching between cameras (the 12-recording comparison above was
-    # made before those two). Turn it on to certify with the flight settings (exactly so on the
-    # vehicle; on a desktop the CPU tracker, and the matching only with OV_GROUP_CAMS=1).
+    # what flight_stiffness.env adds: the stiffness priors, among them the ten times narrower
+    # prior of the lens terms. (Since 2026-10-14 the calibration passes match between cameras and
+    # estimate the lens terms as flight does; the 12-recording comparison above was made with
+    # neither.) Turn it on to certify with the flight settings (exactly so on the vehicle; on a
+    # desktop the CPU tracker, matching where the calibration passes matched).
     frozen = bool(a.frozen_check)
     if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
-            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad)
+            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad, group=_tool_grouped)
             cert_kind = 'frozen-deployment'
-            _fenv = _flight_check_env(vio_root, a, _nonrad)
+            _fenv = _flight_check_env(vio_root, a, _nonrad, _tool_grouped)
             _fsets = _matched_sets(os.path.join(fd, 'out', 'run.log'))
             log('deployment check: flight config + flight_stiffness.env over the same recording (matching between cameras %s)'
                 % (('ON, %d sets of images' % _fsets) if _fsets else
                    'OFF: asked for, but the images reach the estimator one camera at a time here; on the vehicle campaign.env '
-                   'groups them, on a desktop export OV_GROUP_CAMS=1' if _fenv.get('OV_XCAM', '')[:1] == '1' and
+                   'groups them, on a desktop the tool groups them unless --no-matching, or export OV_GROUP_CAMS=1' if _fenv.get('OV_XCAM', '')[:1] == '1' and
                    _fenv.get('OV_GROUP_CAMS', '')[:1] != '1' else 'OFF'))
             report['deploy_check'] = {'matched_sets_of_images': _fsets,
                                       'lens_terms_prior': _number(_fenv.get('OV_PRIOR_NONRAD_SIG')),

@@ -121,7 +121,7 @@ def main():
         raise SystemExit('[deploy] ERROR: IMU chain not found: %s\n'
                          '  (run_tool.py copies the --imu-chain it used to calib/)' % imu)
     mount_json = os.path.join(cal, '%s_mount.json' % drone)
-    # Present only when the calibration ran with OV_PRIOR_NONRAD_SIG: two lens terms per camera,
+    # Present when the calibration ran with OV_PRIOR_NONRAD_SIG (the default since 2026-10-14): two lens terms per camera,
     # which the chain format cannot hold. The estimator reads them from OV_NONRADIAL.
     terms_txt = os.path.join(cal, '%s_published_terms.txt' % drone)
     terms = (open(terms_txt).read().strip() or None) if os.path.isfile(terms_txt) else None
