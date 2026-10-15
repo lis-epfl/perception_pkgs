@@ -1,6 +1,8 @@
 {
+ "_note": "Since 2026-10-15 oak_ffc_4p_driver_ros2 stamps the images with the instant they were taken (capture_timestamps, middle of the exposure) instead of their arrival on the flight computer, which came about 45 ms later. The camera-IMU time offset of a calibration is then near 0 s, so \"center\" is 0. center_arrival_stamps is the center measured on recordings with the old arrival stamps: such a recording now starts 40 ms from its offset and fails the toff check.",
  "nxt3": {
-  "center": -0.03925101285333333,
+  "center": 0.0,
+  "center_arrival_stamps": -0.03925101285333333,
   "file_cam0": -0.03944,
   "offset_ms": 0.18898714666667343,
   "p95_recentered_ms": 0.060217196666669894,
@@ -9,7 +11,8 @@
   "chains_in_5_15ms_band": 0
  },
  "nxt6": {
-  "center": -0.04035609005301205,
+  "center": 0.0,
+  "center_arrival_stamps": -0.04035609005301205,
   "file_cam0": -0.03956,
   "offset_ms": -0.7960900530120524,
   "p95_recentered_ms": 0.08426732120482004,
@@ -18,7 +21,8 @@
   "chains_in_5_15ms_band": 0
  },
  "nxt10": {
-  "center": -0.03909965816179775,
+  "center": 0.0,
+  "center_arrival_stamps": -0.03909965816179775,
   "file_cam0": -0.03913,
   "offset_ms": 0.030341838202246896,
   "p95_recentered_ms": 0.06880116179774909,

@@ -43,3 +43,6 @@ harvests and trajectory estimates.
 `cal/{nxt3,nxt6,nxt10}/theta_star.yaml` (fixed points), `td_center.json` (rig-global toff
 centers), `circle_center_*.json` (fit references), `configs/estimator_calib.yaml` +
 `run_serial.sh` (deterministic estimator).
+The toff centers are 0 s since 2026-10-15, when the camera driver started stamping the images
+with their capture time instead of their arrival (about 45 ms later); the centers measured on
+arrival-stamped recordings stay in the file as `center_arrival_stamps`.
