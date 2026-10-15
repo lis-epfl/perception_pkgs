@@ -173,6 +173,11 @@ def main():
                mount['A_anchored_m'], mount['A_mounted_m']))
         log('  NOTE: the estimator does NOT read this. Apply it to the OUTPUT trajectory '
             '(mount.apply).')
+        if mount.get('lever_arm_imu_m') is not None:
+            log('lever arm: the IMU %+.1f %+.1f %+.1f cm from the rigid body\'s origin (IMU frame; '
+                'vision_pose_node moves the estimate back by it)' % tuple(100 * v for v in mount['lever_arm_imu_m']))
+        elif mount.get('lever_arm_skipped'):
+            log('lever arm: not solved (%s)' % mount['lever_arm_skipped'])
     else:
         log('mount rotation: not solved (no ground truth in that calibration run) — '
             'the deployed folder simply omits it')
@@ -269,7 +274,8 @@ FILES
                              Its last line holds the lens terms of THIS calibration
                              (%s).
   campaign.env               the OV_* environment of the campaign numbers (aarch64 only).
-  mount.json                 mount rotation M. NOT read by the estimator -- apply it to the
+  mount.json                 mount rotation M, and the lever arm (lever_arm_imu_m) when the
+                             flight showed it. NOT read by the estimator -- apply them to the
                              OUTPUT trajectory (selfcalib/tool/mount.py, apply()).%s%s
 
 All three YAML files must stay in THIS directory together: the estimator resolves

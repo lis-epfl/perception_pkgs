@@ -1055,6 +1055,12 @@ def main():
             log('mount: yaw=%.2f° tilt=%.2f° | anchored %.3f m -> %.3f m (best-fit floor %.3f m)'
                 % (ms['mount_yaw_deg'], ms['mount_tilt_deg'], ms['A_anchored_m'],
                    ms['A_mounted_m'], ms['A_bestfit_m']))
+            if ms.get('lever_arm_imu_m') is not None:
+                log('mount: lever arm %+.1f %+.1f %+.1f cm (IMU from the rigid body\'s origin, IMU frame; thirds agree '
+                    'to %.1f cm) | aligned RMS %.3f m -> %.3f m' % (*(100 * v for v in ms['lever_arm_imu_m']),
+                                                                 100 * ms['lever_arm_spread_m'], *ms['lever_arm_rms_m']))
+            else:
+                log('mount: lever arm not written -- %s' % ms.get('lever_arm_skipped', 'not solved'))
         except Exception as e:
             report['mount'] = {'error': '%s: %s' % (type(e).__name__, e)}
             log('mount: solve failed (%s: %s) — not fatal, calibration is unaffected'

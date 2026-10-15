@@ -302,6 +302,15 @@ Solve it once per vehicle and reuse it with `mount.apply()` on later flights: it
 **unaligned** trajectory accurate without fitting against ground truth every flight, which
 is the point — you cannot fit against ground truth you do not have in the field.
 
+The same solve fits the lever arm, `lever_arm_imu_m` in `mount.json`: the IMU's position from
+the origin of the motion capture's rigid body, in the IMU frame. The estimator tracks the IMU
+and the motion capture that origin, so the two differ by the lever arm turned with the
+attitude (about 4 cm in the hard turns of nxt3, 15 Oct 2026; its calibrations gave 4.6-4.9,
+-4.5, -1.7 to -2.0 cm). It is seen only where the attitude changes: it is written when the
+rigid body tilts 15 deg or more (90th percentile) in the flight and the three thirds of the
+flight agree on it within 3 cm, otherwise the report says why not (`lever_arm_skipped`).
+swarm-nxt's vision_pose_node moves the estimate back by it onto the origin.
+
 On the nxt3 reference recording it recovers essentially the whole gap: anchored error
 0.230 m → 0.048 m, against a best-fit floor of 0.048 m (yaw −3.5°, tilt 3.7°). The `noum_m`
 field in `report.json` is the error *before* this correction.
