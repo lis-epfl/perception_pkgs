@@ -213,6 +213,12 @@ python3 tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle
 ```
 
 It also prints every calibrated value (intrinsics, extrinsics, t_d, mount) for inspection.
+With `--mount-from <deployed folder>` (swarm-nxt passes the one in use), a calibration that has
+no mount of its own (no ground truth in its recording) keeps that folder's mount and lever arm,
+and one whose flight showed no lever arm keeps that folder's lever arm; `mount.json` and the
+MANIFEST name the calibration that solved them. They describe how the IMU sits in the motion
+capture's rigid body, which a camera calibration does not change: solve them again in the
+motion capture after changing the hardware.
 See `../WORKFLOW.md` for the full four-step walkthrough.
 
 **Exit codes**: `0` success · `1` gate failure (re-record) · `2` the stopping rule never held

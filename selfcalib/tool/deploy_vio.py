@@ -15,7 +15,8 @@ folder layout the VIO estimator expects:
                                     matching between cameras), copied from the vio package, plus the
                                     lens terms of this calibration (OV_NONRADIAL; empty if it has none)
     <out>/campaign.env              the vehicle's tracker and scheduler switches, copied from the vio package
-    <out>/mount.json                mount rotation, if solved   (NOT an estimator input)
+    <out>/mount.json                mount rotation and lever arm, if solved, else carried over from the folder
+                                    given with --mount-from   (NOT an estimator input)
     <out>/lens_terms.env            OV_NONRADIAL alone, if the calibration estimated lens terms
     <out>/MANIFEST.txt              what each file is and the command to fly it
 
@@ -87,6 +88,11 @@ def main():
                     help='path to the vio/ package (default: $VIO_ROOT, else the sibling ../vio)')
     ap.add_argument('--force', action='store_true',
                     help='deploy even if the calibration verdict was not HEALTHY')
+    ap.add_argument('--mount-from', default=None,
+                    help='a deployed flight folder (e.g. the one in use) whose mount.json is carried over when THIS '
+                         'calibration has none: its recording had no ground truth, or its mount solve was skipped. '
+                         'The mount and the lever arm describe how the IMU sits in the motion capture\'s rigid body, '
+                         'which a camera calibration does not change; solve them again after changing the hardware.')
     a = ap.parse_args()
 
     cal = os.path.abspath(a.calib_out)
@@ -179,8 +185,48 @@ def main():
         elif mount.get('lever_arm_skipped'):
             log('lever arm: not solved (%s)' % mount['lever_arm_skipped'])
     else:
-        log('mount rotation: not solved (no ground truth in that calibration run) — '
-            'the deployed folder simply omits it')
+        log('mount rotation: not solved (no ground truth in that calibration run, or its mount solve was skipped)')
+    # Carried over from an earlier calibration (--mount-from): the vehicle keeps its mount and lever arm through a
+    # calibration made without the motion capture. carried_over_from names the calibration that solved them, also
+    # after several carries.
+    carried = None
+    if mount is None and a.mount_from:
+        src = os.path.join(os.path.realpath(a.mount_from), 'mount.json')
+        if not os.path.isfile(src):
+            log('mount: nothing to carry over (no mount.json in %s) -- the deployed folder has none' % a.mount_from)
+        else:
+            try:
+                carried = json.load(open(src))
+                if not isinstance(carried, dict) or 'M' not in carried or 'mount_yaw_deg' not in carried:
+                    raise ValueError('no mount rotation in it')
+            except (OSError, ValueError) as e:
+                log('mount: cannot carry over %s (%s) -- the deployed folder has none' % (src, e))
+                carried = None
+            else:
+                carried.setdefault('carried_over_from', os.path.dirname(src))
+                lever = carried.get('lever_arm_imu_m')
+                log('mount: carried over from %s (solved by %s): yaw %+.2f deg, tilt %.2f deg, lever arm %s'
+                    % (os.path.dirname(src), carried['carried_over_from'], carried['mount_yaw_deg'],
+                       carried.get('mount_tilt_deg', float('nan')),
+                       ('%+.1f %+.1f %+.1f cm' % tuple(100 * v for v in lever)) if lever is not None else 'none'))
+    elif mount is None:
+        log('mount: none, and nothing to carry over (no --mount-from) -- the deployed folder has none')
+    # A mount solved on a flight that did not tilt enough has no lever arm: the earlier one is kept, like the mount.
+    lever_carried = False
+    if mount is not None and mount.get('lever_arm_imu_m') is None and a.mount_from:
+        src = os.path.join(os.path.realpath(a.mount_from), 'mount.json')
+        try:
+            prev = json.load(open(src)) if os.path.isfile(src) else {}
+        except (OSError, ValueError):
+            prev = {}
+        lever = prev.get('lever_arm_imu_m') if isinstance(prev, dict) else None
+        if lever is not None:
+            mount['lever_arm_imu_m'] = lever
+            mount['lever_arm_carried_over_from'] = (prev.get('lever_arm_carried_over_from') or prev.get('carried_over_from')
+                                                    or os.path.dirname(src))
+            lever_carried = True
+            log('lever arm: none in this calibration -- carried over from %s (solved by %s): %+.1f %+.1f %+.1f cm'
+                % (os.path.dirname(src), mount['lever_arm_carried_over_from'], *(100 * v for v in lever)))
 
     # ---- 4. write the folder the estimator expects ----
     os.makedirs(a.out, exist_ok=True)
@@ -192,8 +238,14 @@ def main():
         log('WARNING: %s not found -- the deployed folder will not carry the campaign switches' % campaign_env)
     shutil.copy(chain, os.path.join(a.out, 'kalibr_imucam_chain.yaml'))
     shutil.copy(imu, os.path.join(a.out, 'kalibr_imu_chain.yaml'))
-    if mount is not None:
+    if mount is not None and lever_carried:
+        with open(os.path.join(a.out, 'mount.json'), 'w') as f:
+            json.dump(mount, f, indent=1)
+    elif mount is not None:
         shutil.copy(mount_json, os.path.join(a.out, 'mount.json'))
+    elif carried is not None:
+        with open(os.path.join(a.out, 'mount.json'), 'w') as f:  # (also when --mount-from is --out itself)
+            json.dump(carried, f, indent=1)
     elif os.path.lexists(os.path.join(a.out, 'mount.json')):
         os.remove(os.path.join(a.out, 'mount.json'))            # of an earlier calibration deployed into --out
     # The flight settings travel with the calibration: the folder gets its own copy of flight_stiffness.env, ending with
@@ -316,7 +368,13 @@ on the vehicle). run_subscribe_msckf feeds one camera per message and reads neit
 IMU nor compressed images: it is not the flight node.
 """ % (drone, cal, verdict, dep_toff, (';\n' + 29 * ' ').join(holds),
        'empty: it has none' if not terms else 'two numbers and a held third per camera',
-       '' if mount is not None else '  (mount.json absent: that calibration had no ground truth)',
+       ('\n                             Its lever arm CARRIED OVER (this calibration solved none);\n'
+        '                             solved by %s.' % mount['lever_arm_carried_over_from']) if lever_carried else
+       '' if mount is not None else
+       ('\n                             CARRIED OVER from %s (this calibration had none);\n'
+        '                             solved by %s.' % (os.path.dirname(os.path.join(os.path.realpath(a.mount_from), 'mount.json')),
+                                                      carried['carried_over_from'])) if carried is not None else
+       '  (mount.json absent: that calibration had no ground truth, and none was carried over)',
        '' if not terms else
        '\n  lens_terms.env             the same lens terms alone (OV_NONRADIAL), for whatever else\n'
        '                             uses this chain: without them it is not the calibrated lens model.',
