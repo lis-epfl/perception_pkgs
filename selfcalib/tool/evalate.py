@@ -45,9 +45,33 @@ def load_aligned(est_path, gt_path, toff=0.0, cam_end=None):
     return te, pe, qe, pg, gt
 
 
+# The start is pinned on the last second before takeoff, as vision_pose_node of swarm-nxt places the estimate (on the
+# ground, from its last second of poses). The estimator's first poses can be far off while it starts: nxt3, 20 Oct 2026,
+# first pose 1 m from where it settled 0.3 s later, the drone still, which made NOUM 1.1 m and the mount's tilt 6.7 deg.
+PIN_S = 1.0
+
+
+def pin_window(te, gt):
+    """-> indices of the estimate's poses in the last second before takeoff; the first pose with fewer than 3 there."""
+    t_to = takeoff_time(gt)
+    w = np.where((te >= t_to - PIN_S) & (te < t_to))[0]
+    return w if len(w) >= 3 else np.array([0])
+
+
+def pin(te, pe, qe, pg, gt):
+    """-> (R, p_e, p_g): over pin_window(), the rotation from the estimate's world to the room that the attitudes give
+    (mean, projected onto a rotation) and the mean positions of the two."""
+    w = pin_window(te, gt)
+    idx = np.clip(np.searchsorted(gt[:, 0], te[w]), 0, len(gt) - 1)
+    S = sum(q_to_R(gt[g, 4:8]) @ q_to_R(qe[i]).T for g, i in zip(idx, w))
+    U, _, Vt = np.linalg.svd(S)
+    R = U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt
+    return R, pe[w].mean(axis=0), pg[w].mean(axis=0)
+
+
 def ate_metrics(est_path, gt_path, toff=0.0, cam_end=None):
     """-> dict(global_m, postg_m, noum_m): global Umeyama; post-takeoff Umeyama (POSTG);
-    start-anchored no-Umeyama (NOUM, GT pose at first est time fixes R,t)."""
+    no-Umeyama (NOUM: the GT poses of the last second before takeoff fix R,t, see pin()), after takeoff."""
     te, pe, qe, pg, gt = load_aligned(est_path, gt_path, toff, cam_end)
     if len(te) < 50:
         return {'global_m': float('nan'), 'postg_m': float('nan'), 'noum_m': float('nan'), 'n': int(len(te))}
@@ -59,8 +83,8 @@ def ate_metrics(est_path, gt_path, toff=0.0, cam_end=None):
     if fl.sum() >= 20:
         R2, t2 = umeyama(pe[fl], pg[fl])
         postg = float(np.sqrt(np.mean(np.linalg.norm((R2 @ pe[fl].T).T + t2 - pg[fl], axis=1) ** 2)))
-    idx = np.clip(np.searchsorted(gt[:, 0], te[0]), 0, len(gt) - 1)
-    Ra = q_to_R(gt[idx, 4:8]) @ q_to_R(qe[0]).T
-    ta = pg[0] - Ra @ pe[0]
-    noum = float(np.sqrt(np.mean(np.linalg.norm((Ra @ pe.T).T + ta - pg, axis=1) ** 2)))
+    Ra, pe0, pg0 = pin(te, pe, qe, pg, gt)
+    ta = pg0 - Ra @ pe0
+    m = fl if fl.sum() >= 20 else np.ones(len(te), bool)
+    noum = float(np.sqrt(np.mean(np.linalg.norm((Ra @ pe[m].T).T + ta - pg[m], axis=1) ** 2)))
     return {'global_m': g, 'postg_m': postg, 'noum_m': noum, 'n': int(len(te))}

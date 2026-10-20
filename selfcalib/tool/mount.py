@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """One-time mount calibration (paper §6.2): solve the constant body/mount rotation that separates
-the start-anchored alignment from the best-fit alignment, on ONE flight; apply it unchanged to
+the alignment anchored before takeoff from the best-fit alignment, on ONE flight; apply it unchanged to
 future flights so the *unaligned* (anchored) trajectory is accurate without per-flight alignment.
+Anchored on the last second before takeoff (evalate.pin), as vision_pose_node places the estimate: the
+estimator's first poses can be far off while it starts.
 
 Also the lever arm (lever_arm_imu_m): the IMU's position from the origin of the motion capture's rigid body, in the
 IMU frame. The estimator tracks the IMU and the motion capture the origin, so without it the two differ by the lever
@@ -19,17 +21,16 @@ import json, sys, os
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from evalate import umeyama, q_to_R, takeoff_time, load_aligned
+from evalate import umeyama, q_to_R, takeoff_time, load_aligned, pin, pin_window
 
 
 def _anchored(te, pe, qe, pg, gt):
-    idx = np.clip(np.searchsorted(gt[:, 0], te[0]), 0, len(gt) - 1)
-    R_anchor = q_to_R(gt[idx, 4:8]) @ q_to_R(qe[0]).T
-    return R_anchor
+    return pin(te, pe, qe, pg, gt)[0]
 
 
 def _rmse_with_R(R, te, pe, pg, gt, post_takeoff=True):
-    t = pg[0] - R @ pe[0]
+    w = pin_window(te, gt)
+    t = pg[w].mean(axis=0) - R @ pe[w].mean(axis=0)
     pea = (R @ pe.T).T + t
     if post_takeoff:
         m = te >= takeoff_time(gt)
