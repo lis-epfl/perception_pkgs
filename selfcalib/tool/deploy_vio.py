@@ -184,6 +184,9 @@ def main():
                 'vision_pose_node moves the estimate back by it)' % tuple(100 * v for v in mount['lever_arm_imu_m']))
         elif mount.get('lever_arm_skipped'):
             log('lever arm: not solved (%s)' % mount['lever_arm_skipped'])
+        if mount.get('room_tilt_deg') is not None:
+            log('room tilt: [%+.2f %+.2f] deg (vision_pose_node turns the estimate by it in the room)'
+                % tuple(mount['room_tilt_deg']))
     else:
         log('mount rotation: not solved (no ground truth in that calibration run, or its mount solve was skipped)')
     # Carried over from an earlier calibration (--mount-from): the vehicle keeps its mount and lever arm through a

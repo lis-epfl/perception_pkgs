@@ -8,6 +8,9 @@ IMU frame. The estimator tracks the IMU and the motion capture the origin, so wi
 arm turned with the attitude (about 4 cm in the hard turns of nxt3, 15 Oct 2026). vision_pose_node of swarm-nxt
 moves the estimate back by it onto the origin.
 
+Also the room tilt (room_tilt_deg): the estimator's vertical as the motion capture's room sees it. vision_pose_node
+places the estimate with a heading only, which takes the two verticals for one, and turns it by this tilt on top.
+
 solve():  M = R_fit @ R_anchor^T on flight A  (dominantly a yaw offset on this platform)
 apply():  on flight B, use R = M @ R_anchor_B — no fitting against B's ground truth.
 The cross-flight test (docs/VALIDATION_MATRIX.md) is the falsifiable claim: if M were not constant,
@@ -90,6 +93,25 @@ def lever_arm(te, pe, qe, pg, gt):
     return out
 
 
+# The room tilt: the rotation about the room's x and y axes (deg) that takes the room's vertical to the estimator's, from
+# the best rigid fit of the flight's positions (moved by the lever arm when it is written, as vision_pose_node moves
+# them), so it holds whatever the attitudes and the mount. On the flights of 19/20 Oct 2026 it was 0.5-1.1 deg, partly
+# the room (the ground plane set in Motive) and partly the drone (nxt6 0.4 deg more than nxt3); placed without it, the
+# estimate's height is off by about 1.4 cm per metre from the start.
+def room_tilt(te, pe, qe, pg, gt, lever=None):
+    """-> dict: room_tilt_deg ([x, y])."""
+    fl = te >= takeoff_time(gt)
+    p, g = pe[fl], pg[fl]
+    if lever is not None:
+        p = p - np.einsum('nij,j->ni', np.array([q_to_R(q) for q in qe[fl]]), np.asarray(lever, float))
+    R, _ = umeyama(p, g)
+    up = R[:, 2]                        # the estimator's vertical, in the room
+    angle = float(np.arccos(np.clip(up[2], -1.0, 1.0)))
+    axis = np.cross([0.0, 0.0, 1.0], up)
+    v = axis / np.linalg.norm(axis) * angle if angle > 0.0 else np.zeros(3)
+    return {'room_tilt_deg': [round(float(np.degrees(v[0])), 3), round(float(np.degrees(v[1])), 3)]}
+
+
 def solve(est_path, gt_path, toff=0.0, cam_end=None):
     """-> dict with M (3x3), mount_yaw_deg, mount_tilt_deg, and flight-A errors."""
     te, pe, qe, pg, gt = load_aligned(est_path, gt_path, toff, cam_end)
@@ -104,6 +126,7 @@ def solve(est_path, gt_path, toff=0.0, cam_end=None):
            'A_mounted_m': round(_rmse_with_R(M @ R_anchor, te, pe, pg, gt), 4),
            'A_bestfit_m': round(_rmse_with_R(R_fit, te, pe, pg, gt), 4)}
     out.update(lever_arm(te, pe, qe, pg, gt))
+    out.update(room_tilt(te, pe, qe, pg, gt, out.get('lever_arm_imu_m')))
     return out
 
 

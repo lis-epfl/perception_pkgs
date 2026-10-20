@@ -1061,6 +1061,8 @@ def main():
                                                                  100 * ms['lever_arm_spread_m'], *ms['lever_arm_rms_m']))
             else:
                 log('mount: lever arm not written -- %s' % ms.get('lever_arm_skipped', 'not solved'))
+            log('mount: room tilt [%+.2f %+.2f] deg (the estimator\'s vertical in the room; vision_pose_node turns the '
+                'estimate by it)' % tuple(ms['room_tilt_deg']))
         except Exception as e:
             report['mount'] = {'error': '%s: %s' % (type(e).__name__, e)}
             log('mount: solve failed (%s: %s) — not fatal, calibration is unaffected'
