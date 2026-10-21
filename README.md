@@ -5,6 +5,7 @@ Two packages that share **one** estimator.
 ```
 vio/          the VIO package — the estimator, and the FLIGHT/deployment config
 selfcalib/    the self-calibration package — the tool, and its OWN calibration config
+relloc/       relative localization between drones, beside the VIO (off unless RELLOC=1; relloc/README.md)
 ```
 
 ## Why they are split
@@ -30,6 +31,7 @@ vio/                        drop into a colcon workspace src/ — four ament pac
   vio_deploy/                      flight config + flight_stiffness.env + the run scripts
   config/                          placeholder — ov_msckf's cmake installs ../config/
   BASELINE.txt  LICENSE  PRUNED.txt
+relloc/                     python + ROS 2 node, no colcon build: scripts/run_relloc.sh, config/relloc.env
 selfcalib/
   tool/run_tool.py          the calibration pipeline
   tool/deploy_vio.py        read a finished calibration -> write the flight folder
