@@ -29,7 +29,12 @@ bash relloc/scripts/run_relloc.sh
 | `RELLOC_FLIGHT_DIR` | required | the flight folder: `kalibr_imucam_chain.yaml`, the lens terms (`OV_NONRADIAL` in its `flight_stiffness.env`), camera topics (`cam_topic0..3` of `estimator_flight.yaml`) |
 | `RELLOC_DEST` | 255.255.255.255:47800 | where the datagrams go: the other drones as `host:port,...` (unicast), or the broadcast address |
 | `RELLOC_PORT` | 47800 | the UDP port this drone listens on |
-| `RELLOC_TAKEOFF_HOLD_S` | 10 | seconds after take-off (VIO height 0.3 m above its first pose) before the drone sends packets and solves. relloc2 found every wrong lock of a healthy pair within 8.4 s of the sender's take-off. 0 = from the first VIO pose, also on the ground |
+| `RELLOC_TAKEOFF_DZ` | 0.5 | the take-off latch: VIO height in m above its first pose. Every keyframe from the first VIO pose is processed (the first keyframes sent have triangulation partners from the ground and the start of the climb); packets leave, and the drone's own keyframes enter its receiver, from the latch on. -1 = no latch: the drone sends from its first VIO pose, also on the ground |
+| `RELLOC_TAKEOFF_HOLD_S` | 0 | seconds after the latch before the drone sends packets and solves |
+| `RELLOC_PARMIN_EARLY_DEG` | 8 | parallax floor of every triangulated point until the latch + `RELLOC_PARMIN_EARLY_S` (section "Take-off and parallax floor") |
+| `RELLOC_PARMIN_EARLY_S` | 8 | seconds after the latch at which the floor changes to `RELLOC_PARMIN_DEG` |
+| `RELLOC_PARMIN_DEG` | 6 | the floor after the change |
+| `RELLOC_MEM_GATE_DEG` | 8 | a keyframe becomes a camera's depth memory only when at least 100 of its points reach this parallax, and only those points are stored. 0 = no gate |
 | `RELLOC_XFEAT_ENGINE` | empty (torch) | TensorRT engine of the XFeat backbone, built on the drone: `python3 relloc/scripts/build_xfeat_engine.py` |
 | `RELLOC_LOG_DIR` | ~/relloc_logs | one `relloc_<id>_<time>.jsonl` per run |
 | `RELLOC_POSE_TOPIC` | /poseimu | the VIO pose (`run_online_msckf`, PoseWithCovarianceStamped; `RELLOC_POSE_MSG_TYPE=nav_msgs/msg/Odometry` for an odometry topic) |
@@ -43,12 +48,23 @@ chain's `timeshift_cam_imu`).
 ## What it needs
 
 - **The VIO running**, with this drone's flight folder. relloc reads the VIO pose (`/poseimu`, about 7.5 poses per second in flight) and
-  sends it in every packet header.
+  sends it in every packet header. The build must publish poses on the ground (at or after dc8d058: `ros2 topic hz /poseimu` about 28 Hz
+  standing): without them the node has no ground keyframes, and the first keyframes of the climb have no triangulation partners. The
+  replays used a build with the slow-flight switches (a8808ea: `strings <ws>/install/ov_msckf/lib/libov_msckf_lib.so | grep OV_MSCKF_ROWS`).
+- **A flight folder calibrated with the drone's current camera driver.** relloc takes every pose at image stamp + the chain's t_d. Since
+  15 Oct the driver stamps the capture time (t_d about 0); the June calibrations have -39 to -47 ms. A folder calibrated on an
+  arrival-stamped recording and flown with the capture-stamp driver puts every pose about 40 ms off (4 cm at 1 m/s), in relloc and in
+  the VIO. `run_relloc.sh --check` prints `td_s`: a few ms with the current driver.
 - **The PX4 IMU.** The VIO publishes a pose after each filter update. Between two poses the drone turns by up to several degrees, so relloc
   propagates the attitude from the last VIO pose with the gyro, as relloc2 did for every evaluated number. Without the gyro the attitude
   is interpolated between poses: in a 45-s replay of the test below the 4-DoF value of a solve was then off in tilt by 1.0-1.1 deg
   (median), against 0.70-0.73 deg with the gyro on the same 45 s. The census line reports `gyro_attitudes` and `slerp_attitudes`.
-- **Python** on the drone: torch with CUDA (the JetPack wheel), kornia, scipy, opencv-python, PyYAML; TensorRT for the engine. No colcon build.
+- **Python** on the drone: torch with CUDA (the JetPack wheel), kornia, tqdm (imported by XFeat), scipy, opencv-python, PyYAML; TensorRT
+  for the engine. No colcon build. `--check` does not import torch, kornia, tqdm or TensorRT: check them with
+  `python3 -c 'import torch, kornia, tqdm; print(torch.cuda.is_available())'`.
+- **A restart before every take-off.** The latch fires once per process: after a landing the drone would keep sending ground packets
+  from its descent. Check that one relloc runs per drone (`pgrep -af relloc_node.py`): a second process with the same drone number
+  breaks every pair with that drone without an error.
 - **A link between the drones.** One drone sends about 43 kB per keyframe (36 datagrams of at most 1,200 B), 214 kB/s = 1.7 Mbit/s, plus
   60-B estimate messages and a 749-B calibration message per second. relloc2's radio specification: residual loss below 5 %, loss bursts
   shorter than 8 datagrams. On Wi-Fi a broadcast frame goes at the network's basic rate, which can be too slow: prefer the unicast list.
@@ -71,9 +87,10 @@ or seed from `provisional`. The transforms are published when they change (one m
 by the packet's age (about 0.1-0.3 s); a consumer that needs the peer's current position needs its pose stream (relloc2: a 10-Hz pose +
 velocity stream, or a velocity in the packet header; not part of this package).
 
-The log has one JSON object per line: `own_kf` (every keyframe: pose, 3-D points, timing), `peer_kf` (every received header),
-`solve` (every solve: inliers, margin, 4-DoF and 6-DoF values), `lock`, `withdraw`, `output`, and a `census` every 5 s. With the drones'
-motion capture this is enough to grade a flight offline.
+The log has one JSON object per line: `own_kf` (every keyframe: pose, height above the first pose, 3-D points, floor, timing, sent or
+not), `takeoff` (the latch), `floor` (each change of the floor), `peer_kf` (every received header), `solve` (every solve: inliers,
+margin, 4-DoF and 6-DoF values), `lock`, `withdraw`, `output`, and a `census` every 5 s. With the drones' motion capture this is enough
+to grade a flight offline.
 
 ## The 6-DoF output
 
@@ -87,11 +104,46 @@ With `RELLOC_6DOF=0` the lock, the maintenance and the withdrawals are relloc2's
 shadow. With `RELLOC_6DOF=1` the 6-DoF maintenance decides the withdrawals and the 4-DoF estimate is the shadow. A shadow skips a solve
 that its own test would withdraw on (counted as `n_shadow_withdraw`). Both outputs therefore come from the same solves in every flight.
 
+## Take-off and parallax floor
+
+The sender triangulates its keypoints against its own past keyframes; a point counts only when its views differ by at least a parallax
+floor. Until this change the floor was 3 deg and the node waited 10 s after take-off. relloc2's review24 traced the early wrong solves
+to the sender's hover map: in the hover after the climb no past keyframe has the 8-cm baseline, so every 3-D point the sender sends comes
+from its depth memory, one stored keyframe from the end of the climb. At a 3-deg floor those points had a median parallax of 3.8-5.6 deg
+(13-15 deg in flight) and depth errors of 4.3-6.9 % (2.2-2.5 % in flight; `review24/early`). The rule PT8F6G8 (`review24/fix` section 8):
+
+- floor 8 deg for each drone's first 8 s after its take-off latch, then 6 deg;
+- a keyframe becomes a camera's memory only when at least 100 of its points reach 8 deg, and only those points are stored;
+- a memory depth never replaces a fresh one (before, it could);
+- keyframes are processed from the first VIO pose and sent from the latch (0.5 m above the first pose), with no hold.
+
+relloc2's replay of the seven June flights against the previous setting (floor 3 deg with the memory fix; 10 healthy drone pairs,
+seeds 0-2, the same requests for both rules; wrong = more than 20 cm off; lock-eligible = accepted with a z-margin of at least 2.7, a
+solve the lock rule can use; public datasets: round 16's setup):
+
+| | floor 3 deg | PT8F6G8 |
+|---|---|---|
+| lock-eligible wrong solves in the sender's first 8 s, of ~28,000 accepted | 344 | 1 |
+| lock-eligible wrong solves after the sender's first 20 s, of ~132,000 accepted | 189 | 105 |
+| wrong locks, of 6,528 lock starts (2-s horizon) | 19 | 2 |
+| locks more than 10 cm off | 357 | 114 |
+| median lock time when both drones take off together (30 starts, 918-MHz compute model) | 0.32 s | 0.56 s |
+| EuRoC held out (V1_01 pairs, 2,700 starts): starts that lock / wrong locks | 38.8 % / 13 | 33.9 % / 0 |
+| TUM-VI held out (rooms 1, 4, 5, 4,050 starts): starts that lock / wrong locks | 94.9 % / 8 | 94.0 % / 13 |
+
+The costs: when both drones take off together the median lock comes later (0.56 s against 0.32 s), and scenes with little parallax
+lock less often (EuRoC). Ten of PT8F6G8's 11 wrong-lock events on TUM-VI are the confusion between rooms 4 and 5
+(184-190 cm off) that every rule shows. The rule was chosen on the seven June flights, which share one climb-and-hover profile.
+
+`RELLOC_PARMIN_DEG=3 RELLOC_PARMIN_EARLY_DEG=3 RELLOC_MEM_GATE_DEG=0` gives the previous floor (with the memory fix) for a comparison
+flight. All drones of a flight must use the same values: a packet does not carry its sender's floor (each node logs its own: `floor`
+events, `own_kf.floor`).
+
 ## Layout
 
 ```
 relloc_node.py        the node
-live/                 new code: sender.py (the sender of relloc2's sender_lean.py as a class), receiver.py (node15.Node + the 6-DoF
+live/                 new code: sender.py (relloc2's sender_lean.py as a class, with the parallax rule), receiver.py (node15.Node + the 6-DoF
                       estimate), six.py, vio.py (pose at the image instant), calib.py (flight folder, calibration datagram), lens.py,
                       transport.py (UDP)
 core/                 relloc2 modules, byte-identical copies (md5 below): the evaluated receiver, lock rule, codec
@@ -124,12 +176,39 @@ What the live code does differently from relloc2's evaluated replay:
 - VIO epoch: the epoch in the packet headers and in the estimate messages is the one of the pose stream (+1 when it pauses for more than
   2 s or goes back in time); node15 counted its own resets.
 - A solve that waited in the queue longer than 1 s is dropped (the replay's queue had no limit).
-- The take-off hold (relloc2 recommended it in DEPLOY_CONFIG; its replays did not apply it).
+- Take-off: relloc2's replay solved from each drone's 0.5-m crossing with its ground keyframes as partners, as the latch does here; its
+  floor switch came at lift-off + 8 s, here at the latch + 8 s (0.3-0.5 s later in the replays above).
 - Rig: drones of the fleet only (four cameras, 1280 x 800, KB4). Peers of another rig are ignored.
 
 ## Tested
 
-On the workstation (RTX 5070, ROS 2 Humble), 2026-10-22:
+This version (take-off latch and PT8F6G8), 2026-10-25, on the workstation (RTX 5070, ROS 2 Humble; relloc2 `review24/branch`):
+
+- `test/test_sender_parity.py`: at sender_lean's settings the sender still builds sender_lean's packets (216e2fed6c33b515). With
+  `--rules`, on the same 40 keyframes: a switch from 8 to 6 deg at the middle keyframe gives every keyframe the fresh 3-D points of a
+  fixed 8-deg floor before it and of a fixed 6-deg floor from it on (40 of 40); the 8-deg points are a subset of the 3-deg ones; with
+  the depth memory forced on, each of the 16 stores holds exactly its keyframe's points at >= 8 deg (the gate removed points from 12 of
+  them), and no keypoint has two 3-D points (2,466 do without the memory fix).
+- `test/test_units.py`: all pass.
+- Replays through two nodes of this version with their defaults, from each drone's first VIO pose on the ground (`test/play_pair.py`,
+  and relloc2's copy of it that plays one drone late, `review24/deploy/e2e/scripts/play_shift.py`), as in the first test below but with relloc2's current inputs (the VIO of a4b4f19 and its
+  flight folders, lens terms), every camera frame at half speed. Per drone the node processed its 26-52 keyframes before the latch (on
+  the ground and below 0.5 m) without sending them; the first keyframe sent was the first above 0.5 m (at 0.55-0.70 m, 0.3-0.5 s after
+  lift-off: the drones climb at 1.0-1.4 m/s, 0.20-0.28 m per keyframe); no solve used an own keyframe from before it, and the peer
+  received no older header; the floor changed from 8 to 6 deg at the keyframe 8 s after the latch. Graded against motion capture (error
+  = where the receiver places the peer's IMU):
+
+| scenario (per direction) | first lock after the later drone's lift-off: error | wrong locks / withdrawals | held error, median / 90th pct |
+|---|---|---|---|
+| s3, simultaneous take-off | 1.1 s: 2.1 cm, 0.9 s: 3.2 cm | 0 / 0 | 3.7-3.9 / 7.2-7.4 cm |
+| s3, nxt6 takes off 30 s after nxt3 | 0.4 s: 5.5 cm, 0.5 s: 5.2 cm | 0 / 0 | 3.6-3.9 / 6.7-7.0 cm |
+| s1, nxt6 takes off 25 s after nxt3 (the late sender of relloc2's early wrong locks) | 0.3 s: 5.9 cm, 0.3 s: 5.8 cm | 0 / 0 | 4.1-4.9 / 7.4-9.0 cm |
+
+The first version on the same three scenarios locked 10.1-10.3 s after the later lift-off, 0.8-14.7 cm off. Of the 436 accepted solves,
+2 were more than 20 cm off, neither usable by the lock rule. One run per scenario and 7-9 solves in a sender's first 8 s: the runs show
+that the node applies the rule as intended; the per-solve effect comes from relloc2's replay (section "Take-off and parallax floor").
+
+The first version (10-s hold, floor 3 deg), 2026-10-22, on the workstation (RTX 5070, ROS 2 Humble; not rerun with this version):
 
 - `test/test_sender_parity.py`: the sender class builds the same packets as relloc2's `sender_lean.py`, byte for byte, on its sequence
   file (40 keyframes of nxt3, 23 June; SHA-256 216e2fed6c33b515).
@@ -168,13 +247,19 @@ worse after 60 s (tilt 0.03-0.06 deg higher), as in relloc2 round 23. One run pe
 primary run, 112-118 solves per direction) the tilt error is 0.36-0.37 deg for the 4-DoF value and 0.26-0.29 deg for the 6-DoF one.
 
 Not tested: on the Orin; over a radio link; with the live VIO (the replay feeds recorded VIO trajectories); with three or more drones; on
-recordings made after 15 Oct (capture stamps, calibrations with lens terms); a VIO restart in flight.
+recordings made after 15 Oct (capture stamps, calibrations with lens terms); a VIO restart in flight; a landing and a second take-off
+without a restart of relloc.
 
 ## Limits
 
 - Compute on the Orin is not measured. On the workstation (RTX 5070) the sender takes 63-71 ms per keyframe and a solve 72-74 ms
   (medians, two nodes on one GPU). relloc2's device times were measured at 918 MHz; the fleet's GPU cap is 612 MHz. A sender slower than 0.2 s skips keyframes (census:
-  `kf_dropped_busy`); the TensorRT engine is the first lever.
+  `kf_dropped_busy`); the TensorRT engine is the first lever. Scaled from relloc2's device times, a keyframe at 612 MHz would take
+  225-260 ms with torch XFeat and 160-190 ms with the engine (an estimate): build the engine on each drone.
+- relloc has not run beside the flight VIO. The VIO tracks on the GPU and pins its threads to all eight cores; relloc adds a CUDA
+  context, XFeat at 5 Hz and the solves, now from the first VIO pose on the pad. Before a flight relies on it, compare the VIO alone with
+  the VIO beside `taskset -c 4-7 nice -n 5 bash relloc/scripts/run_relloc.sh` (pose delay, incomplete image sets), with PX4 on motion
+  capture.
 - The packet header carries the peer's pose at its keyframe; `position` is therefore 0.1-0.3 s old.
 - No time synchronisation is needed between drones (each receiver estimates the clock offset from the packet headers), but the camera
   stamps, the VIO stamps and the IMU stamps of one drone must share its clock, as the VIO requires anyway.

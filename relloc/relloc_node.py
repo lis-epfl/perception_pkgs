@@ -3,7 +3,11 @@
 
 What it does, per drone (one process, three threads):
   sender     every 0.2 s: the four images of one instant + the VIO pose at that instant -> XFeat (3000 keypoints per image) -> rays
-             (KB4 + lens terms) -> triangulation against the drone's own past keyframes -> v3 packet (about 43 kB in 36 datagrams) -> UDP
+             (KB4 + lens terms) -> triangulation against the drone's own past keyframes -> v3 packet (about 43 kB in 36 datagrams) -> UDP.
+             Every keyframe from the first VIO pose is processed (the first keyframes sent have triangulation partners from the ground
+             and the start of the climb); packets leave, and own keyframes enter the receiver, from the take-off latch (VIO 0.5 m above
+             its first pose) on.
+             Parallax floor 8 deg until the latch + 8 s, then 6 deg (relloc2 review24 rule PT8F6G8, live/sender.py)
   receiver   the other drones' datagrams -> node15 (decode, pairing with own keyframes, solve on the GPU, lock rule, maintenance, pair
              protocol) -> per peer the transform of the peer's VIO world into the own VIO world, 4-DoF and 6-DoF
   udp        datagram intake
@@ -36,13 +40,17 @@ def config():
     c = {'id': E('RELLOC_ID', '') or _id_default(), 'flight_dir': E('RELLOC_FLIGHT_DIR', ''), 'pose': E('RELLOC_POSE_TOPIC', '/poseimu'),
          'pose_type': E('RELLOC_POSE_MSG_TYPE', 'geometry_msgs/msg/PoseWithCovarianceStamped'), 'imu': E('RELLOC_IMU_TOPIC'), 'imu_type': E('RELLOC_IMU_MSG_TYPE'),
          'cams': E('RELLOC_CAM_TOPICS', ''), 'cam_type': E('RELLOC_CAM_MSG_TYPE', ''), 'port': int(E('RELLOC_PORT', '47800')),
-         'dest': E('RELLOC_DEST', '255.255.255.255:47800'), 'six': E('RELLOC_6DOF', '0') == '1', 'hold': float(E('RELLOC_TAKEOFF_HOLD_S', '10')),
-         'dz': float(E('RELLOC_TAKEOFF_DZ', '0.3')), 'log_dir': os.path.expanduser(E('RELLOC_LOG_DIR', '~/relloc_logs')), 'td': E('RELLOC_TD_S', ''),
+         'dest': E('RELLOC_DEST', '255.255.255.255:47800'), 'six': E('RELLOC_6DOF', '0') == '1', 'hold': float(E('RELLOC_TAKEOFF_HOLD_S', '0')),
+         'dz': float(E('RELLOC_TAKEOFF_DZ', '0.5')), 'log_dir': os.path.expanduser(E('RELLOC_LOG_DIR', '~/relloc_logs')), 'td': E('RELLOC_TD_S', ''),
          'peers': E('RELLOC_PEERS', ''), 'max_queue_s': float(E('RELLOC_MAX_QUEUE_S', '1.0')), 'topic': E('RELLOC_TOPIC', 'relloc').strip('/'),
          'sim_time': E('RELLOC_SIM_TIME', '0') == '1', 'prio': E('RELLOC_SENDER_PRIO', '1') == '1', 'name': E('RELLOC_NODE_NAME', ''),
-         'engine': E('RELLOC_XFEAT_ENGINE', '')}
+         'engine': E('RELLOC_XFEAT_ENGINE', ''), 'parmin': float(E('RELLOC_PARMIN_DEG', '6')), 'parmin_early': float(E('RELLOC_PARMIN_EARLY_DEG', '8')),
+         'early_s': float(E('RELLOC_PARMIN_EARLY_S', '8')), 'mem_gate': float(E('RELLOC_MEM_GATE_DEG', '8'))}
     if not c['id'] or not c['id'].isdigit() or not 0 <= int(c['id']) <= 255: raise SystemExit(f'RELLOC_ID must be a drone number 0-255 (hostname gives {_id_default()!r})')
     c['id'] = int(c['id'])
+    for k, v in (('parmin', 'RELLOC_PARMIN_DEG'), ('parmin_early', 'RELLOC_PARMIN_EARLY_DEG'), ('mem_gate', 'RELLOC_MEM_GATE_DEG')):
+        if not 0 <= c[k] < 90: raise SystemExit(f'{v} {c[k]}: a parallax angle in deg, 0-90')
+    if c['early_s'] < 0 or c['hold'] < 0: raise SystemExit('RELLOC_PARMIN_EARLY_S and RELLOC_TAKEOFF_HOLD_S: seconds, >= 0')
     if not c['flight_dir']: raise SystemExit('RELLOC_FLIGHT_DIR: the flight folder of this drone (deploy_vio.py output) is required')
     return c
 
@@ -59,8 +67,9 @@ def main():
     summary = {'drone': C['id'], 'calibration': cal.source, 'cameras': cal.ncam, 'image': [cal.W, cal.H], 'lens_terms': cal.has_terms, 'td_s': td,
                'camera_topics': cams, 'camera_msg_type': cam_type, 'vio_pose': f"{C['pose']} ({C['pose_type']})", 'imu': f"{C['imu']} ({C['imu_type']})" if C['imu'] else 'none: attitude interpolated between VIO poses', 'udp_port': C['port'], 'udp_dest': [f'{h}:{p}' for h, p in dest],
                'peers': sorted(peers_ok) if peers_ok else 'any', 'primary_output': '6dof' if C['six'] else '4dof', 'takeoff_hold_s': C['hold'],
-               'takeoff_dz_m': C['dz'], 'log_dir': C['log_dir'], 'max_queue_s': C['max_queue_s'], 'topic_prefix': C['topic'], 'sim_time': C['sim_time'],
-               'xfeat': f"TensorRT {C['engine']}" if C['engine'] else 'torch (batched)'}
+               'takeoff_dz_m': C['dz'], 'parallax_floor_deg': {'until_takeoff_plus_s': C['early_s'], 'early': C['parmin_early'], 'after': C['parmin']},
+               'memory': {'store_gate_deg': C['mem_gate'], 'keeps_fresh_depths': True}, 'log_dir': C['log_dir'], 'max_queue_s': C['max_queue_s'],
+               'topic_prefix': C['topic'], 'sim_time': C['sim_time'], 'xfeat': f"TensorRT {C['engine']}" if C['engine'] else 'torch (batched)'}
     if C['engine'] and not os.path.exists(os.path.expanduser(C['engine'])): raise SystemExit(f"RELLOC_XFEAT_ENGINE {C['engine']}: no such file (scripts/build_xfeat_engine.py)")
     print('[relloc] ' + json.dumps(summary), flush=True)
     if any(h == '255.255.255.255' or h.endswith('.255') for h, _ in dest):
@@ -121,7 +130,7 @@ def main():
         m = deserialize_message(raw, Image)
         if m.encoding not in ('mono8', '8UC1'): raise ValueError(f'image encoding {m.encoding}: mono8 expected')
         return np.frombuffer(m.data, np.uint8).reshape(m.height, m.step)[:, :m.width].copy()
-    S = SND.LiveSender(cal.ncam, cal.W, cal.H, C['id']); S.CAPTURE_MODE = os.environ['CAPTURE_MODE']
+    S = SND.LiveSender(cal.ncam, cal.W, cal.H, C['id'], parmin=C['parmin'], parmin_early=C['parmin_early'], mem_gate=C['mem_gate']); S.CAPTURE_MODE = os.environ['CAPTURE_MODE']
     P_ = np.load(paths.PCA); codec = PC.Codec(P_['mu'], P_['basis'], cal.W, cal.H)
     own_pc = cal.peer_calib(node15)
     OWN = {}; OL = threading.Lock()
@@ -217,7 +226,7 @@ def main():
 
     # ---- sender thread
     hs = torch.cuda.Stream(priority=-1) if C['prio'] else torch.cuda.current_stream()
-    OQ = collections.deque(); air = {'epoch': None, 't_off': None}; kidx = [0]; tim = collections.deque(maxlen=200); LAT = collections.deque(maxlen=50)
+    OQ = collections.deque(); air = {'epoch': None, 't_off': None, 'floor': None}; kidx = [0]; tim = collections.deque(maxlen=200); LAT = collections.deque(maxlen=50)
     def sender_loop():
         while not stop.is_set():
             with FL:
@@ -229,12 +238,13 @@ def main():
             P = vb.pose(tq)
             if P is None: st['kf_no_pose'] += 1; continue
             Rwb, pwb, ep, age, dz = P
-            if air['t_off'] is None:   # once: the first take-off (VIO height above its first pose, or above the VIO origin, which is its
-                if C['hold'] <= 0: air['t_off'] = t_img   # initialisation pose); a VIO restart later keeps it
-                elif dz > C['dz'] or pwb[2] > C['dz']: air['t_off'] = t_img; log('takeoff', epoch=ep, dz=dz, z=float(pwb[2]))
-                else: st['kf_ground'] += 1; continue
-            sending = t_img >= air['t_off'] + C['hold']
-            if t_img < air['t_off'] + C['hold'] - 2.5: st['kf_hold'] += 1; continue   # start 2.5 s before sending: triangulation partners
+            # the take-off latch, once: VIO height above its first pose, or above the VIO origin (its initialisation pose); a VIO restart
+            # later keeps it. Keyframes before it are processed (triangulation partners of the climb) but not sent.
+            if air['t_off'] is None and (dz > C['dz'] or pwb[2] > C['dz']):
+                air['t_off'] = t_img; S.set_floor_switch(tq + C['early_s'])
+                log('takeoff', epoch=ep, dz=dz, z=float(pwb[2]), t_kf=tq, send_from_t_img=t_img + C['hold'], floor_switch_t_kf=tq + C['early_s'])
+                print(f"[relloc] take-off latch: VIO {dz:.2f} m above its first pose; sending from +{C['hold']:g} s; floor {C['parmin_early']:g} -> {C['parmin']:g} deg at +{C['early_s']:g} s", flush=True)
+            sending = air['t_off'] is not None and t_img >= air['t_off'] + C['hold']   # every keyframe is processed, sent or not
             try:
                 ims = list(POOL.map(decode, imgs))
                 for c, im in enumerate(ims):
@@ -257,13 +267,15 @@ def main():
             except Exception as ex:
                 st['kf_error'] += 1; log('error', where='sender', err=repr(ex)); continue
             t2 = time.perf_counter(); k = kidx[0]; kidx[0] += 1; ready_rx.set(); tim.append((t1 - t0, t2 - t1))
+            if info['floor_deg'] != air['floor']:
+                log('floor', k=k, t_kf=tq, deg=info['floor_deg'], prev=air['floor']); print(f"[relloc] parallax floor {info['floor_deg']:g} deg from keyframe {k}", flush=True); air['floor'] = info['floor_deg']
             pose6 = (float(rp[0]), float(rp[1]), yaw, *pb)
             if sending:
                 udp.send(dg); st['kf_sent'] += 1; LAT.append(now() - tq)
                 OQ.append({'t': tq, 'dg': dg, 'pose': pose6, 'health': info['hl'] / 255.0, 'epoch': ep, 'k': k})
-            else: st['kf_warm'] += 1
+            else: st['kf_warm'] += 1; st['kf_ground' if air['t_off'] is None else 'kf_hold'] += 1   # processed, not sent: before the latch / in the hold
             log('own_kf', k=k, t_img=t_img, t_kf=tq, epoch=ep, age=age, pose=pose6, sent=sending, n_dg=len(dg), bytes=sum(len(g) for g in dg), wait_ms=1e3 * (t1 - t0), proc_ms=1e3 * (t2 - t1),
-                n_tri=info['n_tri'], n_mem=info['n_mem'], n3=info['n3_packet'], partners=info['n_partners'], health=info['hl'])
+                n_tri=info['n_tri'], n_mem=info['n_mem'], n3=info['n3_packet'], partners=info['n_partners'], health=info['hl'], floor=info['floor_deg'], z=float(pwb[2]), dz=dz)
 
     # ---- receiver thread
     SESSION = random.SystemRandom().getrandbits(32); CAL_DG = cal.encode(C['id'], SESSION); PEER_CAL = {}; PEER_SES = {}; solve_ms = collections.deque(maxlen=200)
@@ -365,7 +377,7 @@ def main():
                    'sender_wait_ms_med': float(np.median(tm[:, 0]) * 1e3) if len(tm) else None, 'sender_ms_med': float(np.median(tm[:, 1]) * 1e3) if len(tm) else None,
                    'udp_rx': udp.n_rx, 'udp_tx': udp.n_tx, 'udp_drop': udp.n_drop, 'rx_no_calib': st['rx_no_calib'], 'solves': st['solves'], 'solve_stale': st['solve_stale'],
                    'solve_ms_med': float(np.median(list(solve_ms))) if solve_ms else None, 'queue': len(SQ.q), 'lat_min_s': nd.lat_min, 'own_epoch': nd.own_epoch,
-                   'rx_error': st['rx_error'], 'peers': {str(p): nd.state(p)['status'] for p in list(nd.peers)}}
+                   'rx_error': st['rx_error'], 'takeoff': air['t_off'] is not None, 'floor_deg': air['floor'], 'peers': {str(p): nd.state(p)['status'] for p in list(nd.peers)}}
             print('[relloc] census ' + json.dumps(msg), flush=True); log('census', **msg)
     ths = [threading.Thread(target=f, name=n, daemon=True) for f, n in ((sender_loop, 'relloc-sender'), (receiver_loop, 'relloc-receiver'), (census, 'relloc-census'))]
     for th in ths: th.start()
