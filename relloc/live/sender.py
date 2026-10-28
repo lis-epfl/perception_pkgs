@@ -3,8 +3,9 @@
 This is relloc2's orin_pkg/sender_lean.py (round 16) in its deployed configuration (GRAPH=1, PACKET=1, CODEC_V=3, EARLY=0, INTRA=0), turned
 from a benchmark over a sequence file into a class fed one live keyframe at a time, with the parallax rule PT8F6G8 of relloc2 review24/fix
 (section 8) in place of sender_lean's 3-deg floor. At sender_lean's settings (parmin = parmin_early = 3, mem_gate = 0,
-mem_keep_fresh = False) the arithmetic is sender_lean's, expression for expression: test/test_sender_parity.py feeds a sender_lean
-sequence file through this class and compares the packets byte for byte.
+mem_keep_fresh = False) the arithmetic is sender_lean's, expression for expression, except sender_lean's positive-depth test on every
+view in use (dep > 0): the 0.35-deg residual test on the same views implies it (cos = dep / |v| >= cos 0.35 deg), so it is left out.
+test/test_sender_parity.py feeds a sender_lean sequence file through this class and compares the packets byte for byte.
   partners   the same camera at keyframes -10, -7, -5, -4, -3, -2, -1 (0.2-2 s back at 5 Hz) with a baseline >= 8 cm
   matching   mutual nearest neighbour of the top 1500 keypoints (by score) against the partners' 3000, cosine > 0.75, epipolar penalty
              folded into the fp16 product (SOFT 0.1), then the exact 1-deg band on the chosen match
@@ -39,6 +40,7 @@ class LiveSender:
         self.PARMIN = float(parmin); self.PARMIN_EARLY = float(parmin_early); self.t_switch = None; self.floor = self.PARMIN_EARLY
         self.MEM_GATE = float(mem_gate); self.cosgate = float(np.cos(np.radians(self.MEM_GATE))); self.mem_keep_fresh = bool(mem_keep_fresh)
         self.sinb = float(np.sin(np.radians(self.BAND))); self.cosres = float(np.cos(np.radians(self.RES_MAX)))
+        assert 0 <= self.RES_MAX < 90, 'gcompute has no dep > 0 test: the residual test stands in for it only below 90 deg'
         self.cospar = torch.tensor(np.cos(np.radians(self.floor)), dtype=torch.float32, device=dev)   # read by the graph: written in place only
         self.NP = NP = int(np_max); self.NQ = NQ = self.TOPQ if self.TOPQ > 0 else NP
         self.DEPTH = DEPTH = max(-min(self.DS), 1) + 1
@@ -116,9 +118,9 @@ class LiveSender:
             v = X[:, None, :] - Cc; cos = (v * Dd).sum(2) / v.norm(dim=2).clamp_min(1e-9); bad = (cos < cosres) & (W > 0); bad[:, 0] = False
             W = torch.where(bad, torch.zeros_like(W), W); X = self.tri(Cc, Dd, W)
         v = X[:, None, :] - Cc; dep = (v * Dd).sum(2); cos = dep / v.norm(dim=2).clamp_min(1e-9)
-        nobs = (W[:, 1:] > 0).sum(1); depok = torch.where(W > 0, dep > 0, torch.ones_like(dep, dtype=torch.bool)).all(1)
+        nobs = (W[:, 1:] > 0).sum(1)   # no separate dep > 0 test: cos = dep / |v| >= cosres > 0 on every view in use implies it
         par = torch.where(W[:, 1:] > 0, (Dd[:, 1:] * Dd[:, :1]).sum(2), torch.ones_like(W[:, 1:])).min(1).values
-        ok = (nobs >= 2) & (dep[:, 0] > 0.3) & (dep[:, 0] < 12) & torch.where(W > 0, cos >= cosres, torch.ones_like(cos, dtype=torch.bool)).all(1) & depok & (par <= cospar) & torch.isfinite(X).all(1)
+        ok = (nobs >= 2) & (dep[:, 0] > 0.3) & (dep[:, 0] < 12) & torch.where(W > 0, cos >= cosres, torch.ones_like(cos, dtype=torch.bool)).all(1) & (par <= cospar) & torch.isfinite(X).all(1)
         Xw = (SB['Rk'][selc] @ X[..., None])[..., 0] + SB['pk'][selc]; Xrg = (Xw - SB['pb']) @ SB['Rz']
         OUT.update(par=par, ok=ok, Xrg=Xrg, qz=ok[:0], n3=ok[:0], o=ok[:0], n3v=(ok & (nobs >= 3)).sum(), nok=ok.sum())
 
