@@ -13,13 +13,15 @@ On every drone, beside `run_online_msckf`:
 
 ```bash
 source /opt/ros/humble/setup.bash; source ~/ros2_swarmnxt_ws/install/setup.bash   # rclpy + px4_msgs
-set -a; source relloc/config/relloc.env; set +a
+set -a; source relloc/config/relloc.env; set +a              # ROS 2 between the drones, in domain 100 (section "Between the drones")
 export RELLOC=1 RELLOC_FLIGHT_DIR=~/flight_nxt3            # the drone's deploy_vio.py folder
-export RELLOC_DEST=192.168.1.106:47800,192.168.1.110:47800 # the other drones (or 255.255.255.255:47800)
 export RELLOC_6DOF=1                                        # optional: the 6-DoF output drives the lock (section below)
 bash relloc/scripts/run_relloc.sh --check                   # prints the resolved settings and exits
 bash relloc/scripts/run_relloc.sh
 ```
+
+Raw UDP instead of ROS 2: `export RELLOC_TRANSPORT=udp RELLOC_DEST=192.168.1.106:47800,192.168.1.110:47800` (the other drones, or
+255.255.255.255:47800).
 
 | flag | default | what it does |
 |---|---|---|
@@ -27,8 +29,11 @@ bash relloc/scripts/run_relloc.sh
 | `RELLOC_6DOF` | 0 | 1 = the 6-DoF output decides when an estimate is withdrawn and is the primary `transform`; 0 = the 4-DoF output (relloc2's deployed configuration). Both are published either way |
 | `RELLOC_ID` | last number of the hostname | this drone's number, 0-255; it is in every datagram |
 | `RELLOC_FLIGHT_DIR` | required | the flight folder: `kalibr_imucam_chain.yaml`, the lens terms (`OV_NONRADIAL` in its `flight_stiffness.env`), camera topics (`cam_topic0..3` of `estimator_flight.yaml`) |
-| `RELLOC_DEST` | 255.255.255.255:47800 | where the datagrams go: the other drones as `host:port,...` (unicast), or the broadcast address |
-| `RELLOC_PORT` | 47800 | the UDP port this drone listens on |
+| `RELLOC_TRANSPORT` | ros2 | how the datagrams travel between the drones: `ros2` (one best-effort ROS 2 message per datagram on `/relloc/dg/d<RELLOC_ID>`) or `udp` (raw UDP to `RELLOC_DEST`). Section "Between the drones" |
+| `RELLOC_ROS_DOMAIN` | 100 |  ros2: the ROS domain of the datagram topics, joined by every drone's relloc and nothing else; empty = the node's own domain, and the fleet's domain_bridge must forward the topics |
+| `RELLOC_ROS_DEPTH` | 128 | ros2: history depth of the datagram topics (at least 72: two bursts of 36 datagrams) |
+| `RELLOC_DEST` | 255.255.255.255:47800 | udp: where the datagrams go: the other drones as `host:port,...` (unicast), or the broadcast address |
+| `RELLOC_PORT` | 47800 | udp: the port this drone listens on |
 | `RELLOC_TAKEOFF_DZ` | 0.5 | the take-off latch: VIO height in m above its first pose. Every keyframe from the first VIO pose is processed (the first keyframes sent have triangulation partners from the ground and the start of the climb); packets leave, and the drone's own keyframes enter its receiver, from the latch on. -1 = no latch: the drone sends from its first VIO pose, also on the ground |
 | `RELLOC_TAKEOFF_HOLD_S` | 0 | seconds after the latch before the drone sends packets and solves |
 | `RELLOC_PARMIN_EARLY_DEG` | 8 | parallax floor of every triangulated point until the latch + `RELLOC_PARMIN_EARLY_S` (section "Take-off and parallax floor") |
@@ -41,7 +46,8 @@ bash relloc/scripts/run_relloc.sh
 | `RELLOC_IMU_TOPIC` | `imu_topic` of the folder's `estimator_flight.yaml`, else /fmu/out/sensor_combined | the gyro (px4_msgs SensorCombined; `RELLOC_IMU_MSG_TYPE=sensor_msgs/msg/Imu` for an Imu topic). Needed: see "What it needs" |
 | `RELLOC_CAM_TOPICS` | from the flight folder | comma list of the four camera topics, if `estimator_flight.yaml` has no `cam_topic0..3` |
 
-Less often needed: `RELLOC_TOPIC` (output prefix, `relloc`), `RELLOC_PEERS` (accept only these drone numbers), `RELLOC_MAX_QUEUE_S` (a
+Less often needed: `RELLOC_TOPIC` (output prefix, `relloc`), `RELLOC_PEERS` (accept only these drone numbers; with ros2 also the only
+peer topics subscribed, otherwise every `/relloc/dg/d<k>` seen is subscribed, looked up every 2 s), `RELLOC_MAX_QUEUE_S` (a
 solve that waited longer than this is dropped, 1.0), `RELLOC_SIM_TIME=1` (replays), `RELLOC_TD_S` (camera-IMU time offset; default the
 chain's `timeshift_cam_imu`).
 
@@ -66,8 +72,9 @@ chain's `timeshift_cam_imu`).
   from its descent. Check that one relloc runs per drone (`pgrep -af relloc_node.py`): a second process with the same drone number
   breaks every pair with that drone without an error.
 - **A link between the drones.** One drone sends about 43 kB per keyframe (36 datagrams of at most 1,200 B), 214 kB/s = 1.7 Mbit/s, plus
-  60-B estimate messages and a 749-B calibration message per second. relloc2's radio specification: residual loss below 5 %, loss bursts
-  shorter than 8 datagrams. On Wi-Fi a broadcast frame goes at the network's basic rate, which can be too slow: prefer the unicast list.
+  60-B estimate messages and a 749-B calibration message per second; over ROS 2 about 6-8 % more airtime (section "Between the drones").
+  relloc2's radio specification: residual loss below 5 %, loss bursts shorter than 8 datagrams. With UDP: on Wi-Fi a broadcast frame goes
+  at the network's basic rate, which can be too slow: prefer the unicast list.
 
 ## Outputs
 
@@ -91,6 +98,86 @@ The log has one JSON object per line: `own_kf` (every keyframe: pose, height abo
 not), `takeoff` (the latch), `floor` (each change of the floor), `peer_kf` (every received header), `solve` (every solve: inliers,
 margin, 4-DoF and 6-DoF values), `lock`, `withdraw`, `output`, and a `census` every 5 s. With the drones' motion capture this is enough
 to grade a flight offline.
+
+## Between the drones
+
+Every datagram travels on its own, best effort: per keyframe 36 of at most 1,200 B, a 60-B estimate message 5 times per second, a 749-B
+calibration message once per second. A lost datagram costs the 54-56 keypoints it carries, never the keyframe. `RELLOC_TRANSPORT` picks
+the carrier:
+
+- `ros2` (relloc.env): one ROS 2 message per datagram, `std_msgs/msg/UInt8MultiArray`. Each drone publishes `/relloc/dg/d<RELLOC_ID>` and
+  subscribes to `/relloc/dg/d<k>` of every peer: the drones of `RELLOC_PEERS`, or every such topic it sees (looked up every 2 s). QoS
+  best effort, keep last `RELLOC_ROS_DEPTH` (128), volatile, on both sides.
+- `udp`: one UDP datagram per datagram to every address of `RELLOC_DEST`, received on `RELLOC_PORT` (the previous default).
+
+relloc2's study of ROS 2 for this traffic (review24/ros2: two network namespaces with netem loss and rate limits, Fast DDS 2.6.11 as in
+the fleet) set the design:
+
+- One best-effort message per datagram delivered the same share of keypoints as raw UDP under every loss condition: 89.1-89.8 % against
+  89.9-90.4 % at 10 % independent loss; 0.40 % of the keyframes lost against 0.41 % with 10 % loss in bursts. It adds no loss, and no
+  reliability either.
+- One message per keyframe (43 kB, the usual ROS way) is lost with any of its 30-34 fragments: at 10 % loss 1.6-3.3 % of the keyframes
+  arrived. RELIABLE with default timers does not rescue it, because its repairs arrive after the 0.19-s decode window. Keep one message
+  per datagram and best effort.
+
+Domains (`RELLOC_ROS_DOMAIN`):
+
+- `100` (relloc.env): the datagram topics live in domain 100, in a second DDS participant inside relloc's process. Every drone's relloc
+  joins it and nothing else does; the cameras, the VIO and PX4 stay in the drone's own domain (its number). One domain shared by
+  everything would mix the drones' identically named topics (`/fmu/in/*`, `/poseimu`, the cameras). No bridge is needed. Why 100: it is
+  no drone number and not the ground station's 0, and it lies within 0-101, the IDs whose DDS ports (for 100: 32400-32649) stay below
+  Linux's ephemeral ports. Drone numbers must be unique within it: two groups flying on one network need two values.
+- empty: the topics live in each node's own domain and the fleet's domain_bridge forwards them, as it does `traj_full`. In swarm-nxt's
+  `ansible/templates/drone_bridge_config.yaml.j2`, beside the `traj_full` loop (needs best effort and a depth of at least 72; not tested,
+  domain_bridge is not installed on the test workstation):
+
+```yaml
+{% for drone in groups['drones'] %}
+{% set drone_num_id = drone | regex_replace('\.local', '') | regex_search('[0-9]+$') %}
+{% if loop.index0 != current_drone_idx %}
+  /relloc/dg/d{{ drone_num }}:
+    type: std_msgs/msg/UInt8MultiArray
+    to_domain: {{ drone_num_id }}
+    qos:
+      reliability: best_effort
+      durability: volatile
+      history: keep_last
+      depth: 128
+{% endif %}
+{% endfor %}
+```
+
+What ROS 2 costs against raw UDP:
+
+- **Latency:** the study measured +1.0-1.4 ms per keyframe at 24 Mbit/s and +3.6-5.6 ms at 6 Mbit/s: the time to send the extra headers.
+  This version on the workstation, over loopback UDP (relloc2 `review24/ros2tx` bench): a back-to-back burst is complete after 0.79-0.82
+  ms against 0.25 ms; with the datagrams spaced as at 24 Mbit/s each one arrives 0.035 ms after its send against 0.01 ms.
+- **Airtime:** 1.10-1.12 times the payload against 1.036, +6-8 %: the RTPS and CDR headers add 88-91 B per datagram.
+- **Receive CPU per peer:** the study's receiver, one callback per message, took 15.4 ms per keyframe on the Orin with the datagrams
+  spaced at 24 Mbit/s (7.7 % of one core), against 0.91 ms (0.46 %) for UDP. The receive thread here waits on a bare wait set, drains every
+  subscription after each wake-up and slices the payload out of the serialized message. On the workstation it takes 2.1 ms per keyframe
+  spaced and 0.85 ms in bursts, against 0.7 and 0.3 ms for UDP; the study's receiver took 8.3 and 5.7 ms there. Not measured on the Orin;
+  scaled by the study's Orin / workstation ratio (1.85, spaced), about 4 ms per keyframe, 2 % of one core per peer (an estimate).
+- **Sender:** 2.7 against 0.48 ms per keyframe on the Orin (study); here 1.7 against 1.1 ms on the workstation (bursts).
+- **Discovery:** Fast DDS's default, multicast on the Wi-Fi. In the study (Fast DDS and Cyclone) every one of 298 trials found the
+  peer; under loss Fast DDS's first usable keyframe came after 1.06 s (median), 5.06 s at most. Without RELLOC_PEERS the node looks for
+  peer topics every 0.25 s for its first 10 s, then every 2 s.
+- **Not tested, to check on the drones before a flight relies on it:**
+  - rclpy's publish keeps Python's interpreter lock while Fast DDS sends (synchronous publication). If the send buffer fills on a
+    congested radio, every relloc thread waits; raw UDP gives up after 0.2 s. On the drones' Wi-Fi with three drones, compare with
+    `RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS`.
+  - A receive thread that stalls for more than ~0.7 s loses the oldest datagrams of each peer (depth 128) without a counter.
+  - Outages longer than Fast DDS's 20-s lease: relloc2's outage study used UDP.
+  - The study's 1,400-B cap for discovery messages over a lossy radio is not applied (Fast DDS defaults).
+
+The wait set is rclpy's internal `_rclpy.WaitSet`, built as rclpy's own executor builds it. If an rclpy lacks it, the node falls back to
+an executor (`receive` in the start log's `transport` event) with the same drain, at the higher CPU cost.
+
+In flight, the census line shows `ros2_rx`, `ros2_tx`, `ros2_drop`, `ros2_err` and `ros2`: the subscribers matched to the own topic
+(`readers`: one per peer that listens to this drone) and, per subscribed topic, the datagrams received with their DDS latency (reception
+minus source time: the one-way delay when the drones' clocks agree) and the take lag of the receive thread, p50 / p90 / max in ms.
+`rx_peer` gives, per peer and for both transports, the datagrams received by kind (`kf`, `est`, `cal`) and node15's drops (`late`: after
+the keyframe was decoded; `dup`, `stale`, `bad`).
 
 ## The 6-DoF output
 
@@ -145,12 +232,12 @@ events, `own_kf.floor`).
 relloc_node.py        the node
 live/                 new code: sender.py (relloc2's sender_lean.py as a class, with the parallax rule), receiver.py (node15.Node + the 6-DoF
                       estimate), six.py, vio.py (pose at the image instant), calib.py (flight folder, calibration datagram), lens.py,
-                      transport.py (UDP)
+                      transport.py (between the drones: ROS 2 or UDP)
 core/                 relloc2 modules, byte-identical copies (md5 below): the evaluated receiver, lock rule, codec
 third_party/          XFeat + LighterGlue (verlab/accelerated_features e92685f, Apache-2.0: modules and weights unchanged)
 config/relloc.env     the flags
 scripts/              run_relloc.sh, build_xfeat_engine.py
-test/                 test_units.py, test_sender_parity.py, play_pair.py (replay of recordings for the node)
+test/                 test_units.py, test_sender_parity.py, test_ros2_transport.py, play_pair.py (replay of recordings for the node)
 ```
 
 `core/` = relloc2's `orin_pkg/` (and `rule15.py`) of 2026-10-21, md5 (first 12 digits): `lg_trt.py` e28ac6ce6d5f, `lggraph.py`
@@ -181,6 +268,46 @@ What the live code does differently from relloc2's evaluated replay:
 - Rig: drones of the fleet only (four cameras, 1280 x 800, KB4). Peers of another rig are ignored.
 
 ## Tested
+
+This version (ROS 2 between the drones), 2026-10-30, on the workstation (RTX 5070, ROS 2 Humble, Fast DDS 2.6.11; relloc2
+`review24/ros2tx`). The sender and core/ are unchanged.
+
+- `test/test_units.py`: all pass. `test/test_sender_parity.py ... 216e2fed6c33b515 --rules`: sender_lean's packets, every rule check passes.
+- `test/test_ros2_transport.py` (new; 34 checks pass): two transports in one process, in both domain modes and with both receive loops.
+  Discovery; 760 datagrams each way (20 bursts of 36 plus calibration and estimate datagrams, one side sending from two threads) arrive
+  byte for byte and in order; the counters agree; no own datagram; a message with another layout is deserialized; clean close.
+- Transport benchmark, two processes over loopback with Fast DDS on UDP only, 40 s per run, 2 runs per cell: every datagram arrived
+  (7,998 of 7,998). Back-to-back bursts: keyframe complete after 0.79-0.82 ms against 0.25 ms for raw UDP, receive CPU 0.82-0.88 against
+  0.30 ms per keyframe. Datagrams spaced as at 24 Mbit/s: 0.035 against 0.01 ms per datagram, receive CPU 2.06-2.17 against 0.66-0.71
+  ms per keyframe. The first version of the receive loop (an executor) took 6.4-6.9 ms per keyframe spaced, 1.2-1.3 ms in bursts.
+- Replays through two nodes of this version, as in the test below (three scenarios, every camera frame at half speed, graded against
+  motion capture), raw UDP and ROS 2 (`RELLOC_ROS_DOMAIN` set) interleaved, one run each, plus one ROS 2 run with the datagram topics in
+  the nodes' own domain (`RELLOC_ROS_DOMAIN` empty). Both nodes ran on one host, where Fast DDS used shared memory between them (each
+  ROS 2 node mapped 4 more Fast DDS segments), so the latency and CPU below are not the radio's:
+
+| scenario (per direction: nxt3 <- nxt6, nxt6 <- nxt3) | transport | first lock after the later lift-off: error | wrong locks / withdrawals | held error, median / 90th pct |
+|---|---|---|---|---|
+| s3, simultaneous take-off | UDP | 1.00 s: 2.8 cm, 1.00 s: 1.4 cm | 0 / 0 | 3.8 / 6.7, 3.4 / 7.1 cm |
+| | ROS 2, domain of its own | 1.00 s: 2.8 cm, 1.00 s: 1.4 cm | 0 / 0 | 3.7 / 6.8, 3.6 / 7.0 cm |
+| | ROS 2, the nodes' domain | 1.00 s: 1.3 cm, 0.77 s: 4.7 cm | 0 / 0 | 3.9 / 6.9, 3.7 / 6.9 cm |
+| s3, nxt6 takes off 30 s after nxt3 | UDP | 0.40 s: 5.6 cm, 0.37 s: 3.5 cm | 0 / 0 | 3.9 / 7.4, 3.8 / 7.0 cm |
+| | ROS 2, domain of its own | 0.40 s: 5.6 cm, 0.37 s: 3.5 cm | 0 / 0 | 3.8 / 7.0, 3.8 / 7.3 cm |
+| s1, nxt6 takes off 25 s after nxt3 | UDP | 0.30 s: 6.6 cm, 0.41 s: 7.9 cm | 0 / 0 | 4.5 / 7.9, 5.0 / 8.8 cm |
+| | ROS 2, domain of its own | 0.30 s: 5.6 cm, 0.15 s: 4.8 cm | 0 / 0 | 4.2 / 7.0, 4.9 / 8.3 cm |
+
+- Datagrams: in every run and direction the receiver got every keyframe datagram the sender sent (6,660-22,320 per direction), all in
+  time (no late, duplicate, stale or bad datagram), and every datagram but at most the last one sent at the stop. No queue drop, no
+  publish or receive error over ROS 2; one UDP calibration datagram failed in the first 5 s, sent before the peer's port was bound.
+- Header latency (the receiver's arrival of a keyframe's first header datagram minus the sender's send, on the shared sim clock): mean
+  0.6-1.2 ms later over ROS 2 than over UDP (wall-clock equivalent; the clock steps by 5 ms, about 470 headers per direction). The DDS
+  part was 0.03-0.05 ms (median); the receive thread took the datagrams 0.21-0.27 ms after their reception (median; the 90th percentile
+  of the last 2,000 datagrams reached 3.7 ms once).
+- CPU, at half speed: the node processes took 21-29 % of one core with either transport (ROS 2 minus UDP, same scenario and node: 0.0
+  to +2.4 points); the receive thread 0.18-0.23 % (ROS 2) against 0.06-0.12 % (UDP).
+- In both s3 scenarios UDP and ROS 2 (domain of its own) first locked on the same keyframe pairs with the same estimate. In s1 the
+  nxt6 <- nxt3 lock came at 0.15 s over ROS 2 and 0.41 s over UDP; two earlier UDP runs of this direction locked at 0.18 and 0.31 s
+  (review24/clock and the runs below), so one run per arm does not separate the transports. One accepted maintenance solve of the run
+  in the nodes' domain was 20.2 cm off; it caused no withdrawal.
 
 This version (take-off latch and PT8F6G8), 2026-10-25, on the workstation (RTX 5070, ROS 2 Humble; relloc2 `review24/branch`):
 
@@ -261,21 +388,27 @@ without a restart of relloc.
   the VIO beside `taskset -c 4-7 nice -n 5 bash relloc/scripts/run_relloc.sh` (pose delay, incomplete image sets), with PX4 on motion
   capture.
 - The packet header carries the peer's pose at its keyframe; `position` is therefore 0.1-0.3 s old.
+- ROS 2 between the drones has run on one workstation only: not over the drones' Wi-Fi, not on the Orin (its receive CPU above is an
+  estimate), not through domain_bridge, not with three or more drones. Measure it on the drones' Wi-Fi before a flight relies on it.
 - No time synchronisation is needed between drones (each receiver estimates the clock offset from the packet headers), but the camera
   stamps, the VIO stamps and the IMU stamps of one drone must share its clock, as the VIO requires anyway.
 
 ## Replaying recordings
 
-One node per drone, each with its own `RELLOC_ID`, flight folder, ports and the player's topics, then the player:
+One node per drone, each with its own `RELLOC_ID`, flight folder and the player's topics, then the player:
 
 ```bash
-export ROS_DOMAIN_ID=87 RELLOC_SIM_TIME=1 RELLOC=1
-RELLOC_ID=3 RELLOC_FLIGHT_DIR=<folder nxt3> RELLOC_PORT=47803 RELLOC_DEST=127.0.0.1:47806 RELLOC_TOPIC=nxt3/relloc \
+export ROS_DOMAIN_ID=87 RELLOC_SIM_TIME=1 RELLOC=1 RELLOC_TRANSPORT=ros2 RELLOC_ROS_DOMAIN=88   # a domain nobody else uses on this host
+RELLOC_ID=3 RELLOC_FLIGHT_DIR=<folder nxt3> RELLOC_TOPIC=nxt3/relloc \
   RELLOC_CAM_TOPICS=/nxt3/cam0/compressed,/nxt3/cam1/compressed,/nxt3/cam2/compressed,/nxt3/cam3/compressed \
   RELLOC_POSE_TOPIC=/nxt3/poseimu RELLOC_IMU_TOPIC=/nxt3/fmu/out/sensor_combined bash relloc/scripts/run_relloc.sh &
-# ... the same for nxt6 (RELLOC_ID=6, ports swapped, /nxt6/...)
+# ... the same for nxt6 (RELLOC_ID=6, /nxt6/...)
 python3 relloc/test/play_pair.py --all-frames --drone ns=nxt3,mcap=<cams.mcap>,traj=<vio.tum>,bag=<bag.mcap>,toff=<t_d> --drone ns=nxt6,...
 ```
+
+With `RELLOC_ROS_DOMAIN` empty the datagram topics share the player's domain, which both nodes are in. With `RELLOC_TRANSPORT=udp` give
+each node its ports: `RELLOC_PORT=47803 RELLOC_DEST=127.0.0.1:47806` for nxt3, swapped for nxt6. On one host Fast DDS may carry the
+datagrams through shared memory, so latency and CPU there are not the radio's.
 
 `traj` is the estimator's trajectory in camera time (`toff` = its t_d shifts it to the IMU time of `/poseimu`). For recordings made
 before 15 Oct (arrival stamps) pass `--imu-stamp log`, which reproduces how relloc2 aligned the gyro with those recordings.

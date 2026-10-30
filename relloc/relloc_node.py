@@ -3,14 +3,15 @@
 
 What it does, per drone (one process, three threads):
   sender     every 0.2 s: the four images of one instant + the VIO pose at that instant -> XFeat (3000 keypoints per image) -> rays
-             (KB4 + lens terms) -> triangulation against the drone's own past keyframes -> v3 packet (about 43 kB in 36 datagrams) -> UDP.
+             (KB4 + lens terms) -> triangulation against the drone's own past keyframes -> v3 packet (about 43 kB in 36 datagrams) -> transport.
              Every keyframe from the first VIO pose is processed (the first keyframes sent have triangulation partners from the ground
              and the start of the climb); packets leave, and own keyframes enter the receiver, from the take-off latch (VIO 0.5 m above
              its first pose) on.
              Parallax floor 8 deg until the latch + 8 s, then 6 deg (relloc2 review24 rule PT8F6G8, live/sender.py)
   receiver   the other drones' datagrams -> node15 (decode, pairing with own keyframes, solve on the GPU, lock rule, maintenance, pair
              protocol) -> per peer the transform of the peer's VIO world into the own VIO world, 4-DoF and 6-DoF
-  udp        datagram intake
+  transport  datagram intake: ROS 2 (RELLOC_TRANSPORT=ros2, one best-effort message per datagram on /relloc/dg/d<id>) or UDP
+             (RELLOC_TRANSPORT=udp, RELLOC_DEST), live/transport.py
 Inputs: the camera topics of the VIO (CompressedImage or Image), the VIO pose (run_online_msckf's /poseimu), the PX4 IMU (gyro between
         VIO poses), the flight folder.
 Outputs (prefix RELLOC_TOPIC, default relloc):
@@ -45,9 +46,16 @@ def config():
          'peers': E('RELLOC_PEERS', ''), 'max_queue_s': float(E('RELLOC_MAX_QUEUE_S', '1.0')), 'topic': E('RELLOC_TOPIC', 'relloc').strip('/'),
          'sim_time': E('RELLOC_SIM_TIME', '0') == '1', 'prio': E('RELLOC_SENDER_PRIO', '1') == '1', 'name': E('RELLOC_NODE_NAME', ''),
          'engine': E('RELLOC_XFEAT_ENGINE', ''), 'parmin': float(E('RELLOC_PARMIN_DEG', '6')), 'parmin_early': float(E('RELLOC_PARMIN_EARLY_DEG', '8')),
-         'early_s': float(E('RELLOC_PARMIN_EARLY_S', '8')), 'mem_gate': float(E('RELLOC_MEM_GATE_DEG', '8'))}
+         'early_s': float(E('RELLOC_PARMIN_EARLY_S', '8')), 'mem_gate': float(E('RELLOC_MEM_GATE_DEG', '8')),
+         'transport': E('RELLOC_TRANSPORT', 'ros2').strip().lower(), 'ros_domain': E('RELLOC_ROS_DOMAIN', '100').strip(), 'ros_depth': E('RELLOC_ROS_DEPTH', '128').strip()}
     if not c['id'] or not c['id'].isdigit() or not 0 <= int(c['id']) <= 255: raise SystemExit(f'RELLOC_ID must be a drone number 0-255 (hostname gives {_id_default()!r})')
     c['id'] = int(c['id'])
+    if c['transport'] not in ('ros2', 'udp'): raise SystemExit(f"RELLOC_TRANSPORT {c['transport']!r}: ros2 or udp")
+    if c['ros_domain'] and (not c['ros_domain'].isdigit() or not 0 <= int(c['ros_domain']) <= 232):
+        raise SystemExit(f"RELLOC_ROS_DOMAIN {c['ros_domain']!r}: a ROS domain id (0-101 on Linux), or empty for the node's own domain")
+    c['ros_domain'] = int(c['ros_domain']) if c['ros_domain'] else None
+    if not c['ros_depth'].isdigit() or int(c['ros_depth']) < 1: raise SystemExit(f"RELLOC_ROS_DEPTH {c['ros_depth']!r}: history depth per topic, >= 1")
+    c['ros_depth'] = int(c['ros_depth'])
     for k, v in (('parmin', 'RELLOC_PARMIN_DEG'), ('parmin_early', 'RELLOC_PARMIN_EARLY_DEG'), ('mem_gate', 'RELLOC_MEM_GATE_DEG')):
         if not 0 <= c[k] < 90: raise SystemExit(f'{v} {c[k]}: a parallax angle in deg, 0-90')
     if c['early_s'] < 0 or c['hold'] < 0: raise SystemExit('RELLOC_PARMIN_EARLY_S and RELLOC_TAKEOFF_HOLD_S: seconds, >= 0')
@@ -64,16 +72,28 @@ def main():
     cam_type = C['cam_type'] or cal.msg_type or ('sensor_msgs/msg/CompressedImage' if cams[0].endswith('compressed') else 'sensor_msgs/msg/Image')
     if len(cams) != cal.ncam: raise SystemExit(f'{len(cams)} camera topics for {cal.ncam} cameras')
     dest = TR.parse_dest(C['dest'], C['port']); peers_ok = {int(x) for x in C['peers'].split(',') if x.strip()} or None
+    if C['transport'] == 'udp': link = {'udp_port': C['port'], 'udp_dest': [f'{h}:{p}' for h, p in dest]}
+    else:
+        dom = C['ros_domain']
+        link = {'ros2': {'domain': dom if dom is not None else f"the node's (ROS_DOMAIN_ID={E('ROS_DOMAIN_ID', '0') or '0'}): the domain_bridge must forward /relloc/dg/d<k>",
+                         'topic': f"{TR.Ros2.PREFIX}{C['id']}", 'peers': sorted(peers_ok - {C['id']}) if peers_ok else 'discovered every 2 s',
+                         'qos': f"best effort, keep last {C['ros_depth']}, volatile", 'message': f'{TR.Ros2.MSG}, one per datagram'}}
     summary = {'drone': C['id'], 'calibration': cal.source, 'cameras': cal.ncam, 'image': [cal.W, cal.H], 'lens_terms': cal.has_terms, 'td_s': td,
-               'camera_topics': cams, 'camera_msg_type': cam_type, 'vio_pose': f"{C['pose']} ({C['pose_type']})", 'imu': f"{C['imu']} ({C['imu_type']})" if C['imu'] else 'none: attitude interpolated between VIO poses', 'udp_port': C['port'], 'udp_dest': [f'{h}:{p}' for h, p in dest],
+               'camera_topics': cams, 'camera_msg_type': cam_type, 'vio_pose': f"{C['pose']} ({C['pose_type']})", 'imu': f"{C['imu']} ({C['imu_type']})" if C['imu'] else 'none: attitude interpolated between VIO poses',
+               'transport': C['transport'], **link,
                'peers': sorted(peers_ok) if peers_ok else 'any', 'primary_output': '6dof' if C['six'] else '4dof', 'takeoff_hold_s': C['hold'],
                'takeoff_dz_m': C['dz'], 'parallax_floor_deg': {'until_takeoff_plus_s': C['early_s'], 'early': C['parmin_early'], 'after': C['parmin']},
                'memory': {'store_gate_deg': C['mem_gate'], 'keeps_fresh_depths': True}, 'log_dir': C['log_dir'], 'max_queue_s': C['max_queue_s'],
                'topic_prefix': C['topic'], 'sim_time': C['sim_time'], 'xfeat': f"TensorRT {C['engine']}" if C['engine'] else 'torch (batched)'}
     if C['engine'] and not os.path.exists(os.path.expanduser(C['engine'])): raise SystemExit(f"RELLOC_XFEAT_ENGINE {C['engine']}: no such file (scripts/build_xfeat_engine.py)")
     print('[relloc] ' + json.dumps(summary), flush=True)
-    if any(h == '255.255.255.255' or h.endswith('.255') for h, _ in dest):
+    if C['transport'] == 'udp' and any(h == '255.255.255.255' or h.endswith('.255') for h, _ in dest):
         print('[relloc] WARNING: broadcast destination: on Wi-Fi broadcast frames go at the basic rate without retries; ~1.7 Mbit/s per drone may not fit. Prefer RELLOC_DEST=<peer>:<port>,...', flush=True)
+    if C['transport'] == 'ros2':
+        if C['ros_domain'] is None: print("[relloc] ros2 in the node's own domain (RELLOC_ROS_DOMAIN empty): the peers hear this drone only through the fleet's domain_bridge (README)", flush=True)
+        elif C['ros_domain'] > 101: print(f"[relloc] WARNING: RELLOC_ROS_DOMAIN {C['ros_domain']} > 101: its DDS ports can collide with Linux's ephemeral ports", flush=True)
+        elif str(C['ros_domain']) == (E('ROS_DOMAIN_ID', '0') or '0'): print(f"[relloc] WARNING: RELLOC_ROS_DOMAIN {C['ros_domain']} = this drone's ROS_DOMAIN_ID: the other drones' relloc join this drone's domain", flush=True)
+        if C['ros_depth'] < 72: print(f"[relloc] WARNING: RELLOC_ROS_DEPTH {C['ros_depth']} < 72 (two bursts of 36 datagrams): a peer's burst can overwrite the one before", flush=True)
     if not C['imu']: print('[relloc] WARNING: no IMU topic: the attitude between VIO poses is interpolated (tilt error ~3x in the replay test)', flush=True)
     if '--check' in sys.argv: return
     os.environ.setdefault('CAPTURE_MODE', 'thread_local')
@@ -142,7 +162,9 @@ def main():
         return (e['t'], e['pose'], e['A'], e['health'])
     nd = RCV.LiveNode(codec, RX.solve, own, [], win=0.25, rule=None, clock_free=True, own_id=C['id'], rig=CAL.RIG, own_fx=cal.fx, pair_protocol=True, six_primary=C['six'])
     SQ = node15.SolveQueue(nd)
-    udp = TR.Udp(C['port'], dest, now)
+    if C['transport'] == 'udp': tx = TR.Udp(C['port'], dest, now)
+    else: tx = TR.Ros2(C['id'], now, domain=C['ros_domain'], peers=peers_ok, depth=C['ros_depth'])
+    log('transport', transport=C['transport'], rx_thread=tx.th.native_id, **(link if C['transport'] == 'udp' else {'ros2': tx.describe()}))   # rx_thread: Linux thread id (top -H)
 
     # ---- ROS inputs
     vb = VIO.VioBuffer(); st = collections.Counter(); ready_rx = threading.Event(); stop = threading.Event()
@@ -271,7 +293,7 @@ def main():
                 log('floor', k=k, t_kf=tq, deg=info['floor_deg'], prev=air['floor']); print(f"[relloc] parallax floor {info['floor_deg']:g} deg from keyframe {k}", flush=True); air['floor'] = info['floor_deg']
             pose6 = (float(rp[0]), float(rp[1]), yaw, *pb)
             if sending:
-                udp.send(dg); st['kf_sent'] += 1; LAT.append(now() - tq)
+                tx.send(dg); st['kf_sent'] += 1; LAT.append(now() - tq)
                 OQ.append({'t': tq, 'dg': dg, 'pose': pose6, 'health': info['hl'] / 255.0, 'epoch': ep, 'k': k})
             else: st['kf_warm'] += 1; st['kf_ground' if air['t_off'] is None else 'kf_hold'] += 1   # processed, not sent: before the latch / in the hold
             log('own_kf', k=k, t_img=t_img, t_kf=tq, epoch=ep, age=age, pose=pose6, sent=sending, n_dg=len(dg), bytes=sum(len(g) for g in dg), wait_ms=1e3 * (t1 - t0), proc_ms=1e3 * (t2 - t1),
@@ -279,11 +301,13 @@ def main():
 
     # ---- receiver thread
     SESSION = random.SystemRandom().getrandbits(32); CAL_DG = cal.encode(C['id'], SESSION); PEER_CAL = {}; PEER_SES = {}; solve_ms = collections.deque(maxlen=200)
+    RXP = collections.defaultdict(collections.Counter)   # per peer: datagrams received, by kind (census rx_peer, with node15's late / dup / stale / bad)
     def handle(g, t, addr):
         if CAL.Calib.is_calib(g):
             r = CAL.Calib.decode(g)
             if r is None: st['rx_bad_calib'] += 1; return
             pid, pc, ses = r
+            if pid != C['id']: RXP[pid]['cal'] += 1
             if pid == C['id'] or (peers_ok and pid not in peers_ok): return
             if pc.W != cal.W or pc.H != cal.H: st['rx_other_rig'] += 1; return
             if pid in PEER_CAL and PEER_CAL[pid].same(pc) and PEER_SES.get(pid) == ses: return
@@ -296,6 +320,7 @@ def main():
         try: drone, kf, cam, ck, nck, has = PC.Codec.peek(g)
         except Exception: st['rx_bad'] += 1; return
         if drone == C['id']: return
+        RXP[drone]['est' if cam == PC.Codec.EST_CAM else 'kf'] += 1
         if cam == PC.Codec.EST_CAM: nd.on_estimate(g, t); st['rx_est'] += 1; return
         if drone not in nd.peers: st['rx_no_calib'] += 1; return
         if nd.peers[drone].on_datagram(g, t) is not None and has:
@@ -318,10 +343,10 @@ def main():
             t = now(); busy = False
             if LAT: nd.lat_min = max(0.02, min(list(LAT)))   # node15's clock offset assumes this minimum packet latency: the own sender's
             if nd.set_own_epoch(t, vb.epoch): log('own_epoch', epoch=vb.epoch)   # the epoch of the own packet headers
-            if t - T['cal'] >= 1.0: udp.send([CAL_DG]); T['cal'] = t
+            if t - T['cal'] >= 1.0: tx.send([CAL_DG]); T['cal'] = t
             n = 0
-            while not udp.q.empty() and n < 2000:
-                g, ta, addr = udp.q.get_nowait(); handle(g, ta, addr); n += 1
+            while not tx.q.empty() and n < 2000:
+                g, ta, addr = tx.q.get_nowait(); handle(g, ta, addr); n += 1
             while OQ:
                 e = OQ.popleft()
                 if e['epoch'] != nd.own_epoch: st['own_kf_old_epoch'] += 1; continue
@@ -352,7 +377,7 @@ def main():
                     if was and not p.lock.locked: log('withdraw', peer=pid)
                     publish(pid, t2); busy = True
             if t - T['est'] >= 0.2:
-                m = nd.estimate_messages(t); udp.send(m); T['est'] = t
+                m = nd.estimate_messages(t); tx.send(m); T['est'] = t
                 for pid in list(nd.peers): publish(pid, t)
             if t - T['stat'] >= 1.0:
                 T['stat'] = t; out = {}
@@ -365,6 +390,12 @@ def main():
         import rule15
         return rule15.zmargin(s)
 
+    def link_counts():   # transport counters (udp_rx ... or ros2_rx ... plus the ROS 2 stats) and per peer: datagrams received by kind, node15's drops
+        out = {f"{C['transport']}_{k}": getattr(tx, f'n_{k}') for k in ('rx', 'tx', 'drop', 'err')}
+        if C['transport'] == 'ros2': out['ros2'] = tx.stats()
+        out['rx_peer'] = {str(pid): {**c, **({'late': p.n_late, 'dup': p.n_dup, 'stale': p.n_stale, 'bad': p.n_bad} if p is not None else {})}
+                          for pid, c, p in ((pid, dict(c), nd.peers.get(pid)) for pid, c in sorted(list(RXP.items())))}
+        return out
     def census():
         while not stop.wait(5.0):
             try: census_once()
@@ -375,7 +406,7 @@ def main():
             msg = {'vio_poses': st['vio_poses'], 'imu': st['imu'], 'gyro_attitudes': vb.n_gyro, 'slerp_attitudes': vb.n_slerp, 'gyro_bias': [round(float(x), 5) for x in vb.bias], 'images': [st[f'img{c}'] for c in range(cal.ncam)], 'kf_sent': st['kf_sent'], 'kf_warm': st['kf_warm'], 'kf_ground': st['kf_ground'],
                    'kf_hold': st['kf_hold'], 'kf_no_pose': st['kf_no_pose'], 'img_incomplete': st['img_incomplete'], 'kf_dropped_busy': st['kf_dropped_busy'], 'kf_error': st['kf_error'],
                    'sender_wait_ms_med': float(np.median(tm[:, 0]) * 1e3) if len(tm) else None, 'sender_ms_med': float(np.median(tm[:, 1]) * 1e3) if len(tm) else None,
-                   'udp_rx': udp.n_rx, 'udp_tx': udp.n_tx, 'udp_drop': udp.n_drop, 'rx_no_calib': st['rx_no_calib'], 'solves': st['solves'], 'solve_stale': st['solve_stale'],
+                   **link_counts(), 'rx_no_calib': st['rx_no_calib'], 'solves': st['solves'], 'solve_stale': st['solve_stale'],
                    'solve_ms_med': float(np.median(list(solve_ms))) if solve_ms else None, 'queue': len(SQ.q), 'lat_min_s': nd.lat_min, 'own_epoch': nd.own_epoch,
                    'rx_error': st['rx_error'], 'takeoff': air['t_off'] is not None, 'floor_deg': air['floor'], 'peers': {str(p): nd.state(p)['status'] for p in list(nd.peers)}}
             print('[relloc] census ' + json.dumps(msg), flush=True); log('census', **msg)
@@ -390,8 +421,11 @@ def main():
         while rclpy.ok() and not stop.is_set(): ex.spin_once(timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
-    stop.set(); [th.join(timeout=2.0) for th in ths]; udp.close()
-    try: log('stop', **dict(st))
+    stop.set(); [th.join(timeout=2.0) for th in ths]
+    try: lc = link_counts()
+    except Exception: lc = {}
+    tx.close()
+    try: log('stop', **dict(st), link=lc)
     except Exception: pass
     LOG.close()
     try: ros.destroy_node(); rclpy.shutdown()
