@@ -45,7 +45,7 @@ def config():
          'dz': float(E('RELLOC_TAKEOFF_DZ', '0.5')), 'log_dir': os.path.expanduser(E('RELLOC_LOG_DIR', '~/relloc_logs')), 'td': E('RELLOC_TD_S', ''),
          'peers': E('RELLOC_PEERS', ''), 'max_queue_s': float(E('RELLOC_MAX_QUEUE_S', '1.0')), 'topic': E('RELLOC_TOPIC', 'relloc').strip('/'),
          'sim_time': E('RELLOC_SIM_TIME', '0') == '1', 'prio': E('RELLOC_SENDER_PRIO', '1') == '1', 'name': E('RELLOC_NODE_NAME', ''),
-         'engine': E('RELLOC_XFEAT_ENGINE', ''), 'parmin': float(E('RELLOC_PARMIN_DEG', '6')), 'parmin_early': float(E('RELLOC_PARMIN_EARLY_DEG', '8')),
+         'engine': E('RELLOC_XFEAT_ENGINE', 'auto'), 'parmin': float(E('RELLOC_PARMIN_DEG', '6')), 'parmin_early': float(E('RELLOC_PARMIN_EARLY_DEG', '8')),
          'early_s': float(E('RELLOC_PARMIN_EARLY_S', '8')), 'mem_gate': float(E('RELLOC_MEM_GATE_DEG', '8')),
          'transport': E('RELLOC_TRANSPORT', 'ros2').strip().lower(), 'ros_domain': E('RELLOC_ROS_DOMAIN', '100').strip(), 'ros_depth': E('RELLOC_ROS_DEPTH', '128').strip()}
     if not c['id'] or not c['id'].isdigit() or not 0 <= int(c['id']) <= 255: raise SystemExit(f'RELLOC_ID must be a drone number 0-255 (hostname gives {_id_default()!r})')
@@ -78,14 +78,14 @@ def main():
         link = {'ros2': {'domain': dom if dom is not None else f"the node's (ROS_DOMAIN_ID={E('ROS_DOMAIN_ID', '0') or '0'}): the domain_bridge must forward /relloc/dg/d<k>",
                          'topic': f"{TR.Ros2.PREFIX}{C['id']}", 'peers': sorted(peers_ok - {C['id']}) if peers_ok else 'discovered every 2 s',
                          'qos': f"best effort, keep last {C['ros_depth']}, volatile", 'message': f'{TR.Ros2.MSG}, one per datagram'}}
+    engine, how = paths.xfeat_backend(C['engine'], cal.ncam, (cal.W, cal.H))          # TensorRT by default once the drone has its engine
     summary = {'drone': C['id'], 'calibration': cal.source, 'cameras': cal.ncam, 'image': [cal.W, cal.H], 'lens_terms': cal.has_terms, 'td_s': td,
                'camera_topics': cams, 'camera_msg_type': cam_type, 'vio_pose': f"{C['pose']} ({C['pose_type']})", 'imu': f"{C['imu']} ({C['imu_type']})" if C['imu'] else 'none: attitude interpolated between VIO poses',
                'transport': C['transport'], **link,
                'peers': sorted(peers_ok) if peers_ok else 'any', 'primary_output': '6dof' if C['six'] else '4dof', 'takeoff_hold_s': C['hold'],
                'takeoff_dz_m': C['dz'], 'parallax_floor_deg': {'until_takeoff_plus_s': C['early_s'], 'early': C['parmin_early'], 'after': C['parmin']},
                'memory': {'store_gate_deg': C['mem_gate'], 'keeps_fresh_depths': True}, 'log_dir': C['log_dir'], 'max_queue_s': C['max_queue_s'],
-               'topic_prefix': C['topic'], 'sim_time': C['sim_time'], 'xfeat': f"TensorRT {C['engine']}" if C['engine'] else 'torch (batched)'}
-    if C['engine'] and not os.path.exists(os.path.expanduser(C['engine'])): raise SystemExit(f"RELLOC_XFEAT_ENGINE {C['engine']}: no such file (scripts/build_xfeat_engine.py)")
+               'topic_prefix': C['topic'], 'sim_time': C['sim_time'], 'xfeat': f'TensorRT {engine} ({how})' if engine else f'torch (batched): {how}'}
     print('[relloc] ' + json.dumps(summary), flush=True)
     if C['transport'] == 'udp' and any(h == '255.255.255.255' or h.endswith('.255') for h, _ in dest):
         print('[relloc] WARNING: broadcast destination: on Wi-Fi broadcast frames go at the basic rate without retries; ~1.7 Mbit/s per drone may not fit. Prefer RELLOC_DEST=<peer>:<port>,...', flush=True)
@@ -94,6 +94,9 @@ def main():
         elif C['ros_domain'] > 101: print(f"[relloc] WARNING: RELLOC_ROS_DOMAIN {C['ros_domain']} > 101: its DDS ports can collide with Linux's ephemeral ports", flush=True)
         elif str(C['ros_domain']) == (E('ROS_DOMAIN_ID', '0') or '0'): print(f"[relloc] WARNING: RELLOC_ROS_DOMAIN {C['ros_domain']} = this drone's ROS_DOMAIN_ID: the other drones' relloc join this drone's domain", flush=True)
         if C['ros_depth'] < 72: print(f"[relloc] WARNING: RELLOC_ROS_DEPTH {C['ros_depth']} < 72 (two bursts of 36 datagrams): a peer's burst can overwrite the one before", flush=True)
+    if engine is None and how.startswith('auto'):
+        print(f'[relloc] WARNING: XFeat runs in PyTorch ({how}); at the fleet\'s 612-MHz GPU cap the sender is estimated to exceed the '
+              '0.2-s keyframe interval (README, Limits)', flush=True)
     if not C['imu']: print('[relloc] WARNING: no IMU topic: the attitude between VIO poses is interpolated (tilt error ~3x in the replay test)', flush=True)
     if '--check' in sys.argv: return
     os.environ.setdefault('CAPTURE_MODE', 'thread_local')
@@ -136,10 +139,16 @@ def main():
     for Bn in range(1, RX.CAMPAIRS + 1): RX.G._get(Bn, K_, K_, False); RX.G._get(Bn, L_, L_, True)
     torch.cuda.synchronize()
     xf = XFeat(top_k=3000); xf.dev = dev; XT = None
-    if C['engine']:
-        if cal.ncam != 4 or (cal.W, cal.H) != (1280, 800): raise SystemExit('RELLOC_XFEAT_ENGINE: the engine is built for 4 cameras of 1280 x 800')
-        cwd = os.getcwd(); import xfeat_trt; os.chdir(cwd)                                    # xfeat_trt changes to its own directory
-        XT = xfeat_trt.XFeatTRT(xf, os.path.expanduser(C['engine']))
+    if engine:
+        try:
+            cwd = os.getcwd()
+            try: import xfeat_trt                                                              # xfeat_trt changes to its own directory
+            finally: os.chdir(cwd)
+            XT = xfeat_trt.XFeatTRT(xf, engine)
+        except Exception as e:                                       # no TensorRT, or an engine built for another GPU or TensorRT version
+            if how != 'auto': raise
+            print(f'[relloc] WARNING: TensorRT engine {engine} not usable ({type(e).__name__}: {e}): XFeat runs in PyTorch', flush=True)
+            log('xfeat_fallback', engine=engine, error=f'{type(e).__name__}: {e}')
     from concurrent.futures import ThreadPoolExecutor
     POOL = ThreadPoolExecutor(cal.ncam, thread_name_prefix='relloc-jpeg')
     def decode(raw):   # one serialized image message -> 8-bit grey image (H, W)

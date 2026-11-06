@@ -5,7 +5,9 @@
   M6      at zero tilt, M6 (chordal blend) gives rule15.Maintenance's estimate and withdrawal on a random solve sequence; the geodesic blend
           stays within 1e-6 deg / 1e-9 m of it on the same sequence after the rotation part is mapped to yaw (both are 0.7 blends)
   lens    unproject with zero lens terms = the 8-number KB4 path bit for bit; reference values with terms (relloc2 review21 md21)
-  calib   calibration datagram round trip"""
+  calib   calibration datagram round trip
+  engine  RELLOC_XFEAT_ENGINE: auto takes the engine at paths.ENGINE if it exists and the rig is 4 x 1280 x 800, else PyTorch; torch;
+          a path must exist"""
 import os, sys, numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from live import paths, six, lens, calib as CAL
@@ -77,4 +79,15 @@ nd = RCV.LiveNode(codec, dummy_solve, lambda i: (0.0, (0.0,) * 6, {}, None), [],
 nd.add_peer(6, node15.PeerCalib(lambda c, uv: None, [np.eye(3)] * 4, [np.zeros(3)] * 4, 1280, 800))
 ch = nd.set_own_epoch(1.0, 2); nd.estimate_messages(1.0); p6 = nd.peers[6]
 check('own epoch follows the header epoch', ch and nd.own_epoch == 2 and p6.link.own_ep == 2 and not nd.set_own_epoch(1.1, 2))
+import tempfile
+with tempfile.TemporaryDirectory() as d:
+    f = os.path.join(d, 'x.engine'); open(f, 'w').close(); rig = (4, (1280, 800)); yes = lambda p: True; no = lambda p: False
+    r = [paths.xfeat_backend('', *rig, exists=yes) == (os.path.expanduser(paths.ENGINE), 'auto'), paths.xfeat_backend('auto', *rig, exists=no)[0] is None,
+         paths.xfeat_backend('auto', 2, (512, 512), exists=yes)[0] is None, paths.xfeat_backend('torch', *rig, exists=yes)[0] is None,
+         paths.xfeat_backend(f, *rig) == (f, 'RELLOC_XFEAT_ENGINE')]
+    for bad in ((os.path.join(d, 'missing.engine'), *rig), (f, 2, (512, 512))):
+        try: paths.xfeat_backend(*bad); r.append(False)
+        except SystemExit: r.append(True)
+check('engine', all(r), r)
+
 print('ALL PASSED' if not FAIL else f'FAILED: {FAIL}'); sys.exit(1 if FAIL else 0)

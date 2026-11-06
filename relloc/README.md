@@ -16,7 +16,8 @@ source /opt/ros/humble/setup.bash; source ~/ros2_swarmnxt_ws/install/setup.bash 
 set -a; source relloc/config/relloc.env; set +a              # ROS 2 between the drones, in domain 100 (section "Between the drones")
 export RELLOC=1 RELLOC_FLIGHT_DIR=~/flight_nxt3            # the drone's deploy_vio.py folder
 export RELLOC_6DOF=1                                        # optional: the 6-DoF output drives the lock (section below)
-bash relloc/scripts/run_relloc.sh --check                   # prints the resolved settings and exits
+python3 relloc/scripts/build_xfeat_engine.py               # once per drone: the TensorRT engine that XFeat uses by default
+bash relloc/scripts/run_relloc.sh --check                   # prints the resolved settings (xfeat: TensorRT or torch) and exits
 bash relloc/scripts/run_relloc.sh
 ```
 
@@ -40,7 +41,7 @@ Raw UDP instead of ROS 2: `export RELLOC_TRANSPORT=udp RELLOC_DEST=192.168.1.106
 | `RELLOC_PARMIN_EARLY_S` | 8 | seconds after the latch at which the floor changes to `RELLOC_PARMIN_DEG` |
 | `RELLOC_PARMIN_DEG` | 6 | the floor after the change |
 | `RELLOC_MEM_GATE_DEG` | 8 | a keyframe becomes a camera's depth memory only when at least 100 of its points reach this parallax, and only those points are stored. 0 = no gate |
-| `RELLOC_XFEAT_ENGINE` | empty (torch) | TensorRT engine of the XFeat backbone, built on the drone: `python3 relloc/scripts/build_xfeat_engine.py` |
+| `RELLOC_XFEAT_ENGINE` | auto | `auto`: XFeat's backbone runs on the TensorRT engine at `~/relloc_engines/xfeat_b4_800x1280_fp16.engine` when it exists (build it once on each drone: `python3 relloc/scripts/build_xfeat_engine.py`), else in PyTorch with a warning; `torch`: PyTorch; a path: that engine, which must exist |
 | `RELLOC_LOG_DIR` | ~/relloc_logs | one `relloc_<id>_<time>.jsonl` per run |
 | `RELLOC_POSE_TOPIC` | /poseimu | the VIO pose (`run_online_msckf`, PoseWithCovarianceStamped; `RELLOC_POSE_MSG_TYPE=nav_msgs/msg/Odometry` for an odometry topic) |
 | `RELLOC_IMU_TOPIC` | `imu_topic` of the folder's `estimator_flight.yaml`, else /fmu/out/sensor_combined | the gyro (px4_msgs SensorCombined; `RELLOC_IMU_MSG_TYPE=sensor_msgs/msg/Imu` for an Imu topic). Needed: see "What it needs" |
@@ -381,8 +382,8 @@ without a restart of relloc.
 
 - Compute on the Orin is not measured. On the workstation (RTX 5070) the sender takes 63-71 ms per keyframe and a solve 72-74 ms
   (medians, two nodes on one GPU). relloc2's device times were measured at 918 MHz; the fleet's GPU cap is 612 MHz. A sender slower than 0.2 s skips keyframes (census:
-  `kf_dropped_busy`); the TensorRT engine is the first lever. Scaled from relloc2's device times, a keyframe at 612 MHz would take
-  225-260 ms with torch XFeat and 160-190 ms with the engine (an estimate): build the engine on each drone.
+  `kf_dropped_busy`); the TensorRT engine (the default once built) is the first lever. Scaled from relloc2's device times, a keyframe at 612 MHz would take
+  225-260 ms with torch XFeat and 160-190 ms with the engine (an estimate): build the engine on each drone (`--check` shows which runs).
 - relloc has not run beside the flight VIO. The VIO tracks on the GPU and pins its threads to all eight cores; relloc adds a CUDA
   context, XFeat at 5 Hz and the solves, now from the first VIO pose on the pad. Before a flight relies on it, compare the VIO alone with
   the VIO beside `taskset -c 4-7 nice -n 5 bash relloc/scripts/run_relloc.sh` (pose delay, incomplete image sets), with PX4 on motion

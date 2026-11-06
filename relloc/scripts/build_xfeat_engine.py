@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build the TensorRT engine of the XFeat backbone for this device (an engine runs only on the GPU and TensorRT version it was built
 with): core/data/xfeat_b4_800x1280.onnx (relloc2 xfeat_export.py: static batch 4 = the four cameras, 800 x 1280) -> fp16 engine.
-Same as `trtexec --onnx=core/data/xfeat_b4_800x1280.onnx --fp16 --saveEngine=<out>`. Then set RELLOC_XFEAT_ENGINE=<out>.
+Same as `trtexec --onnx=core/data/xfeat_b4_800x1280.onnx --fp16 --saveEngine=<out>`. The node uses the engine at the default path
+(RELLOC_XFEAT_ENGINE=auto); for another path set RELLOC_XFEAT_ENGINE=<out>.
 usage: python3 build_xfeat_engine.py [out=~/relloc_engines/xfeat_b4_800x1280_fp16.engine]"""
 import os, sys, time
 import tensorrt as trt
