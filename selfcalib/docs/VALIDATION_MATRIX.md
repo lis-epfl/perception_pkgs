@@ -261,6 +261,10 @@ recording with its own calibration):
 | override folder = folder of 5301181 = the real-time test's original model | identical | identical | identical |
 | default folder sourced, then the override folder, in one shell = folder of 5301181 | identical | | |
 | `OV_KB_BEARING=0` exported over the default folder (the fitted mask stays) | differs from the original (as documented) | | |
+| folder of a calibration whose published pass kept the config's mask, and of one whose estimator did not run the model (the original model) = folder of 5301181 | identical, both | | |
+
+Run again after the rule that the model flies only with the fitted mask: every replay of the
+table gives the bytes it gave before the rule (trajectory and calibration).
 
 **Tool** (`--frozen-check`, nxt3 4 June, 20 s, `OV_DETERMINISTIC=1`, against the tool of 5301181): all
 four runs HEALTHY at pass 2. Default: published chain, lens terms and both harvests byte-identical;
@@ -269,4 +273,10 @@ and its trajectory and calibration equal those of the folder `deploy_vio.py` wri
 the same window. The ATE certificate and the mount, which the tool computes on the flight check,
 follow it (POSTG 2.09 against 1.65 cm, mount yaw -3.73 against -3.54 deg). `--no-bearing`:
 everything byte-identical to the tool of 5301181, the flight check included (the original model,
-which the deployed folder of that calibration flies as well).
+which the deployed folder of that calibration flies as well). After the rule that the model flies
+only with the fitted mask, the four runs give the same bytes again, and a fifth, the default with a
+mask fit that raises (test copy of `wmask.py`), is HEALTHY at pass 2: its passes run the model with
+the config's mask, so its flight check flies the original model with a WARNING (`deploy_check`
+`bearing_model` false, `bearing_model_off` naming the pass that kept the config's mask; POSTG
+2.07 cm), and equals, byte for byte, the replay of the folder `deploy_vio.py` writes from that
+calibration (the original model too, with the same WARNING).
