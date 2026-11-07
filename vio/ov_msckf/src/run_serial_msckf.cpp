@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -56,6 +57,7 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -715,14 +717,83 @@ int main(int argc, char **argv) {
     return e && *e == '1';
   }();
   double rt_t0_bag = -1.0, rt_t0_wall = -1.0;
+  // OV_RT_T0_BAG + OV_RT_T0_WALL (both, with OV_REALTIME=1): tie the pacing clock to the instant the data went live,
+  // instead of to the moment this run reads its first record. The record stamped OV_RT_T0_BAG (sensor clock, seconds) is
+  // released at OV_RT_T0_WALL, read on THIS runner's clock: steady_clock = CLOCK_MONOTONIC, seconds (Python's
+  // time.monotonic()), not the wall clock despite the name. A run started while the recording is being replayed in real
+  // time -- the in-flight self-calibration of selfcalib/inflight -- then works off what has already arrived at full speed and
+  // afterwards follows the data as they arrive: no record is used before the instant it went live. Both unset: as before.
+  // A value that is not a number, only one of the two, or no pacing (OV_REALTIME unset, or OV_DETERMINISTIC=1): a warning,
+  // and the anchor is ignored. An anchor that would hold the first record back for more than a minute is taken to be on the
+  // wrong clock: a warning, and the run paces from its own first record as before.
+  struct RtAnchor {
+    bool set = false;
+    double bag = 0.0, wall = 0.0;
+  };
+  const RtAnchor rt_anchor = [] {
+    RtAnchor a;
+    const char *b = std::getenv("OV_RT_T0_BAG"), *w = std::getenv("OV_RT_T0_WALL");
+    if (!b && !w)
+      return a;
+    char *eb = nullptr, *ew = nullptr;
+    const double vb = b ? std::strtod(b, &eb) : 0.0, vw = w ? std::strtod(w, &ew) : 0.0;
+    if (!b || !w || eb == b || *eb != '\0' || ew == w || *ew != '\0' || !std::isfinite(vb) || !std::isfinite(vw) || vb <= 0.0 ||
+        vw <= 0.0) {
+      PRINT_WARNING(YELLOW "[realtime]: OV_RT_T0_BAG=%s OV_RT_T0_WALL=%s: both must be positive numbers; anchor ignored\n" RESET,
+                    b ? b : "(unset)", w ? w : "(unset)");
+      return a;
+    }
+    if (!rt_pace) {
+      PRINT_WARNING(YELLOW "[realtime]: OV_RT_T0_BAG/OV_RT_T0_WALL set, but this run is not paced (OV_REALTIME=1 needed, and "
+                           "OV_DETERMINISTIC=1 turns pacing off); anchor ignored\n" RESET);
+      return a;
+    }
+    a.set = true;
+    a.bag = vb;
+    a.wall = vw;
+    return a;
+  }();
   auto pace = [&](double tbag) {
     if (!rt_pace) return;
-    if (rt_t0_bag < 0) { rt_t0_bag = tbag; rt_t0_wall = now_s(); return; }
+    if (rt_t0_bag < 0) {
+      rt_t0_bag = tbag;
+      rt_t0_wall = now_s();
+      if (!rt_anchor.set)
+        return;
+      // seconds by which the first record is already late against the anchor (negative: it has not gone live yet)
+      const double behind = (rt_t0_wall - rt_anchor.wall) - (tbag - rt_anchor.bag);
+      if (behind < -60.0) {
+        PRINT_WARNING(YELLOW "[realtime]: anchor stamp %.6f = clock %.6f would hold the first record (stamp %.6f, clock %.6f) "
+                             "back %.1f s: not the clock of this runner (CLOCK_MONOTONIC)? Anchor ignored\n" RESET,
+                      rt_anchor.bag, rt_anchor.wall, tbag, rt_t0_wall, -behind);
+        return;
+      }
+      rt_t0_bag = rt_anchor.bag;
+      rt_t0_wall = rt_anchor.wall;
+      PRINT_INFO("[realtime]: pacing anchored: stamp %.6f = clock %.6f; first record %.6f read at clock %.6f, %.2f s behind "
+                 "the live data\n",
+                 rt_anchor.bag, rt_anchor.wall, tbag, now_s(), behind);
+      // falls through: a record that has not gone live yet waits for its instant like every later one
+    }
     const double target = rt_t0_wall + (tbag - rt_t0_bag);
     const double now = now_s();
     if (target > now + 0.0002)
       std::this_thread::sleep_for(std::chrono::duration<double>(target - now));
   };
+  // OV_RT_TRACE=<file>: one line per set of images handed to the filter -- its stamp, the clock above when the filter was done
+  // with it, and the milliseconds that took -- to see when a paced run has worked off its backlog and follows the live data.
+  // The file is appended to, after one '#' line per run, so that the passes of a calibration, which all get the same
+  // environment, keep one block each. Unset or empty: no file.
+  FILE *rt_trace = nullptr;
+  if (const char *p = std::getenv("OV_RT_TRACE")) {
+    if (*p && !(rt_trace = std::fopen(p, "a"))) {
+      PRINT_WARNING(YELLOW "[realtime]: cannot open OV_RT_TRACE=%s; no trace\n" RESET, p);
+    } else if (rt_trace) {
+      setvbuf(rt_trace, nullptr, _IOLBF, 0);
+      std::fprintf(rt_trace, "# run_serial_msckf pid=%d paced=%d anchor_stamp=%.6f anchor_clock=%.6f | stamp_s clock_s proc_ms\n",
+                   (int)getpid(), (int)rt_pace, rt_anchor.set ? rt_anchor.bag : -1.0, rt_anchor.set ? rt_anchor.wall : -1.0);
+    }
+  }
   std::vector<double> lat_s; // per-fed-frame latency, seconds
   lat_s.reserve(8192);
   // ---- MEASUREMENT-DEFINITION gates (they change the METRIC, never the system) ----
@@ -1085,6 +1156,8 @@ int main(int argc, char **argv) {
       ov_core::g_rt_behind_ms = fr.arrive_wall > 0 ? 1000.0 * (now_s() - fr.arrive_wall) : 0.0;
       feed_frame_impl(fr, groups, imgs);
       const double proc = now_s() - _tp;
+      if (rt_trace)
+        std::fprintf(rt_trace, "%.6f %.6f %.2f\n", fr.ts, now_s(), 1000.0 * proc);
       if (fr.arrive_wall > 0) {
         lat_s.push_back(now_s() - fr.arrive_wall);
         static FILE *lf = [] {
