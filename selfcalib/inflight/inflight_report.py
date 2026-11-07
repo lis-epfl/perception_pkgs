@@ -22,7 +22,8 @@ distance between neighbouring cameras, mm, and of their relative rotation, deg);
 envelopes (its stopping rule calls two calibrations the same at <= 2).
 
 Board: with RUN_DIR/sampler.txt (the launcher samples the computer every second), the load, GPU load, CPU clocks and
-temperature during the tool's run and during each offline run, and every process seen above 20 % CPU in the 5-s samples.
+temperature during the tool's run and during each offline run, and every process seen above 20 % CPU in the 5-s samples
+(ps's %CPU: the average over the process's life, so a short burst of a long-lived process may not show).
 The run's own processes are run_serial_msck (the estimator), python3 (the tool and its image pass) and ros2 (the players
 and the recorder); anything else was another job on the computer, and the times are then not those of a quiet board.
 
@@ -181,7 +182,7 @@ def board(run, t0, t1):
     A = np.array(rows)
     return {'seconds': int(len(A)), 'load1_mean': float(A[:, 1].mean()), 'load1_max': float(A[:, 1].max()),
             'gpu_load_pct_mean': float(A[:, 2].mean() / 10.0), 'gpu_load_pct_max': float(A[:, 2].max() / 10.0),
-            'cpu_khz_min': float(A[:, 3].min()), 'cpu_khz_max': float(A[:, 4].max()), 'hottest_zone_c_max': float(A[:, 5].max() / 1000.0),
+            'cpu_khz_min': float(A[:, 3].min()), 'cpu_khz_max': float(A[:, 4].max()), 'hottest_soc_zone_c_max': float(A[:, 5].max() / 1000.0),
             'processes_over_20pct': {n: round(c, 1) for n, c in sorted(names.items())},
             'other_processes': sorted(n for n in names if n not in OWN_PROCESSES)}
 
@@ -324,9 +325,9 @@ def main():
     for name, b in rep['board'].items():
         if b:
             out.append('board    %-9s %d s: 1-min load mean %.2f max %.2f, GPU load mean %.0f %% max %.0f %%, CPU %.0f-%.0f MHz, hottest '
-                       'zone %.1f C; other processes above 20 %% CPU: %s'
+                       'sensor %.1f C; other processes above 20 %% CPU: %s'
                        % (name, b['seconds'], b['load1_mean'], b['load1_max'], b['gpu_load_pct_mean'], b['gpu_load_pct_max'],
-                          b['cpu_khz_min'] / 1000.0, b['cpu_khz_max'] / 1000.0, b['hottest_zone_c_max'],
+                          b['cpu_khz_min'] / 1000.0, b['cpu_khz_max'] / 1000.0, b['hottest_soc_zone_c_max'],
                           ', '.join('%s (%.0f %%)' % (n, b['processes_over_20pct'][n]) for n in b['other_processes']) or 'none'))
     for p in rep.get('problems', []):
         out.append('PROBLEM  ' + p)

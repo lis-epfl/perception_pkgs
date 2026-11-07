@@ -96,9 +96,10 @@ for v in "$FLIGHT_S" "$IMAGE_S" "$START_AFTER" "$OFFLINE" "$DOMAIN" "$TOOL_DOMAI
   num "$v" || { echo "not a number >= 0: $v" >&2; exit 64; }
 done
 [[ "$OFFLINE" =~ ^[0-9]+$ ]] || { echo "--offline takes a whole number" >&2; exit 64; }
+for v in "$DOMAIN" "$TOOL_DOMAIN"; do [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -le 232 ] || { echo "a ROS domain is a whole number 0-232: $v" >&2; exit 64; }; done
 [ -z "$TOOL_CPUS" ] || [[ "$TOOL_CPUS" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "--tool-cpus takes a CPU list like 4-7" >&2; exit 64; }
-REC=$(cd "$REC" 2>/dev/null && pwd) || { echo "no recording folder: $REC" >&2; exit 66; }
-WS=$(cd "$WS" 2>/dev/null && pwd) || { echo "no workspace folder: $WS" >&2; exit 66; }
+d=$(cd "$REC" 2>/dev/null && pwd) && REC=$d || { echo "no recording folder: $REC" >&2; exit 66; }
+d=$(cd "$WS" 2>/dev/null && pwd) && WS=$d || { echo "no workspace folder: $WS" >&2; exit 66; }
 VIO=${VIO:-$(dirname "$SELFCALIB")/vio}
 TEMPLATE=${TEMPLATE:-$SELFCALIB/fleet_reference/$DRONE/theta_star.yaml}
 IMU=${IMU:-$SELFCALIB/fleet_reference/$DRONE/kalibr_imu_chain.yaml}
@@ -221,16 +222,17 @@ cleanup() { local p; for p in "${LEADERS[@]}"; do stop_group "$p" 4; done; }
 trap cleanup EXIT
 trap 'say "interrupted"; exit 130' INT TERM
 
-# the board, every second: clock load1 gpu_load_permille cpu_cur_min_kHz cpu_cur_max_kHz hottest_zone_mC; every 5 s the three
-# busiest processes ("#top clock name:%cpu ..."), so that a run shows whether anything else was running
+# the board, every second: clock load1 gpu_load_permille cpu_cur_min_kHz cpu_cur_max_kHz hottest_soc_zone_mC (the Wi-Fi card's
+# sensor, the warmest on an Orin NX, is left out); every 5 s the three busiest processes ("#top clock name:%cpu ..."), so that a
+# run shows whether anything else was running
 sampler() {
   local n=0 t f mn mx x z hot
   while :; do
     mn=99999999; mx=0; hot=-273000
     for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do read -r x < "$f" 2>/dev/null || continue
       [ "$x" -lt $mn ] && mn=$x; [ "$x" -gt $mx ] && mx=$x; done
-    for z in /sys/class/thermal/thermal_zone*/temp; do read -r x < "$z" 2>/dev/null || continue
-      [[ $x =~ ^-?[0-9]+$ ]] && [ "$x" -gt $hot ] && hot=$x; done
+    for z in /sys/class/thermal/thermal_zone*; do read -r x < "$z/type" 2>/dev/null; [[ $x == iwlwifi* ]] && continue
+      read -r x < "$z/temp" 2>/dev/null || continue; [[ $x =~ ^-?[0-9]+$ ]] && [ "$x" -gt $hot ] && hot=$x; done
     read -r t _ < /proc/uptime
     echo "$t $(cut -d' ' -f1 /proc/loadavg) $(gpu_load) $mn $mx $hot"
     if [ $((n % 5)) = 0 ]; then

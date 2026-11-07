@@ -66,7 +66,7 @@ workspace has it; `ros2 bag play` needs it to publish the PX4 IMU messages, and 
 
     source /opt/ros/humble/setup.bash
     source <workspace with px4_msgs>/install/setup.bash
-    OV_WS=<new workspace> bash vio/vio_deploy/scripts/build_openvins.sh          # about 11 min on an Orin NX
+    OV_WS=<new workspace> bash vio/vio_deploy/scripts/build_openvins.sh    # 8 min on an Orin NX (OV_BUILD_JOBS=6)
 
 Replay a recorded flight in real time and run the scheme on it:
 
@@ -75,15 +75,20 @@ Replay a recorded flight in real time and run the scheme on it:
         --ws <the workspace> --out <new run folder> [--offline 1] [--wait-idle 900]
 
 What it does, in this order: refuses to start if another estimator or tool run is on the computer (and with --wait-idle
-waits for a 1-min load below 0.5 for 60 s); starts a recorder of the five topics (the vehicle records them too) and a
-listener for the first image; starts two `ros2 bag play` for the IMU file and the camera file, with the IMU leading the
-cameras by 0-60 ms (restarted until it does); waits until the replay is --start-after seconds past the takeoff; starts the
-tool with --after-takeoff 90 --image-after-takeoff 15 --no-gt-autodetect --fleet-exclude <drone> and OV_REALTIME=1,
-OV_RT_T0_BAG / OV_RT_T0_WALL = stamp and arrival of the first image of camera A, OV_RT_TRACE; waits for the tool; stops
-the players, the recorder (its copy is deleted unless --keep-copy) and the listener; with --offline N runs the same tool N
-times after the flight on the same recording, without pacing; and writes inflight_report.txt/.json. The run folder keeps
-the exact tool command (tool.cmd.sh), the tool's log with a clock stamp on every line (tool.log), the trace (rt_trace.txt)
-and the tool's output (tool/). The exit code is the tool's.
+waits for a 1-min load below 0.5 and a GPU load below 5 % for 60 s); samples the computer every second until the end
+(sampler.txt); starts a recorder of the five topics (the vehicle records them too) and a listener for the first image;
+starts two `ros2 bag play` for the IMU file and the camera file, with the IMU leading the cameras by 0-60 ms (restarted
+until it does); waits until the replay is --start-after seconds past the takeoff; starts the tool with --after-takeoff 90
+--image-after-takeoff 15 --no-gt-autodetect --fleet-exclude <drone> and OV_REALTIME=1, OV_RT_T0_BAG / OV_RT_T0_WALL =
+stamp and arrival of the first image of camera A, OV_RT_TRACE; waits for the tool; stops the players, the recorder (its
+copy is deleted unless --keep-copy) and the listener; with --offline N runs the same tool N times after the flight on the
+same recording, without pacing; and writes inflight_report.txt/.json. The run folder keeps the exact tool command
+(tool.cmd.sh), the tool's log with a clock stamp on every line (tool.log), the trace (rt_trace.txt) and the tool's output
+(tool/). The exit code is the tool's.
+
+The times are those of a quiet computer only if nothing else ran. The quiet check passes before the start, but nothing
+stops another job from starting during the run (it happened in the first run of section 6): the report lists every
+process above 20 % CPU that was not the run's own, and the load and GPU load during the tool's run.
 
 Options that matter:
   --flight-time 90 / --image-time 15   the two lengths of the scheme (tool --after-takeoff / --image-after-takeoff)
@@ -98,10 +103,10 @@ Options that matter:
 
 Afterwards, deploy the calibration as usual (../tool/deploy_vio.py --calib-out <run folder>/tool --out <flight folder>).
 
-Example (the run of section 6):
+Example (the runs of section 6):
 
     bash selfcalib/inflight/run_inflight_replay.sh --recording data/nxt10_s1 --drone nxt10 --ws ws --out runs/nxt10_s1 \
-        --min-still 4.5 --arrival-stamps --offline 2 --wait-idle 900
+        --min-still 4.5 --arrival-stamps --offline 1 --wait-idle 600
 
 
 4. WHAT WAS MEASURED
@@ -130,7 +135,8 @@ of the same pass differ by about 0.9 mm).
   Study records: paper_rerun/spread_study/online15/README.txt and online_table.txt.
 
 The common start. In the replay the heuristics run as a batch on the recorded file, so the tool is started a few seconds
-after takeoff (--start-after, default 3) and pass 1 begins 13-17 s after takeoff, earlier or later than in the scheme.
+after takeoff (--start-after, default 3) and pass 1 usually begins 13-17 s after takeoff, earlier or later than in the
+scheme.
 The reported time is therefore also given for a common start, "first set of images done 16.5 s after takeoff" (15 s of
 heuristics + 1.5 s for the estimator to start): pass 1's own trace is replayed as a queue (each set available at its stamp,
 costing what it cost in the run) from that start, and pass 2 is added as measured. All paper numbers above use it;
@@ -162,7 +168,46 @@ the result would come about 158-163 s after takeoff (estimate).
 6. THIS BRANCH ON THE FLIGHT COMPUTER
 -------------------------------------
 
-Not run yet with this branch.
+Tested on 7 Nov 2026 on the Orin NX flight computer (GPU at the fleet's 612 MHz, CPUs at 1.98 GHz): estimator built
+from this branch (8 min, the same compiler warnings as the release build, none in the changed file), recording nxt10_s1
+(4 June 2026, arrival stamps, 4.1 s on the ground before takeoff), the example command of section 3 (--flight-time 90
+--image-time 15 --start-after 3 --min-still 4.5 --arrival-stamps), nothing else estimating.
+
+Switches unset change nothing. The deterministic runner (OV_DETERMINISTIC=1, campaign.env, matching and lens terms, the
+calibration config on 20 s of flight) wrote byte-identical trajectories and calibrations with the release build of main
+(3a96bc0), with this branch's build, and with this branch's build and all the switches set (the trace written; the anchor
+ignored with a warning, because a deterministic run is not paced).
+
+The replay on a quiet computer (sampler: no other process above 20 % CPU; GPU load 20 % on average, 53 % at most, which
+is the estimator's own tracker; CPUs at 1.98 GHz throughout):
+  pass 1  began 12.1 s after takeoff (first set of images done at 13.5 s, with 17.6 s of data waiting), worked off the
+          backlog at 1.50 x real time (1.44 x in flight), caught up with the live data 47.6 s after takeoff (54.3 s from the
+          common start of section 4) and read its last set 90.0 s after takeoff, 0.015 s behind the live data
+  pass 2  started 90.3 s after takeoff; verdict 65.0 s later: HEALTHY, two passes (step 0.16 envelopes)
+  READY   155.3 s after takeoff, as run and from the common start. The replays behind the paper: 155.9-168.2 s, median
+          158.3 s (nxt10_s1 alone: 155.9, 156.4 and 158.3 s).
+The same tool after the flight on the same recording, on the same quiet computer: 133.0 s from its start (without the
+motion-capture read of 7-9 s, --no-gt-autodetect).
+
+The calibration against the tool after the flight. Five calibrations of the same data were made: two in flight (this
+replay and the first one below) and three after the flight, all HEALTHY with two passes, time offsets -42.99 to -43.06 ms.
+  in flight vs after the flight (6 pairs): camera positions relative to the IMU differ by at most 2.48-2.71 mm (mean of
+    the four cameras 1.74-2.04 mm), rotations by at most 0.036-0.072 deg, principal points by at most 0.19-0.46 px, focal
+    lengths by at most 0.04-0.08 %, the time offset by 0.02-0.08 ms; distances between neighbouring cameras by at most
+    0.61-1.94 mm; the tool's own step measure 0.11-0.18 envelopes (it calls two calibrations the same at 2)
+  after the flight vs after the flight (3 pairs): 2.35-2.58 mm (mean 1.45-1.86 mm), 0.057-0.069 deg, 0.23-0.35 px,
+    0.04-0.07 %, 0.01-0.05 ms, 1.10-1.91 mm, 0.15-0.18 envelopes
+So the calibration made during the flight differs from one made after the flight as much as two runs after the flight
+differ from each other: the estimator's run-to-run scatter.
+
+The first replay, same set-up 45 min earlier, ran while another job built TensorRT engines on the same computer (trtexec,
+through both passes and both runs after the flight; it started 2 s before the tool, after the quiet check had passed,
+which is why the launcher now samples the computer): pass 1 at 1.33 x real time in flight, caught up 69.0 s
+after takeoff (70.5 s from the common start), pass 2 76.0 s, READY 166.3 s after takeoff; after the flight 154.3 and
+142.0 s. Its calibrations are in the comparison above; its times are not those of a quiet computer.
+
+  Records (not in this repository): paper_rerun/review/inflight_branch/orin (the scripts that ran, logs, run folders with
+  inflight_report.txt/.json).
 
 
 7. WHAT IT DOES NOT DO (limitations)
@@ -190,5 +235,5 @@ Not run yet with this branch.
   - It was replayed, not flown: the camera driver, the autopilot link and the rest of the onboard software were not
     running.
   - The flight estimator beside it (--flight-folder) is the 12 Oct harness's set-up ported to deploy_vio.py folders; it
-    was not run with this branch (section 6 is one replay without it).
+    was not run with this branch (the replays of section 6 ran without it).
   - One run at a time, recordings in the vehicle layout (bag/ + cams/recording.mcap with PX4 and OAK topics) only.
