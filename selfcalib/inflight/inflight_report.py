@@ -21,6 +21,11 @@ length (%), principal point (px), distortion, the two lens terms; the time offse
 distance between neighbouring cameras, mm, and of their relative rotation, deg); and the tool's own step measure in
 envelopes (its stopping rule calls two calibrations the same at <= 2).
 
+Board: with RUN_DIR/sampler.txt (the launcher samples the computer every second), the load, GPU load, CPU clocks and
+temperature during the tool's run and during each offline run, and every process seen above 20 % CPU in the 5-s samples.
+The run's own processes are run_serial_msck (the estimator), python3 (the tool and its image pass) and ros2 (the players
+and the recorder); anything else was another job on the computer, and the times are then not those of a quiet board.
+
 Writes RUN_DIR/inflight_report.json and inflight_report.txt.
 """
 import argparse
@@ -146,6 +151,41 @@ def times(run, start):
     return r
 
 
+OWN_PROCESSES = {'run_serial_msck', 'python3', 'ros2'}
+
+
+def board(run, t0, t1):
+    """What sampler.txt saw between clock t0 and t1 (uptime clock, the same as the estimator's on a computer that has not
+    been suspended), or None."""
+    path = os.path.join(run, 'sampler.txt')
+    if not os.path.exists(path) or t0 is None or t1 is None:
+        return None
+    rows, names = [], {}
+    for line in open(path, errors='replace'):
+        p = line.split()
+        try:
+            if p and p[0] == '#top':
+                if len(p) > 1 and t0 <= float(p[1]) <= t1:
+                    for x in p[2:]:
+                        n, c = x.rsplit(':', 1)
+                        if float(c) >= 20.0:
+                            names[n] = max(names.get(n, 0.0), float(c))
+            elif len(p) == 6:
+                v = [float(x) for x in p]
+                if t0 <= v[0] <= t1:
+                    rows.append(v)
+        except ValueError:
+            continue
+    if not rows:
+        return None
+    A = np.array(rows)
+    return {'seconds': int(len(A)), 'load1_mean': float(A[:, 1].mean()), 'load1_max': float(A[:, 1].max()),
+            'gpu_load_pct_mean': float(A[:, 2].mean() / 10.0), 'gpu_load_pct_max': float(A[:, 2].max() / 10.0),
+            'cpu_khz_min': float(A[:, 3].min()), 'cpu_khz_max': float(A[:, 4].max()), 'hottest_zone_c_max': float(A[:, 5].max() / 1000.0),
+            'processes_over_20pct': {n: round(c, 1) for n, c in sorted(names.items())},
+            'other_processes': sorted(n for n in names if n not in OWN_PROCESSES)}
+
+
 def rotation_deg(Ra, Rb):
     return float(np.degrees(np.arccos(np.clip((np.trace(np.asarray(Ra) @ np.asarray(Rb).T) - 1.0) / 2.0, -1.0, 1.0))))
 
@@ -213,6 +253,18 @@ def main():
     a = ap.parse_args()
     run = os.path.abspath(a.run)
     rep = {'run': run, 'times': times(run, a.start)}
+    t = rep['times']
+    try:
+        tk_clock = float(read_env(os.path.join(run, 'replay.env'))['TAKEOFF_CLOCK'])
+    except (OSError, KeyError, ValueError):
+        tk_clock = None
+    rep['board'] = {}
+    if tk_clock is not None and t.get('tool_first_line') is not None and t.get('verdict_line') is not None:
+        rep['board']['inflight'] = board(run, tk_clock + t['tool_first_line'], tk_clock + t['verdict_line'])
+    for logf in sorted(glob.glob(os.path.join(run, 'offline[0-9]*.log'))):
+        L = stamped_lines(logf)
+        if L:
+            rep['board'][os.path.basename(logf)[:-4]] = board(run, L[0][0], L[-1][0])
     runs = {'inflight': os.path.join(run, 'tool')}
     for d in sorted(glob.glob(os.path.join(run, 'offline[0-9]*'))):
         if os.path.isdir(d):
@@ -269,6 +321,13 @@ def main():
                                                 s['principal_point_px_max'], s['focal_pct_max'], s['time_offset_ms'],
                                                 (', lens terms max %.1e' % s['lens_terms_max_abs']) if 'lens_terms_max_abs' in s else '',
                                                 s['pair_distance_mm_max'] or 0.0, s['pair_rotation_deg_max'] or 0.0, s['step_envelopes_max']))
+    for name, b in rep['board'].items():
+        if b:
+            out.append('board    %-9s %d s: 1-min load mean %.2f max %.2f, GPU load mean %.0f %% max %.0f %%, CPU %.0f-%.0f MHz, hottest '
+                       'zone %.1f C; other processes above 20 %% CPU: %s'
+                       % (name, b['seconds'], b['load1_mean'], b['load1_max'], b['gpu_load_pct_mean'], b['gpu_load_pct_max'],
+                          b['cpu_khz_min'] / 1000.0, b['cpu_khz_max'] / 1000.0, b['hottest_zone_c_max'],
+                          ', '.join('%s (%.0f %%)' % (n, b['processes_over_20pct'][n]) for n in b['other_processes']) or 'none'))
     for p in rep.get('problems', []):
         out.append('PROBLEM  ' + p)
     open(os.path.join(run, 'inflight_report.txt'), 'w').write('\n'.join(out) + '\n')

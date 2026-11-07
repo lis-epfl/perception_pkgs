@@ -42,18 +42,21 @@
 #                        `ros2 bag play` needs to publish the PX4 IMU messages
 #   --no-recorder        do not record the replayed topics (the measured runs recorded them, as the vehicle does)
 #   --keep-copy          keep the recorder's copy (default: removed at the end; 1-5 GB)
-#   --wait-idle S        wait up to S seconds for a quiet computer (1-min load < 0.5 for 60 s) before starting; default 0 = do
-#                        not wait. Another estimator or tool run always makes it refuse.
+#   --wait-idle S        wait up to S seconds for a quiet computer before starting: 1-min load < 0.5 and, on a Jetson, GPU
+#                        load < 5 %, both for 60 s; default 0 = do not wait. Another estimator or tool run always makes it
+#                        refuse. Either way the board is sampled every second during the run (sampler.txt; the report
+#                        says what else ran).
 #   --tool-args "ARGS"   more options for run_tool.py (split on spaces)
 #   --dry-run            print what would run and stop
 # END USAGE
 #
 # Writes OUT/: launcher.log, versions.txt, replay.env (the facts the report reads), first_frame.txt, play_imu.log,
-# play_cam.log, record.log, tool.cmd.sh (the exact tool command), tool.log (its output, each line stamped with the clock),
+# play_cam.log, record.log, sampler.txt (load, GPU load, CPU clocks and temperature every second; the busiest processes
+# every 5 s), tool.cmd.sh (the exact tool command), tool.log (its output, each line stamped with the clock),
 # rt_trace.txt (one block per estimator pass), tool/ (the tool's --out: published chain, lens terms, report.json),
 # offline<k>/ + offline<k>.log, flight/ (with --flight-folder), inflight_report.txt/.json (inflight_report.py).
-# One run at a time. Nothing outside OUT is written. Exit code: the tool's (0 HEALTHY or HARDWARE-CHANGED etc., see the
-# tool's README), 64 usage, 65 refused, 66-72 set-up failures.
+# One run at a time. Nothing outside OUT is written. Exit code: the tool's (selfcalib/README.md, "Exit codes"); 64 usage,
+# 65 refused, 66-72 set-up failures.
 set -o pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SELFCALIB=$(dirname "$HERE")
@@ -62,6 +65,8 @@ CLOCK=$HERE/replay_clock.py
 usage() { sed -n '/^# USAGE/,/^# END USAGE/p' "$0" | sed -e '/USAGE/d' -e 's/^# \{0,1\}//'; }
 die() { local rc=$1; shift; echo "run_inflight_replay.sh: $*" >&2; [ -n "$LOG" ] && echo "[$(stamp)] ERROR: $*" >> "$LOG"; exit "$rc"; }
 stamp() { echo "$(date +%H:%M:%S) $(cut -d' ' -f1 /proc/uptime)"; }
+GPU_LOAD=; for f in /sys/devices/platform/17000000.gpu/load /sys/devices/platform/gpu.0/load; do [ -r $f ] && { GPU_LOAD=$f; break; }; done
+gpu_load() { if [ -n "$GPU_LOAD" ]; then cat "$GPU_LOAD"; else echo 0; fi; }   # per mille (Jetson); 0 elsewhere
 say() { echo "[$(stamp)] $*" | tee -a "$LOG"; }
 
 LOG=; REC=; DRONE=; WS=; OUT=; FLIGHT_S=90; IMAGE_S=15; START_AFTER=3; MIN_STILL=; TEMPLATE=; IMU=; VIO=
@@ -111,7 +116,7 @@ if [ -n "$FLIGHT" ]; then
   [ -x "$WS/install/ov_msckf/lib/ov_msckf/run_online_msckf" ] || { echo "no run_online_msckf in $WS" >&2; exit 66; }
 fi
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then echo "$OUT exists and is not empty" >&2; exit 65; fi
-if [ $DRY = 1 ]; then LOG=/dev/null; OUT=$(cd "$(dirname "$OUT")" 2>/dev/null && pwd)/$(basename "$OUT")
+if [ $DRY = 1 ]; then LOG=/dev/null; OUT=$(realpath -m "$OUT")
 else mkdir -p "$OUT" && OUT=$(cd "$OUT" && pwd) && LOG=$OUT/launcher.log || exit 66; fi
 
 # ---- environment of the replay ----
@@ -160,11 +165,12 @@ TOOL_ARGV=(python3 -B "$SELFCALIB/tool/run_tool.py" --drone "$DRONE" --bag "$REC
 [ -n "$MIN_STILL" ] && TOOL_ARGV+=(--min-still "$MIN_STILL")
 # shellcheck disable=SC2206
 [ -n "$TOOL_ARGS" ] && TOOL_ARGV+=($TOOL_ARGS)
-write_cmd() {   # write_cmd FILE TOOL_OUT [VAR=VALUE ...] [-- taskset ...]: the tool's command line, every word quoted
+write_cmd() {   # write_cmd FILE|- TOOL_OUT [VAR=VALUE ...] [taskset ...]: the tool's command line, every word quoted
   local file=$1 tout=$2; shift 2
-  { echo '#!/bin/bash'; echo '# written by run_inflight_replay.sh: the exact tool command of this run'
+  cmd_text() { echo '#!/bin/bash'; echo '# written by run_inflight_replay.sh: the exact tool command of this run'
     printf 'cd %q || exit 1\nexec env' "$OUT"; printf ' %q' "${UNSET[@]}" "${TOOL_ENV[@]}" "$@" "${TOOL_ARGV[@]}" --out "$tout"
-    printf ' 2>&1\n'; } > "$file"
+    printf ' 2>&1\n'; }
+  if [ "$file" = - ]; then cmd_text "$@"; else cmd_text "$@" > "$file"; fi
 }
 IMU_PLAY=(ros2 bag play "$REC_IMU_URI" --topics "$REC_IMU_TOPIC" --disable-keyboard-controls)
 [[ $REC_IMU_URI == *.mcap ]] && IMU_PLAY+=(-s mcap)
@@ -186,7 +192,7 @@ say "flight time $FLIGHT_S s, image pass $IMAGE_S s, tool started $START_AFTER s
 if [ $DRY = 1 ]; then
   echo "--- dry run: nothing started, nothing written ---"; echo "recorder:   ${RECORDER[*]}"; echo "IMU player: ${IMU_PLAY[*]} -d <s>"
   echo "cam player: ${CAM_PLAY[*]} -d <s>"; echo "first image of $CAM0_TOPIC -> tool started $START_AFTER s after takeoff:"
-  write_cmd /dev/stdout "$OUT/tool" OV_REALTIME=1 OV_RT_T0_BAG='<stamp of the first image>' OV_RT_T0_WALL='<its arrival clock>' \
+  write_cmd - "$OUT/tool" OV_REALTIME=1 OV_RT_T0_BAG='<stamp of the first image>' OV_RT_T0_WALL='<its arrival clock>' \
             "OV_RT_TRACE=$OUT/rt_trace.txt" ${TOOL_CPUS:+"OV_AFFINITY=$TOOL_CPUS:$TOOL_CPUS" taskset -c "$TOOL_CPUS"}
   exit 0
 fi
@@ -197,11 +203,12 @@ busy() { pgrep -x run_serial_msck; pgrep -x run_online_msck; pgrep -f '^python3 
 if [ "${WAIT_IDLE%.*}" -gt 0 ]; then
   t_end=$(( $(cut -d. -f1 /proc/uptime) + ${WAIT_IDLE%.*} )); ok=0
   while [ $ok -lt 12 ]; do
-    [ "$(cut -d. -f1 /proc/uptime)" -lt $t_end ] || die 65 "the 1-min load did not stay below 0.5 for 60 s within $WAIT_IDLE s"
+    [ "$(cut -d. -f1 /proc/uptime)" -lt $t_end ] || die 65 "the computer did not stay quiet (1-min load < 0.5, GPU load < 5 %) for 60 s within $WAIT_IDLE s"
     [ -z "$(busy)" ] || die 65 "another estimator or tool run started while waiting"
-    if awk -v l="$(cut -d' ' -f1 /proc/loadavg)" 'BEGIN{exit !(l < 0.5)}'; then ok=$((ok + 1)); else ok=0; fi
+    if awk -v l="$(cut -d' ' -f1 /proc/loadavg)" -v g="$(gpu_load)" 'BEGIN{exit !(l < 0.5 && g < 50)}'; then ok=$((ok + 1)); else ok=0; fi
     sleep 5
   done
+  say "quiet: 1-min load $(cut -d' ' -f1 /proc/loadavg), GPU load $(gpu_load) per mille"
 fi
 
 # ---- processes: each in its own session, so that it can be stopped with its children; stopped on any exit ----
@@ -213,6 +220,27 @@ stop_group() { kill -0 -- "-$1" 2>/dev/null || return 0; kill -INT -- "-$1" 2>/d
 cleanup() { local p; for p in "${LEADERS[@]}"; do stop_group "$p" 4; done; }
 trap cleanup EXIT
 trap 'say "interrupted"; exit 130' INT TERM
+
+# the board, every second: clock load1 gpu_load_permille cpu_cur_min_kHz cpu_cur_max_kHz hottest_zone_mC; every 5 s the three
+# busiest processes ("#top clock name:%cpu ..."), so that a run shows whether anything else was running
+sampler() {
+  local n=0 t f mn mx x z hot
+  while :; do
+    mn=99999999; mx=0; hot=-273000
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do read -r x < "$f" 2>/dev/null || continue
+      [ "$x" -lt $mn ] && mn=$x; [ "$x" -gt $mx ] && mx=$x; done
+    for z in /sys/class/thermal/thermal_zone*/temp; do read -r x < "$z" 2>/dev/null || continue
+      [[ $x =~ ^-?[0-9]+$ ]] && [ "$x" -gt $hot ] && hot=$x; done
+    read -r t _ < /proc/uptime
+    echo "$t $(cut -d' ' -f1 /proc/loadavg) $(gpu_load) $mn $mx $hot"
+    if [ $((n % 5)) = 0 ]; then
+      echo "#top $t $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -3 | awk '{printf "%s:%s ", $1, $2}')"
+    fi
+    n=$((n + 1)); sleep 1
+  done
+}
+start bash -c "GPU_LOAD='$GPU_LOAD'; $(declare -f gpu_load sampler); sampler" > "$OUT/sampler.txt" 2>/dev/null < /dev/null
+SPID=$!
 
 NPID=
 if [ -n "$FLIGHT" ]; then
@@ -298,5 +326,6 @@ for k in $(seq 1 "$OFFLINE"); do
   say "offline run $k done, rc $(cat "$OUT/offline$k.rc" 2>/dev/null), $(python3 -c "import sys; L = [l.split()[0] for l in open(sys.argv[1]) if l.strip()]; print('%.1f s' % (float(L[-1]) - float(L[0])))" "$OUT/offline$k.log" 2>/dev/null): $(grep -a 'VERDICT:' "$OUT/offline$k.log" | tail -1 | cut -d' ' -f2-)"
 done
 
+stop_group "$SPID" 2; wait "$SPID" 2>/dev/null
 python3 -B "$HERE/inflight_report.py" "$OUT" | tee -a "$OUT/launcher.log"
 exit "$TOOL_RC"

@@ -107,8 +107,9 @@ Example (the run of section 6):
 4. WHAT WAS MEASURED
 --------------------
 
-The paper's numbers come from replays on the flight computer (Orin NX, GPU at the fleet's 612 MHz, CPUs at 1.98 GHz) with the tool 1ff4d12 (matching between cameras and lens terms on) and an estimator build of the release dc8d058 plus
-the same two switches (test harness scripts onl15.sh / onl2p.sh). This folder is those harness scripts, cleaned and
+The paper's numbers come from replays on the flight computer (Orin NX, GPU at the fleet's 612 MHz, CPUs at 1.98 GHz)
+with the tool 1ff4d12 (matching between cameras and lens terms on) and an estimator build of the release dc8d058 plus the
+same two switches (test harness scripts onl15.sh / onl2p.sh). This folder is those harness scripts, cleaned and
 parameterised; the switches are the same, ported to main (section 1).
 
 Ready after takeoff, two passes as one sequence, 90 s of flight, nothing else estimating on the computer: median 158.3 s
@@ -177,11 +178,12 @@ Not run yet with this branch.
     started only at the 15th second, pass 1 would begin 26-29 s after takeoff: alone it would still catch up (at about
     78-88 s), beside the flight estimator it would miss the 90th second by 3-9 s (estimate, 12 Oct 2026).
   - Live use. Pointing the launcher at the recording a vehicle is writing does NOT work without new code, and the launcher
-    refuses it (a .mcap that does not end with the MCAP footer is still being written): the tool reads the takeoff, the
-    topics and the length from the recording's metadata, which the recorder writes when it closes the file, and the
-    estimator's reader (vio/ov_msckf/src/utils/bag_source.h) stops at the end of the file instead of waiting for more
-    data. A live version needs a reader that follows a growing recording or hands over to the live topics, the takeoff
-    from the land detector as it happens, and the heuristics computed as the images arrive. None of this is implemented.
+    refuses it (a .mcap that does not end with the MCAP footer is still being written): the tool finds the topics and
+    the length of the recording in its metadata (the bag's metadata.yaml, the MCAP summary), which a recorder writes
+    when it closes the file, and the estimator's reader (vio/ov_msckf/src/utils/bag_source.h) stops at the end of the
+    file instead of waiting for more data. A live version needs a reader that follows a growing recording or hands
+    over to the live topics, the takeoff from the land detector as it happens, and the heuristics computed as the
+    images arrive. None of this is implemented.
   - Standstill before takeoff. Pass 1 also replays the standstill (at 2.2-2.9 x real time); the tested recordings stood
     4-11 s. Estimate (12 Oct 2026): beyond about 17-20 s of standstill pass 1 no longer catches up by the 90th second
     beside the flight estimator; alone the limit is about 35 s.
