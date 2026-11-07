@@ -18,8 +18,8 @@
 #   --out DIR            run folder, new or empty
 #   --flight-time S      seconds of flight the calibration uses (tool --after-takeoff), default 90
 #   --image-time S       seconds of flight of the image pass (tool --image-after-takeoff), default 15
-#   --start-after S      start the tool S seconds after takeoff on the replay clock, default 3 (README, "Start of the tool")
-#   --min-still S        tool --min-still (the tool's default 6 s; 4.5 for the 4 June 2026 recordings of nxt10 and nxt3b)
+#   --start-after S      start the tool S seconds after takeoff on the replay clock, default 3 (README, section 4)
+#   --min-still S        tool --min-still (the tool's default 6 s; 4.5 for nxt10_s1 of 4 June 2026 and nxt3b of 3 June 2026)
 #   --template FILE      tool --template, default selfcalib/fleet_reference/NAME/theta_star.yaml
 #   --imu-chain FILE     tool --imu-chain, default selfcalib/fleet_reference/NAME/kalibr_imu_chain.yaml
 #   --vio-root DIR       the vio/ package, default the sibling of selfcalib/
