@@ -162,9 +162,10 @@ CALIB_LENS = (('OV_PRIOR_NONRAD_SIG', '0.002'), ('OV_NONRAD_SKEW_FIXED', '1'))
 # observation, with the shipped RANSAC below 80 deg) and a fisheye mask fitted to the lens's image circle (wmask.py): together
 # the configuration "E1W" of the rerun of 29 Oct 2026. --no-bearing, or OV_KB_BEARING=0 in the caller's environment, switches
 # both off. Flight runs the model too, since the same day: flight_stiffness.env sets these three variables, and a calibration
-# made with the model is flown with the mask of the pass it published (deploy_vio.py writes it into the flight folder;
-# frozen_pass() flies the calibration the same way). A calibration made without the model is flown without it. README,
-# "Bearing model and fitted fisheye mask".
+# made with the model is flown with the mask of the pass it published, as fitted (deploy_vio.py writes it into the flight
+# folder; frozen_pass() flies the calibration the same way). A calibration made without the model is flown without it, and so
+# is one whose fitted mask cannot fly as it is (flight_model(), with a WARNING): the original model, the config's own mask.
+# README, "Bearing model and fitted fisheye mask".
 CALIB_BEARING = (('OV_KB_BEARING', '1'), ('OV_BEARING_ALL', '1'), ('OV_BEARING_RANSAC', '1'))
 
 
@@ -365,12 +366,34 @@ def _bearing_ran(run_log):
         return None
 
 
+def flight_model(vio_root, report, cams):
+    """The measurement model a calibration flies with, as deploy_vio.py deploys it and --frozen-check flies it (unless the
+    original model is asked for: deploy_vio.py --no-bearing or OV_KB_BEARING other than 1 at deploy) -> (lines, why, fix).
+    lines: the bearing model flies, with this fisheye mask (the one of the published pass, exactly as fitted) written into
+    the flight config. None: the ORIGINAL model flies, with the flight config's own mask, and why says why: the calibration
+    ran without the model (fix None: the flight runs the model the calibration ran), the vio package's flight_stiffness.env
+    does not switch it on (fix None), or the fitted mask cannot fly as it is (wmask.flight_mask; fix says what would let it:
+    deploy_vio.py and the tool then WARN). Only the combination measured in flight, the bearing model with the mask the
+    calibration fitted, ever flies the model. Raises ValueError when report.json's record of the mask is malformed."""
+    if 'w_mask' not in report:
+        return None, 'the calibration ran without it: report.json has no w_mask (a calibration by the tool before 2026-11-07)', None
+    if report['w_mask'] is None:
+        return None, ('the calibration ran without it: report.json w_mask is null (--no-bearing, OV_KB_BEARING=0, cameras other '
+                      'than Kannala-Brandt, or stereo passes)'), None
+    cfgdir = os.path.join(vio_root, 'vio_deploy', 'config')
+    if _env_file(os.path.join(cfgdir, 'flight_stiffness.env')).get('OV_KB_BEARING') != '1':
+        return None, ('the vio package\'s flight_stiffness.env does not switch it on (%s)'
+                      % os.path.join(cfgdir, 'flight_stiffness.env')), None
+    return flight_mask(report, open(os.path.join(cfgdir, 'estimator_flight.yaml')).read(), sorted(cams))
+
+
 def _flight_check_env(vio_root, a, nonradial=None, group=False, bearing=False):
     """Environment of the flight check: the caller's, plus campaign.env on the vehicle, plus every line of
     flight_stiffness.env. The lens terms it starts from are those of THIS calibration, or none (zero): never what the
     caller's shell or a file holds. The bearing model's variables of the caller are left out: the flight runs the model as
-    flight_stiffness.env sets it when bearing (deploy_vio.py's folder of a calibration made with the model), and without it
-    otherwise (a calibration made without the model, flown as deploy_vio.py flies it).
+    flight_stiffness.env sets it when bearing (deploy_vio.py's folder of a calibration made with the model, whose fitted mask
+    flies as it is), and without it otherwise (flight_model(): a calibration made without the model, or one whose fitted
+    mask cannot fly as it is, flown as deploy_vio.py flies it).
     group: the tool grouped the cameras of the calibration passes itself (a desktop, or --no-campaign-env), so the flight
     check groups them too and matches as the passes did."""
     env = {k: v for k, v in os.environ.items() if not _is_bearing_var(k)}   # the model only as the flight settings set it
@@ -501,8 +524,8 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     priors, the two lens terms as states, the matching between cameras, the limits for slow flight and, with bearing, the
     bearing model. On a desktop there is no campaign.env, so the CPU tracker runs, and the matching runs only if the caller
     exported OV_GROUP_CAMS=1. The lens terms start at those of this calibration, or at zero when it has none. mask_lines:
-    the fisheye mask written into the flight config (wmask.flight_mask: the one of the published pass), as deploy_vio.py
-    writes it; None = the config's own.
+    the fisheye mask written into the flight config (flight_model(): the one of the published pass, as fitted), as
+    deploy_vio.py writes it; None = the config's own, with the original model.
 
     Returns the trajectory path. Raises on any failure -- the caller degrades honestly.
     """
@@ -590,7 +613,8 @@ def main():
                          'this switch. Off by '
                          'itself for a template whose cameras are not Kannala-Brandt, and for stereo passes. Flight '
                          'runs the model the calibration ran: a calibration made without it is deployed without it '
-                         '(deploy_vio.py), and --frozen-check flies it so.')
+                         '(deploy_vio.py), and so is one whose fitted mask cannot fly as it is (a WARNING); '
+                         '--frozen-check flies it so.')
     ap.add_argument('--max-pass', type=int, default=16,
                     help='cap on estimator passes (paper: 16). The stopping rule needs at least two.')
     ap.add_argument('--domain', type=int, default=70)
@@ -655,7 +679,8 @@ def main():
                          'cameras are grouped: on the vehicle, on a desktop when the calibration passes '
                          'matched, or with OV_GROUP_CAMS=1); since 2026-11-07 the bearing model with the '
                          'fisheye mask of the published pass, as deploy_vio.py deploys the calibration '
-                         '(without the model when the passes ran without it).')
+                         '(the original model when the passes ran without it, or when that mask cannot fly '
+                         'as it is).')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -1114,13 +1139,17 @@ def main():
     if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
-            # The measurement model of the flight, as deploy_vio.py deploys this calibration: the bearing model when the passes
-            # ran it and flight_stiffness.env switches it on, with the fisheye mask of the published pass for the flight config
-            # (the config's own where that pass kept it); else the original model and the config's mask.
-            _fbear = _bearing and _env_file(os.path.join(vio_root, 'vio_deploy', 'config', 'flight_stiffness.env')).get(
-                'OV_KB_BEARING') == '1'
-            _fmask, _fmask_note = (flight_mask(report, open(os.path.join(vio_root, 'vio_deploy', 'config', 'estimator_flight.yaml')).read(),
-                                               sorted(tmpl_cams)) if _fbear else (None, None))
+            # The measurement model of the flight, as deploy_vio.py deploys this calibration (flight_model(), the same decision):
+            # the bearing model when the passes ran it, flight_stiffness.env switches it on and the fisheye mask of the published
+            # pass flies as it is in the flight config; else the original model and the config's own mask, with a WARNING when
+            # the passes ran the model (only the bearing model with the fitted mask was measured in flight).
+            _fmask, _foff, _ffix = flight_model(vio_root, report, tmpl_cams)
+            _fbear = _fmask is not None
+            if _ffix:
+                log('WARNING: deployment check: the ORIGINAL model, without the bearing model, because %s. The bearing model flies '
+                    'only with the fisheye mask the calibration fitted, as it is (the combination measured in flight), and '
+                    'deploy_vio.py deploys this calibration with the original model too. To fly the bearing model: %s.'
+                    % (_foff, _ffix))
             est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad, group=_tool_grouped,
                                    bearing=_fbear, mask_lines=_fmask)
             cert_kind = 'frozen-deployment'
@@ -1133,12 +1162,13 @@ def main():
                    'groups them, on a desktop the tool groups them unless --no-matching, or export OV_GROUP_CAMS=1' if _fenv.get('OV_XCAM', '')[:1] == '1' and
                    _fenv.get('OV_GROUP_CAMS', '')[:1] != '1' else 'OFF',
                    ('ON, fisheye mask of the published pass: %s' % ', '.join('%s %s' % (k, ('%.6f' % v).rstrip('0').rstrip('.'))
-                                                                              for k, v in sorted(_fmask.items())) if _fmask else
-                    'ON, the flight config\'s own fisheye mask (%s)' % _fmask_note) if _fbear else 'off, the flight config\'s own fisheye mask'))
+                                                                              for k, v in sorted(_fmask.items()))) if _fbear else
+                   'off (%s), the flight config\'s own fisheye mask' % _foff))
             report['deploy_check'] = {'matched_sets_of_images': _fsets,
                                       'lens_terms_prior': _number(_fenv.get('OV_PRIOR_NONRAD_SIG')),
                                       'lens_terms_start': 'this calibration' if _nonrad else 'zero',
                                       'bearing_model': _fbear, 'fisheye_mask': _fmask,
+                                      'bearing_model_off': _foff,
                                       'bearing_model_ran': _bearing_ran(os.path.join(fd, 'out', 'run.log'))}
         except Exception as e:
             rl = os.path.join(fd, 'out', 'run.log')

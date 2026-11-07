@@ -59,7 +59,8 @@ python3 selfcalib/tool/run_tool.py \
 # 2+3. read the calibrated values and deploy them into a flight-ready folder
 python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle
 #    → prints intrinsics / extrinsics / t_d / mount, writes the folder the estimator wants
-#      (the bearing model with the calibration's fitted fisheye mask; add --no-bearing for the original model)
+#      (the bearing model with the calibration's fitted fisheye mask; add --no-bearing for the original model,
+#       which a calibration whose fitted mask cannot fly as it is also gets, with a WARNING)
 
 # 4. fly (the folder's own flight settings; its MANIFEST.txt gives every line)
 set -a; source flight_myvehicle/flight_stiffness.env; set +a           # REQUIRED
@@ -71,7 +72,11 @@ ros2 run ov_msckf run_online_msckf flight_myvehicle/estimator_flight.yaml
 ```
 
 A folder deployed before 2026-10-09 has no `flight_stiffness.env` of its own: deploy it again
-(`deploy_vio.py` on the same calibration output), or follow that folder's own MANIFEST.
+(`deploy_vio.py` on the same calibration output). Its own MANIFEST no longer applies: it sources
+the vio package's `flight_stiffness.env`, which since 2026-11-07 switches on the bearing model,
+never measured with the config's mask such a folder holds. A folder deployed before 2026-11-07
+does not set `OV_KB_BEARING` itself: fly it from a fresh shell, not after sourcing another
+folder, or deploy it again.
 
 Step 2+3 exists because the estimator resolves its chain files **relative to its config** and
 by literal filename: a chain called `myvehicle_published_chain.yaml` sitting elsewhere is

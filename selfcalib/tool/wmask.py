@@ -30,9 +30,12 @@ The ring (380-500 px) is the fleet's lens (f about 252 px, image circle ending a
 on another rig the profiles do not reach the circle and the rule finds no edge: the config's mask is then kept. The
 rule never widens the config's disk (a value above the config's is lowered to it).
 
-Flight (since 2026-11-07) runs the bearing model as well, with the mask of the pass a calibration published
-(report.json w_mask): flight_mask() reads it and fits it to the flight config, for deploy_vio.py and the tool's flight
-check alike.
+Flight (since 2026-11-07) runs the bearing model as well, but only with the mask of the pass a calibration published
+(report.json w_mask), exactly as that pass ran it: the combination measured in flight. flight_mask() reads it and checks
+that the flight config takes it as it is, for deploy_vio.py and the tool's flight check alike; where it cannot (the
+estimator of the calibration did not run the model, the published pass kept the config's mask, the flight config does
+not draw the disk itself, keys its cameras differently or has a narrower disk), the flight runs the original model with
+the flight config's own mask.
 """
 import math
 import re
@@ -242,33 +245,57 @@ def published_lines(report):
     return out, None
 
 
+def _txt(v):
+    return ('%.*f' % (DECIMALS, v)).rstrip('0').rstrip('.')
+
+
 def for_config(lines, cfg_txt, cams):
-    """The lines of a fitted mask for another config of the rig (the flight config) -> (lines, note).
-    lines None and note = why, when they cannot be used there: the config does not draw the disk itself (use_mask /
-    mask_fisheye_auto false), or its mask has other keys (every camera must get its fitted value: the global key for the
-    cameras without one of their own, mask_fisheye_theta_max<i> for each camera with one). Otherwise a value wider than
-    this config's own is lowered to it, as in w_mask (note then names the keys, else None)."""
+    """Does another config of the rig (the flight config) take a fitted mask as it is? -> (lines, why).
+    lines: the fitted lines, to be written into that config unchanged. None and why (a sentence) when it cannot take them
+    unchanged: the config does not draw the disk itself (use_mask / mask_fisheye_auto false), its mask has other keys (every
+    camera must get its fitted value: the global key for the cameras without one of their own, mask_fisheye_theta_max<i>
+    for each camera with one), or its disk is narrower than the fitted one on some key (the fitted value would have to be
+    lowered to it, and the mask that flew would not be the fitted one)."""
     auto, theta, own, _ = config_mask(cfg_txt, cams)
     if not auto:
         return None, 'the flight config does not draw the fisheye disk itself (use_mask / mask_fisheye_auto)'
     keys = {'mask_fisheye_theta_max%d' % c if c in own else 'mask_fisheye_theta_max': c for c in cams}
     if set(lines) != set(keys):
         return None, ('the fitted mask sets %s, the flight config\'s mask has %s' % (', '.join(sorted(lines)), ', '.join(sorted(keys))))
-    out, capped = {}, []
-    for k, v in lines.items():
-        cfgv = theta[keys[k]]
-        if v > cfgv:
-            capped.append(k)
-            v = cfgv
-        out[k] = v
-    return out, ('wider than the flight config, lowered to it: %s' % ', '.join(sorted(capped))) if capped else None
+    narrower = sorted(k for k, v in lines.items() if v > theta[keys[k]])
+    if narrower:
+        return None, ('the flight config\'s fisheye disk is narrower than the fitted mask (%s)'
+                      % ', '.join('%s %s against %s fitted' % (k, _txt(theta[keys[k]]), _txt(lines[k])) for k in narrower))
+    return dict(lines), None
+
+
+# What lets a calibration fly the bearing model, when flight_mask() finds that it cannot (the folder then flies the original model).
+FIX_NOT_RUN = 'rebuild the estimator (commit 250f9f2 or later) and calibrate again'
+FIX_KEPT = ('the mask fit must succeed on the pass the calibration publishes (selfcalib/docs/TROUBLESHOOTING.md, section 9, '
+            '"fisheye mask of the config kept"): calibrate again once it does')
+FIX_CONFIG = ('the flight config must take the fitted mask as it is: draw the fisheye disk itself (use_mask and '
+              'mask_fisheye_auto true), with the mask keys of the calibration config (mask_fisheye_theta_max, and '
+              'mask_fisheye_theta_max<i> for a camera with its own) and a disk at least as wide as the fitted one (the '
+              'shipped 1.83 / 1.87); then deploy again')
 
 
 def flight_mask(report, cfg_txt, cams):
-    """The fisheye mask a calibration is flown with when flight runs the bearing model: the fitted mask of the pass it
-    published, for the flight config cfg_txt. -> (lines, note): lines None = the flight config's own mask stays, note why.
-    Raises ValueError when report.json's record is malformed."""
+    """The fisheye mask a calibration flies with when the flight settings switch the bearing model on -> (lines, why, fix).
+    lines: the fitted mask of the pass it published, exactly as that pass ran it, for the flight config cfg_txt: the flight
+    runs the bearing model with it. None: the flight runs the ORIGINAL model with the flight config's own mask, because the
+    bearing model flies only with the fitted mask as it is (the combination measured in flight); why says why (a sentence),
+    and fix what would let a calibration fly the model (None when the calibration ran without the model: nothing to fix).
+    The cases: the calibration ran without the model (no w_mask, or w_mask null); the estimator of the calibration did not
+    run it (calib_passes.bearing_model_ran false); its published pass kept the config's mask; the flight config cannot take
+    the fitted mask unchanged (for_config). Raises ValueError when report.json's record of the mask is malformed."""
+    if report.get('w_mask') is None:
+        return None, published_lines(report)[1], None
     lines, why = published_lines(report)
+    if (report.get('calib_passes') or {}).get('bearing_model_ran') is False:
+        return None, ('the estimator of the calibration did not run the bearing model (report.json '
+                      'calib_passes.bearing_model_ran false: built before commit 250f9f2?), so the calibration is the one '
+                      'without it'), FIX_NOT_RUN
     if lines is None:
-        return None, why
-    return for_config(lines, cfg_txt, cams)
+        return None, why, FIX_KEPT
+    lines, why = for_config(lines, cfg_txt, cams)
+    return lines, why, (FIX_CONFIG if lines is None else None)

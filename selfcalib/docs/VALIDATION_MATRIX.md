@@ -229,25 +229,28 @@ wider. The fit takes 0.6 s per pass on the flight computer.
 ## 9. Bearing model in flight (2026-11-07)
 Since 2026-11-07 flight runs the bearing model as well (`vio/vio_deploy/config/flight_stiffness.env`,
 point 5), with the fisheye mask of the pass the calibration published, which `deploy_vio.py` writes
-into the flight folder (README, "Bearing model and fitted fisheye mask"). The real-time test on the
+into the flight folder as it was fitted (README, "Bearing model and fitted fisheye mask"); every other
+case flies the original model. The real-time test on the
 Orin NX that decided it is in `../../vio/README.md`, "Bearing measurement model": the same tracking
 error (3.69 against 3.73 cm over 11 flights x 3 runs per model, no run above 6 cm in either), about
 10 % more time per set of images. The `--frozen-check` row of section 8 describes the tool before
 this change. Tests of the change (workstation; the estimator's code is that of 5301181, unchanged):
 
 **Deployment** (no estimator; the three 90 s calibrations the real-time test flew, nxt3 4 June,
-nxt6 23 June, nxt10 4 June; `deploy_vio.py` of 5301181 as the reference; 216 checks, all pass).
+nxt6 23 June, nxt10 4 June; `deploy_vio.py` of 5301181 as the reference; 345 checks, all pass,
+counting the shells and docs checks).
 
 | case | result |
 |---|---|
 | default | the fitted mask of the published pass in `estimator_flight.yaml` (nxt3 1.808444 / 1.818816, nxt6 1.817016 / 1.819301, nxt10 1.800899 / 1.83665); with each recording's topic layout it is the real-time test's config of the bearing model for all 11 recordings, byte for byte, and the sourced `flight_stiffness.env` is that test's environment (campaign.env and the real-time replay switches aside); every other file as deployed before |
 | `OV_KB_BEARING=0` exported, `--no-bearing`, or both with `OV_KB_BEARING=1` | the folder of 5301181 file for file (`estimator_flight.yaml`, chains, mount, lens terms, `campaign.env`); the sourced flight settings differ only by `OV_KB_BEARING=0`; it is the real-time test's config and environment of the original model |
 | `report.json` without `w_mask` (a tool before 2026-11-07), or `w_mask` null (`--no-bearing` calibration) | the original model, the config's mask |
-| the published pass kept the config's mask; a flight config without the automatic disk, or without the camera-3 key | the bearing model with the config's own mask, WARNING |
-| a flight disk narrower than the fitted one | the fitted mask lowered to it, noted |
-| `w_mask` record damaged (not an angle, a key that is not a mask key, no record of the published pass) | refused |
+| the fitted mask cannot fly as it is: the estimator of the calibration did not run the model (`bearing_model_ran` false); the published pass kept the config's mask (no circle found, or the fit failed); a flight config without the automatic disk (`use_mask` or `mask_fisheye_auto` false), without the camera-3 key or with a key of its own for another camera, or with a disk narrower than the fitted one (cameras 0-2, or camera 3) | the original model, with a WARNING naming the reason and what would let the model fly: the folder of 5301181 file for file (MANIFEST and `flight_stiffness.env` aside), its flight settings those of 5301181 plus `OV_KB_BEARING=0`; `--frozen-check` takes the same decision (`run_tool.flight_model`) |
+| a flight disk wider than the fitted one, or equal to it | the bearing model with the fitted mask as it is |
+| `w_mask` record damaged (not an angle, a key that is not a mask key, no record of the published pass) | refused (`--frozen-check`: the deployment check fails); `--no-bearing` deploys the original model |
 | a vio package whose `flight_stiffness.env` does not set the model | the original model, no fitted mask |
-| deployed again into the same folder: model, original, model | each time the folder of that deployment |
+| the default, the original model asked for, a calibration without the model | the folder that `deploy_vio.py` of the commit before this rule (408c165) writes, file for file (the MANIFEST up to its paths, `flight_stiffness.env` as sourced) |
+| deployed again into the same folder: model, original, model, a calibration whose mask cannot fly | each time the folder of that deployment |
 
 **Replays** (CPU tracker, `OV_DETERMINISTIC=1`, `OV_GROUP_CAMS=1`, 2 threads, whole recordings; each
 recording with its own calibration):

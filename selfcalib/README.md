@@ -223,7 +223,8 @@ capture's rigid body, which a camera calibration does not change: solve them aga
 motion capture after changing the hardware.
 Since 2026-11-07 the folder flies the bearing measurement model with the fisheye mask the
 calibration fitted, written into its `estimator_flight.yaml` (section "Bearing model and fitted
-fisheye mask"); `--no-bearing`, or `OV_KB_BEARING=0` exported, deploys the original model.
+fisheye mask"); `--no-bearing`, or `OV_KB_BEARING=0` exported, deploys the original model, and so
+does a calibration made without the model or whose fitted mask cannot fly as it is (a WARNING).
 See `../WORKFLOW.md` for the full four-step walkthrough.
 
 **Exit codes**: `0` success · `1` gate failure (re-record) · `2` the stopping rule never held
@@ -305,7 +306,8 @@ tool's own image pass (30 s of flight) gives the same disk as a fit on 300 pictu
 the whole recording, at the same calibration, to within 0.3 px of radius. The rule is made for
 the fleet's lens (the circle ends 380-500 px from the principal point): for another lens, a
 config whose mask is not the automatic disk, or a fit that fails, the config's mask is kept and
-the log says why. The fitted disk is never wider than the config's.
+the log says why (when the published pass kept it, the calibration is flown with the original
+model: "In flight" below). The fitted disk is never wider than the config's.
 
 What it changes, measured on the fleet's recordings: the lens model 105-110 deg off the axis
 comes out 4.5-6.9 times more repeatable between starting values (0.6-0.8 px with 90 s of flight,
@@ -326,7 +328,8 @@ mask. Exporting `OV_KB_BEARING=0` does the same; your own values of `OV_BEARING_
 off by itself for a template whose cameras are not Kannala-Brandt (`equidistant`) and for
 `--calib-stereo true` (it was tested on monocular passes). An estimator built before the commit
 that added it ignores the switches; the run then ends with a WARNING (`report.json`
-`calib_passes.bearing_model_ran` false): rebuild it. The log says what the passes ran with
+`calib_passes.bearing_model_ran` false), and the calibration is flown with the original model
+(section "In flight" below): rebuild it. The log says what the passes ran with
 (`calibration passes: ..., bearing model ON (...)`), and so does `report.json`
 (`calib_passes.bearing_model`).
 
@@ -336,11 +339,16 @@ about 10 % more time per set of images). The flight settings (`flight_stiffness.
 package) set the three switches, and `deploy_vio.py` writes into the flight folder's
 `estimator_flight.yaml` the mask of the pass the calibration published (`report.json`
 `w_mask.passes`, the entry of `published_from_pass`): the mask that pass ran with, fitted
-around the principal points of the pass before. Where that pass kept the config's mask, the
-folder keeps it too, with a WARNING. A calibration made without the model (`--no-bearing`,
+around the principal points of the pass before, written as it is. The model flies only with that
+mask, the combination measured in flight. A calibration made without the model (`--no-bearing`,
 `OV_KB_BEARING=0`, a rig the model is off for, or this tool before 2026-11-07, whose
 `report.json` has no `w_mask`) is deployed without it: the original model, with the config's
-mask. `--frozen-check` flies the calibration the same way. To fly the original model with a
+mask. So is, with a WARNING that says why, a calibration whose fitted mask cannot fly as it is:
+the estimator of the calibration did not run the model (`calib_passes.bearing_model_ran` false),
+the pass it published kept the config's mask (no image circle found, or the fit failed), or the
+flight config does not draw the disk itself, keys its cameras differently, or has a disk narrower
+than the fitted one. `--frozen-check` flies the calibration the same way (`tool/run_tool.py`,
+`flight_model()`, decides for both). To fly the original model with a
 calibration made with it, deploy with `OV_KB_BEARING=0` exported or `deploy_vio.py --no-bearing`:
 that folder's flight is byte-identical to the flight of before 2026-11-07, and its
 `flight_stiffness.env` sets `OV_KB_BEARING=0`. The folder's MANIFEST says which model it flies
@@ -459,9 +467,10 @@ operating point; on a desktop it runs the CPU tracker, and it matches between ca
 calibration passes did (the tool groups the cameras on a desktop) or when you export
 `OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched. It flies
 the measurement model as `deploy_vio.py` deploys this calibration: the bearing model with the
-mask of the published pass when the passes ran the model, the original model with the config's
-mask when they did not; the bearing variables of your shell are ignored (`deploy_check`
-`bearing_model`, `fisheye_mask`, `bearing_model_ran`).
+mask of the published pass when the passes ran the model and that mask can fly as it is, the
+original model with the config's mask otherwise (a WARNING when the passes ran the model); the
+bearing variables of your shell are ignored (`deploy_check` `bearing_model`, `fisheye_mask`,
+`bearing_model_off`, `bearing_model_ran`).
 
 **This matters operationally:** `run_serial.sh` passes your shell environment through, so
 flight variables leaking into a calibration run silently pin the calibration at its seed.

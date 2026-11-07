@@ -22,7 +22,9 @@ Both operating points use this one build. Needs Ubuntu 22.04, ROS 2 Humble, and
 needs an estimator built from commit 6bbaf8c on (an older build ignores both, and the run ends
 with a WARNING for each). Since 2026-11-07 it also runs the bearing measurement model, and so does
 flight, which needs an estimator built from commit 250f9f2 on (an older build ignores it: a
-calibration run then ends with a WARNING, and a flight runs the original model with the fitted mask).
+calibration run then ends with a WARNING and is deployed with the original model, and a folder of
+the bearing model flown on such a build runs the original model with the fitted mask, which was
+never measured).
 
 ---
 
@@ -116,9 +118,21 @@ the flight settings the ones intended.
 **The measurement model (since 2026-11-07).** The folder flies the bearing measurement model
 (`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1` in its `flight_stiffness.env`) with the
 fisheye mask the calibration fitted to each lens, the one of the pass it published, written into
-its `estimator_flight.yaml`. A calibration made without the model (`--no-bearing`, or by the tool
-before 2026-11-07) is deployed without it, with the config's own mask. To fly the original model
-with any calibration, deploy it into its own folder with the model off:
+its `estimator_flight.yaml` as it was fitted: the combination measured in flight. Every other case
+is deployed with the original model and the config's own mask: a calibration made without the
+model (`--no-bearing`, or by the tool before 2026-11-07) and, with a WARNING that says why and what
+would change it, a calibration whose fitted mask cannot fly as it is (the estimator of the
+calibration did not run the model, the pass it published kept the config's mask, or the flight
+config does not draw the disk itself, keys its cameras differently or has a disk narrower than the
+fitted one):
+
+```
+[deploy] WARNING: measurement model: the ORIGINAL, without the bearing model (the published pass 2 kept
+         the config's own mask (...)); the flight config's own fisheye mask (...). The calibration ran the
+         bearing model, but the model flies only with the fisheye mask the calibration fitted, as it is ...
+```
+
+To fly the original model with any calibration, deploy it into its own folder with the model off:
 
 ```bash
 OV_KB_BEARING=0 python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle_original
@@ -179,10 +193,19 @@ calibration was made on. Without them the live node starts and receives nothing,
 writes no trajectory.
 
 A flight folder deployed before 2026-10-09 has no `flight_stiffness.env` of its own. Run
-`deploy_vio.py` again on its calibration output (the calibration is not repeated), or do what
-that folder's MANIFEST says: source `vio/vio_deploy/config/flight_stiffness.env` and then, if
-the folder has one, its `lens_terms.env`. If `source` answers `No such file or directory`,
-nothing was set and the estimator would fly with loose priors.
+`deploy_vio.py` again on its calibration output (the calibration is not repeated; a calibration
+made before 2026-11-07 is deployed with the original model). Do not follow that folder's MANIFEST
+any more: it sources `vio/vio_deploy/config/flight_stiffness.env`, which since 2026-11-07 switches
+on the bearing model, and the folder holds the config's own mask, a combination never measured in
+flight. If `source` answers `No such file or directory`, nothing was set and the estimator would
+fly with loose priors.
+
+A folder deployed before 2026-11-07 flies the original model, but its `flight_stiffness.env` does
+not set `OV_KB_BEARING`. Sourced in a shell that sourced a folder of the bearing model before, it
+keeps that folder's `OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1` and flies the bearing
+model with the config's own mask, which was never measured. Fly older folders from a fresh shell,
+or deploy them again (`deploy_vio.py` on the same calibration output): every folder deployed since
+sets `OV_KB_BEARING` itself (`1`, or `0` for the original model).
 
 `flight_stiffness.env` is **not optional**. It tightens the calibration priors ×0.10 so the
 online calibration stays tethered to the chain you just deployed. Without it you are running

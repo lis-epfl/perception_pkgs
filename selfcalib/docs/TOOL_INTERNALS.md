@@ -21,11 +21,12 @@ synthetic-smudge localization / fixed-point publish / 6 diagnosis verdicts / cro
   end radius / focal length over the cameras that share the global key (camera 3 has its own),
   so that the estimator's disk ends 4 px inside the circle. The rule and its checks are in the
   module's docstring. `flight_mask()` hands the mask of the published pass (`report.json`
-  `w_mask`) to the flight config, for `deploy_vio.py` and `--frozen-check` (flight runs the model
-  too since the same day).
+  `w_mask`) to the flight config when it can fly there as it is, or says why not (flight runs the
+  model too since the same day, but only with that mask; otherwise the original model).
 - `deploy_vio.py` — the deployment step: the flight folder (chains, flight settings with the lens
   terms, the fitted mask written into its `estimator_flight.yaml`), verified; `--no-bearing` or
-  `OV_KB_BEARING=0` deploys the original model.
+  `OV_KB_BEARING=0` deploys the original model. `run_tool.flight_model()` decides the model and
+  the mask, for it and for `--frozen-check` alike.
 - `publish.py` — §3.4/§6 robust-mean publisher (median + chordal rotation mean over harvests);
   kept for the study, the tool now publishes the converged pass itself.
 - `evalate.py` — trajectory metrics (toff-corrected; global/POSTG/NOUM), study conventions.

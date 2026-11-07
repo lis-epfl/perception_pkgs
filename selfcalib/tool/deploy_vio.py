@@ -24,11 +24,14 @@ folder layout the VIO estimator expects:
 
 The measurement model (since 2026-11-07): the folder flies the bearing measurement model, which the vio
 package's flight_stiffness.env switches on, with the fisheye mask of the pass the calibration published
-(report.json w_mask), written into estimator_flight.yaml. That pass's own mask stays the config's where the fit
-kept it. A calibration made without the model (a tool before 2026-11-07, --no-bearing, cameras other than
-Kannala-Brandt, stereo passes) is flown without it. --no-bearing here, or OV_KB_BEARING other than 1 in this
-shell, deploys the ORIGINAL model whatever the calibration: the config's own mask and the folder's
-flight_stiffness.env with OV_KB_BEARING=0, which fly the estimator of before byte for byte.
+(report.json w_mask), written into estimator_flight.yaml as it was fitted: the combination measured in flight.
+Every other case flies the ORIGINAL model: the config's own mask and the folder's flight_stiffness.env with
+OV_KB_BEARING=0, which fly the estimator of before byte for byte. So does --no-bearing here, or OV_KB_BEARING
+other than 1 in this shell, whatever the calibration; a calibration made without the model (a tool before
+2026-11-07, --no-bearing, cameras other than Kannala-Brandt, stereo passes); and, with a WARNING, a calibration
+whose fitted mask cannot fly as it is: its estimator did not run the model, the pass it published kept the
+config's mask, or the flight config does not draw the disk itself, keys its cameras differently or has a disk
+narrower than the fitted one (run_tool.flight_model, which --frozen-check follows as well).
 
 The estimator resolves `relative_config_imu` / `relative_config_imucam` RELATIVE TO THE
 CONFIG FILE, which is why all three must sit in one directory. That is the whole reason this
@@ -51,8 +54,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chainio import parse_chain
-from run_tool import resolve_vio_root, _env_file, _number, _is_bearing_var
-from wmask import flight_mask, apply_lines, config_mask
+from run_tool import resolve_vio_root, _env_file, _number, _is_bearing_var, flight_model
+from wmask import apply_lines, config_mask
 
 
 def log(s):
@@ -122,7 +125,8 @@ def main():
                          'the flight of before 2026-11-07 byte for byte. Exporting OV_KB_BEARING=0 (any value but 1) when '
                          'running this does the same. By default the folder flies the bearing model with the mask the '
                          'calibration fitted, when the calibration ran the model (the tool\'s default since 2026-11-07); a '
-                         'calibration made without it is flown without it.')
+                         'calibration made without it is flown without it, and so is one whose fitted mask cannot fly as '
+                         'it is (a WARNING says why).')
     a = ap.parse_args()
 
     cal = os.path.abspath(a.calib_out)
@@ -262,49 +266,39 @@ def main():
                 % (os.path.dirname(src), mount['lever_arm_carried_over_from'], *(100 * v for v in lever)))
 
     # ---- 3b. the measurement model, and the fisheye mask it flies with ----
-    # The vio package's flight_stiffness.env switches the bearing model on (since 2026-11-07). It flies with the mask the
-    # calibration fitted to each lens, the one of the pass it published: written into the folder's estimator_flight.yaml.
-    # Off -- the original model, the config's own mask, OV_KB_BEARING=0 in the folder's flight_stiffness.env -- with
-    # --no-bearing or OV_KB_BEARING other than 1 in this shell (byte for byte the flight of before), for a calibration made
-    # without the model (the flight then runs the model the calibration ran), and for a vio package whose
-    # flight_stiffness.env does not switch it on (older than this tool: a fitted mask without the model was never tested).
+    # The vio package's flight_stiffness.env switches the bearing model on (since 2026-11-07). It flies only with the mask the
+    # calibration fitted to each lens, the one of the pass it published, written into the folder's estimator_flight.yaml as
+    # it was fitted: the combination measured in flight. Every other case flies the ORIGINAL model -- the config's own mask,
+    # OV_KB_BEARING=0 in the folder's flight_stiffness.env, byte for byte the flight of before: --no-bearing or OV_KB_BEARING
+    # other than 1 in this shell; a calibration made without the model (the flight then runs the model the calibration
+    # ran); a vio package whose flight_stiffness.env does not switch it on (older than this tool: a fitted mask without the
+    # model was never tested); and, with a WARNING, a calibration whose fitted mask cannot fly as it is (its estimator did not
+    # run the model, its published pass kept the config's mask, or the flight config cannot take the fitted mask unchanged).
+    # run_tool.flight_model() decides, for --frozen-check as well.
     flight_txt = open(flight_cfg).read()
     off_why = ('--no-bearing' if a.no_bearing else
                'OV_KB_BEARING=%s in the environment of deploy_vio.py' % os.environ['OV_KB_BEARING']
-               if os.environ.get('OV_KB_BEARING', '1') != '1' else
-               'the calibration ran without it: report.json has no w_mask (a calibration by the tool before 2026-11-07)'
-               if 'w_mask' not in rep else
-               'the calibration ran without it: report.json w_mask is null (--no-bearing, OV_KB_BEARING=0, cameras other '
-               'than Kannala-Brandt, or stereo passes)' if rep['w_mask'] is None else
-               'the vio package\'s flight_stiffness.env does not switch it on (%s)' % stiffness
-               if fl_src.get('OV_KB_BEARING') != '1' else None)
-    bearing = off_why is None
-    mask_lines, mask_note = None, None
-    if bearing:
+               if os.environ.get('OV_KB_BEARING', '1') != '1' else None)
+    mask_lines, fix = None, None
+    if off_why is None:
         try:
-            mask_lines, mask_note = flight_mask(rep, flight_txt, sorted(cams))
+            mask_lines, off_why, fix = flight_model(vio, rep, cams)
         except ValueError as e:
             raise SystemExit('[deploy] ERROR: %s.\n  The calibration output is damaged: run the calibration again into an empty '
                              '--out, or deploy the original model (--no-bearing).' % e)
-        if (rep.get('calib_passes') or {}).get('bearing_model_ran') is False:
-            log('WARNING: the estimator of that calibration did not report the bearing model (built before commit 250f9f2?): '
-                'the calibration is the one without it. Rebuild the estimator; check the one that flies.')
+    bearing = mask_lines is not None
     _, cfg_theta, cfg_own, _ = config_mask(flight_txt, sorted(cams))
     cfg_lines = {('mask_fisheye_theta_max%d' % c if c in cfg_own else 'mask_fisheye_theta_max'): cfg_theta[c] for c in sorted(cams)}
     show = lambda ls: ', '.join('%s %s' % (k, ('%.6f' % v).rstrip('0').rstrip('.')) for k, v in sorted(ls.items()))
-    if not bearing:
-        log('measurement model: the ORIGINAL, without the bearing model (%s); the flight config\'s own fisheye mask (%s)'
-            % (off_why, show(cfg_lines)))
-    elif mask_lines:
+    if bearing:
         log('measurement model: bearing (%s); fisheye mask fitted by the calibration, the one of the pass it published '
             '(pass %s): %s -> estimator_flight.yaml' % (' '.join('%s=%s' % (k, fl_src[k]) for k in sorted(fl_src) if _is_bearing_var(k)),
                                                          rep.get('published_from_pass'), show(mask_lines)))
-        if mask_note:
-            log('  note: %s' % mask_note)
     else:
-        log('WARNING: measurement model: bearing, but with the flight config\'s own fisheye mask (%s): %s. The bearing model '
-            'was measured in flight with the fitted mask only; to fly the original model deploy with --no-bearing.'
-            % (show(cfg_lines), mask_note))
+        log('%smeasurement model: the ORIGINAL, without the bearing model (%s); the flight config\'s own fisheye mask (%s)%s'
+            % ('WARNING: ' if fix else '', off_why, show(cfg_lines),
+               ('. The calibration ran the bearing model, but the model flies only with the fisheye mask the calibration '
+                'fitted, as it is (the combination measured in flight). To fly it: %s.' % fix) if fix else ''))
 
     # ---- 4. write the folder the estimator expects ----
     os.makedirs(a.out, exist_ok=True)
@@ -410,26 +404,24 @@ def main():
     if bearing:
         model_txt = ('\nMEASUREMENT MODEL: the bearing model (since 2026-11-07)\n'
                      + wrap('flight_stiffness.env: %s' % ' '.join('%s=%s' % (k, fl[k]) for k in sorted(fl) if _is_bearing_var(k)), '  ')
-                     + (wrap('estimator_flight.yaml: the fisheye mask the calibration fitted to each lens, the one of the pass it '
-                             'published (pass %s):' % rep.get('published_from_pass'), '  ') + ylines(mask_lines) if mask_lines else
-                        wrap('estimator_flight.yaml: the flight config\'s OWN fisheye mask, because %s. WARNING: the bearing '
-                             'model was measured in flight with the fitted mask only.' % mask_note, '  ') + ylines(cfg_lines))
+                     + wrap('estimator_flight.yaml: the fisheye mask the calibration fitted to each lens, the one of the pass it '
+                            'published (pass %s):' % rep.get('published_from_pass'), '  ') + ylines(mask_lines)
                      + 'The estimator\'s start-up line "[bearing-cfg] on=1 ..." in its log shows that it runs.\n'
                      'To fly the ORIGINAL model with this calibration, deploy it again into another folder:\n'
                      '  OV_KB_BEARING=0 python3 %s --calib-out %s --out <another folder>\n'
                      '(or pass --no-bearing). That folder flies the estimator of before 2026-11-07 byte for byte.\n'
-                     % (shlex.quote(os.path.abspath(__file__)), shlex.quote(cal))
-                     + ('Exporting OV_KB_BEARING=0 after sourcing THIS folder switches the model off but keeps the\n'
-                        'fitted mask, which is narrower than the config\'s: that is not the original flight.\n' if mask_lines else
-                        'This folder has the config\'s own mask, so exporting OV_KB_BEARING=0 after sourcing it flies\n'
-                        'the original model as well.\n'))
+                     'Exporting OV_KB_BEARING=0 after sourcing THIS folder switches the model off but keeps the\n'
+                     'fitted mask, which is narrower than the config\'s: that is not the original flight.\n'
+                     % (shlex.quote(os.path.abspath(__file__)), shlex.quote(cal)))
     else:
         model_txt = ('\nMEASUREMENT MODEL: the ORIGINAL model, without the bearing model\n'
                      + wrap('flight_stiffness.env: OV_KB_BEARING=0 (the lines of the model are switched off)', '  ')
                      + wrap('estimator_flight.yaml: the flight config\'s own fisheye mask:', '  ') + ylines(cfg_lines)
                      + 'The flight of before 2026-11-07, byte for byte.\n'
                      + wrap('Why: %s.' % off_why)
-                     + ('To fly the bearing model (the default since 2026-11-07), calibrate with the tool\'s default, which\n'
+                     + (wrap('WARNING: the calibration ran the bearing model, but the model flies only with the fisheye mask '
+                             'the calibration fitted, as it is (the combination measured in flight). To fly it: %s.' % fix) if fix else
+                        'To fly the bearing model (the default since 2026-11-07), calibrate with the tool\'s default, which\n'
                         'runs it and fits the mask, and deploy that calibration.\n' if 'the calibration ran without it' in off_why else
                         'Deployed without --no-bearing and without OV_KB_BEARING=0 in the shell, the same calibration\n'
                         'flies the bearing model.\n' if not off_why.startswith('the vio package') else
@@ -517,8 +509,7 @@ IMU nor compressed images: it is not the flight node.
     for f in sorted(os.listdir(a.out)):
         log('   %s' % f)
     log('verified: %d cameras, t_d %+.6f s, chain/config cross-references consistent, %s'
-        % (ncam, dep_toff, ('the bearing model with the fitted fisheye mask' if mask_lines else
-                            'the bearing model with the config\'s own fisheye mask') if bearing else
+        % (ncam, dep_toff, 'the bearing model with the fitted fisheye mask' if bearing else
            'the original model (OV_KB_BEARING=0, the config\'s own fisheye mask)'))
     log('fly it with the command in %s/MANIFEST.txt' % os.path.abspath(a.out))
     return 0
