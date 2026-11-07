@@ -23,6 +23,8 @@
 #define OV_CORE_CAM_BASE_H
 
 #include <Eigen/Eigen>
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -256,6 +258,228 @@ public:
 
   /// Gets the fixed non-radial terms (p1, p2, s)
   Eigen::Vector3d get_nonradial() const { return camera_nonradial; }
+
+  // ============================================================================================================================
+  // OV_KB_BEARING=1 (default OFF): the bearing measurement model. The tracker stores every observation as normalized pinhole
+  // coordinates (x/z, y/z) computed by cv::fisheye::undistortPoints, which clips the distorted angle at pi/2: with these lenses
+  // every pixel beyond about 86 deg from the optical axis is stored at 85-86 deg whatever its true direction, and a direction at or
+  // beyond 90 deg has no pinhole coordinates at all. With the switch, observations are used as unit bearings unprojected from the
+  // RAW pixel with the current calibration (no pinhole division, no clip), predicted by a projection that accepts any direction
+  // inside the lens model, with its exact Jacobians. Unset, empty or "0" = off (every code path below is skipped and the estimator
+  // is the one without it); exactly "1" = on; anything else = one warning, off. Sub-switches (read only when on):
+  //   OV_BEARING_SWITCH_DEG  (80)  an observation is "rim" when |uvs_norm| > tan(this)   (exact below the clip at ~84.8 deg)
+  //   OV_BEARING_ANCHOR_DEG  (75)  largest bearing of the anchor observation of a feature triangulated by the bearing path
+  //   OV_BEARING_RIM_SIGMA   (1.0) pixel-noise multiplier of the rim rows (triangulation refinement and updates)
+  //   OV_BEARING_RANSAC      (2)   tracker RANSAC: 0 = rim points skip it, 1 = rim points get the pixel-equivalent epipolar test
+  //                                and the other points keep the original test, 2 = every point gets that test (F fitted on the
+  //                                core points only)
+  //   OV_BEARING_RANSAC_PX   (2.0) threshold of that test (px)
+  //   OV_BEARING_SLAM_MAXDEG (85)  SLAM anchor change: a landmark whose smallest bearing over the cameras of the newest clone is
+  //                                above this is marginalized instead of re-anchored
+  //   OV_BEARING_FORCE       (0)   TESTS ONLY: 1 = every observation goes through the bearing branch of the measurement model
+  //   OV_BEARING_ALL         (0)   "everywhere" mode. Exactly "1" = on; unset, empty or "0" = off (the bearing paths then take the
+  //                                rim observations only, and features without rim observations run the original code); anything
+  //                                else = one warning, off. With it EVERY observation takes the bearing code paths, not only the
+  //                                rim ones: every feature is triangulated by the bearing path (unit bearings unprojected from the
+  //                                RAW pixel with the current calibration for every observation, the anchor rule, the linear solve
+  //                                on those bearings, refinement with PIXEL residuals through project_bearing); every row of the
+  //                                measurement model is predicted by project_bearing and differentiated through
+  //                                project_bearing_jacobian; every observation without a bearing under the current calibration
+  //                                (beyond the polynomial's turning point) is erased in the clean steps. Unchanged: the rim test
+  //                                (it still selects the RANSAC split of OV_BEARING_RANSAC = 1 and the rim noise
+  //                                OV_BEARING_RIM_SIGMA), the tracker, the cross-camera matcher. First-estimate Jacobians: a CORE row
+  //                                (stored and predicted bearing <= the switch angle, FEJ point in front of the camera) uses the
+  //                                ORIGINAL split dz/dp = D(n_cur) P(p_fej) (D = the distortion Jacobian at the current normalized
+  //                                point, read off the bearing Jacobian; P = the pinhole Jacobian at the FEJ point), so its rows
+  //                                equal the original rows to float precision (the original prediction is rounded to float); every
+  //                                other row takes the bearing split J_dir(b_cur) (I - b_fej b_fej^T) / |p_fej|. OV_BEARING_FORCE=1
+  //                                still forces the bearing split on every row (tests).
+  // The self-calibration tool (selfcalib/tool/run_tool.py) runs its calibration passes with OV_KB_BEARING=1 OV_BEARING_ALL=1
+  // OV_BEARING_RANSAC=1; the flight configuration does not set them.
+  struct BearingCfg {
+    bool on = false;
+    double switch_deg = 80.0, anchor_deg = 75.0, rim_sigma = 1.0, ransac_px = 2.0, slam_maxdeg = 85.0;
+    int ransac = 2;
+    bool force = false;
+    bool all = false; // OV_BEARING_ALL=1
+    double tan_switch2 = 0.0, switch_rad = 0.0, cos_anchor = 0.0, cos_slam = 0.0;
+  };
+  static const BearingCfg &bearing_cfg() {
+    static const BearingCfg c = [] {
+      BearingCfg b;
+      const char *e = std::getenv("OV_KB_BEARING");
+      if (e == nullptr || *e == '\0' || std::string(e) == "0")
+        return b;
+      if (std::string(e) != "1") {
+        std::fprintf(stderr, "[bearing] warning: OV_KB_BEARING='%s' is neither 0 nor 1: off\n", e);
+        return b;
+      }
+      b.on = true;
+      auto num = [](const char *name, double def, double lo, double hi) {
+        const char *s = std::getenv(name);
+        if (s == nullptr || *s == '\0')
+          return def;
+        char *end = nullptr;
+        const double v = std::strtod(s, &end);
+        if (end == s || *end != '\0' || !std::isfinite(v) || v < lo || v > hi) {
+          std::fprintf(stderr, "[bearing] warning: %s='%s' is not a number in [%g, %g]: %g is used\n", name, s, lo, hi, def);
+          return def;
+        }
+        return v;
+      };
+      b.switch_deg = num("OV_BEARING_SWITCH_DEG", 80.0, 1.0, 84.0);
+      b.anchor_deg = num("OV_BEARING_ANCHOR_DEG", 75.0, 1.0, b.switch_deg);
+      b.rim_sigma = num("OV_BEARING_RIM_SIGMA", 1.0, 0.01, 100.0);
+      b.ransac = (int)num("OV_BEARING_RANSAC", 2.0, 0.0, 2.0);
+      b.ransac_px = num("OV_BEARING_RANSAC_PX", 2.0, 0.01, 100.0);
+      b.slam_maxdeg = num("OV_BEARING_SLAM_MAXDEG", 85.0, 1.0, 89.9);
+      b.force = num("OV_BEARING_FORCE", 0.0, 0.0, 1.0) > 0.5;
+      {
+        const char *ea = std::getenv("OV_BEARING_ALL");
+        if (ea != nullptr && *ea != '\0' && std::string(ea) != "0") {
+          if (std::string(ea) == "1")
+            b.all = true;
+          else
+            std::fprintf(stderr, "[bearing] warning: OV_BEARING_ALL='%s' is neither 0 nor 1: off\n", ea);
+        }
+      }
+      const double ts = std::tan(b.switch_deg * M_PI / 180.0);
+      b.tan_switch2 = ts * ts;
+      b.switch_rad = b.switch_deg * M_PI / 180.0;
+      b.cos_anchor = std::cos(b.anchor_deg * M_PI / 180.0);
+      b.cos_slam = std::cos(b.slam_maxdeg * M_PI / 180.0);
+      std::fprintf(stderr, "[bearing-cfg] on=1 switch_deg=%.3f anchor_deg=%.3f rim_sigma=%.3f ransac=%d ransac_px=%.3f slam_maxdeg=%.3f force=%d all=%d\n",
+                   b.switch_deg, b.anchor_deg, b.rim_sigma, b.ransac, b.ransac_px, b.slam_maxdeg, (int)b.force, (int)b.all);
+      return b;
+    }();
+    return c;
+  }
+
+  /// OV_KB_BEARING=1 (see bearing_cfg())
+  static bool kb_bearing() { return bearing_cfg().on; }
+
+  /// OV_KB_BEARING=1 and OV_BEARING_ALL=1: the bearing model for EVERY observation (see bearing_cfg())
+  static bool bearing_all() { return bearing_cfg().on && bearing_cfg().all; }
+
+  /// OV_KB_BEARING: true when a stored normalized coordinate (x/z, y/z as the tracker stored it, clipped by OpenCV beyond ~85 deg)
+  /// belongs to a rim observation (bearing > OV_BEARING_SWITCH_DEG). Exact below the clip; every clipped value is >= 84.8 deg.
+  static bool bearing_is_rim(double xn, double yn) {
+    const double r2 = xn * xn + yn * yn;
+    return !(r2 <= bearing_cfg().tan_switch2); // NaN counts as rim
+  }
+
+  /// OV_KB_BEARING counters, printed once at exit as the [bearing] line (only when the switch is on)
+  struct BearingStats {
+    // triangulation (features with at least one rim observation)
+    std::atomic<long> tri_rim{0}, tri_rim_ok{0}, tri_rim_fail_lin{0}, tri_rim_fail_ref{0}, tri_anchor_fallback{0}, tri_anchor_rim{0};
+    std::atomic<long> tri_rim_obs{0}, clean_erased{0}, unproj_fail{0};
+    // measurement model rows (bearing branch): observations, of them rim, zero rows (projection failed)
+    std::atomic<long> jac_bearing{0}, jac_rim{0}, jac_zero{0};
+    // updates: features with rim observations used / rejected by the chi2 test; their rim observations
+    std::atomic<long> msckf_rim_used{0}, msckf_rim_chi2{0}, msckf_rim_obs_used{0}, msckf_used{0}, msckf_chi2{0};
+    std::atomic<long> slam_rim_used{0}, slam_rim_chi2{0}, slam_init_rim_ok{0}, slam_init_rim_fail{0};
+    std::atomic<long> slam_anchor_same{0}, slam_anchor_other{0}, slam_anchor_marg{0};
+    // tracker RANSAC (KLT-ok points): core / rim kept and rejected, calls, fallbacks to today's call on all points
+    std::atomic<long> rs_calls{0}, rs_fallback{0}, rs_core_keep{0}, rs_core_rej{0}, rs_rim_keep{0}, rs_rim_rej{0}, rs_unproj_fail{0};
+    // OV_BEARING_ALL only ([bearing-all] line): features WITHOUT rim observations taken through the bearing path (count, ok, failed in
+    // the linear step / in the refinement, anchor in another camera / beyond the anchor angle, anchor different from the original
+    // rule's), core observations whose unprojection failed in the triangulation, core observations erased by the clean steps (no
+    // bearing under the current calibration), core rows of the measurement model with the original FEJ split / with the bearing split
+    // (original split not evaluable: FEJ point not in front of the camera) / zero rows (no projection)
+    std::atomic<long> tri_core{0}, tri_core_ok{0}, tri_core_fail_lin{0}, tri_core_fail_ref{0}, core_anchor_fallback{0}, core_anchor_wide{0};
+    std::atomic<long> core_anchor_moved{0}, core_unproj_fail{0}, clean_erased_core{0}, jac_core_orig{0}, jac_core_own{0}, jac_core_zero{0};
+    // residuals of the bearing-branch rows by predicted bearing band (80-90, 90-100, >= 100 deg): count, sum r^2, count <= 3 px, sum r^2 there
+    std::atomic<long> rb_n[3] = {{0}, {0}, {0}}, rb_ns[3] = {{0}, {0}, {0}};
+    std::atomic<long long> rb_s2_mpx2[3] = {{0}, {0}, {0}}, rb_ss2_mpx2[3] = {{0}, {0}, {0}}; // in 1e-6 px^2
+    void note_res(double t_rad, double r2) {
+      const double d = t_rad * 180.0 / M_PI;
+      if (!(d >= 80.0) || !std::isfinite(r2))
+        return;
+      const int b = d < 90.0 ? 0 : (d < 100.0 ? 1 : 2);
+      const long long q = (long long)std::llround(std::min(r2, 1e9) * 1e6);
+      rb_n[b].fetch_add(1, std::memory_order_relaxed);
+      rb_s2_mpx2[b].fetch_add(q, std::memory_order_relaxed);
+      if (r2 <= 9.0) {
+        rb_ns[b].fetch_add(1, std::memory_order_relaxed);
+        rb_ss2_mpx2[b].fetch_add(q, std::memory_order_relaxed);
+      }
+    }
+    ~BearingStats() {
+      if (!kb_bearing())
+        return;
+      auto rms = [](long long s, long n) { return n > 0 ? std::sqrt((double)s * 1e-6 / (double)n) : 0.0; };
+      std::fprintf(stderr,
+                   "[bearing] tri_rim=%ld ok=%ld fail_lin=%ld fail_refine=%ld anchor_fallback=%ld anchor_rim=%ld rim_obs=%ld clean_erased=%ld | "
+                   "jac_bearing=%ld jac_rim=%ld jac_zero=%ld | msckf used=%ld chi2=%ld rim_used=%ld rim_chi2=%ld rim_obs_used=%ld | "
+                   "slam rim_used=%ld rim_chi2=%ld init_rim_ok=%ld init_rim_fail=%ld anchor_same=%ld anchor_other=%ld anchor_marg=%ld | "
+                   "ransac calls=%ld fallback=%ld core_keep=%ld core_rej=%ld rim_keep=%ld rim_rej=%ld unproj_fail=%ld | "
+                   "res80_90 n=%ld rms=%.3f n3=%ld rms3=%.3f res90_100 n=%ld rms=%.3f n3=%ld rms3=%.3f res100 n=%ld rms=%.3f n3=%ld rms3=%.3f\n",
+                   tri_rim.load(), tri_rim_ok.load(), tri_rim_fail_lin.load(), tri_rim_fail_ref.load(), tri_anchor_fallback.load(),
+                   tri_anchor_rim.load(), tri_rim_obs.load(), clean_erased.load(), jac_bearing.load(), jac_rim.load(), jac_zero.load(),
+                   msckf_used.load(), msckf_chi2.load(), msckf_rim_used.load(), msckf_rim_chi2.load(), msckf_rim_obs_used.load(),
+                   slam_rim_used.load(), slam_rim_chi2.load(), slam_init_rim_ok.load(), slam_init_rim_fail.load(), slam_anchor_same.load(),
+                   slam_anchor_other.load(), slam_anchor_marg.load(), rs_calls.load(), rs_fallback.load(), rs_core_keep.load(),
+                   rs_core_rej.load(), rs_rim_keep.load(), rs_rim_rej.load(), rs_unproj_fail.load(), rb_n[0].load(),
+                   rms(rb_s2_mpx2[0].load(), rb_n[0].load()), rb_ns[0].load(), rms(rb_ss2_mpx2[0].load(), rb_ns[0].load()), rb_n[1].load(),
+                   rms(rb_s2_mpx2[1].load(), rb_n[1].load()), rb_ns[1].load(), rms(rb_ss2_mpx2[1].load(), rb_ns[1].load()), rb_n[2].load(),
+                   rms(rb_s2_mpx2[2].load(), rb_n[2].load()), rb_ns[2].load(), rms(rb_ss2_mpx2[2].load(), rb_ns[2].load()));
+      if (bearing_cfg().all)
+        std::fprintf(stderr,
+                     "[bearing-all] tri_core=%ld ok=%ld fail_lin=%ld fail_refine=%ld anchor_fallback=%ld anchor_wide=%ld anchor_moved=%ld "
+                     "unproj_fail=%ld clean_erased_core=%ld | jac_core_orig=%ld jac_core_own=%ld jac_core_zero=%ld\n",
+                     tri_core.load(), tri_core_ok.load(), tri_core_fail_lin.load(), tri_core_fail_ref.load(), core_anchor_fallback.load(),
+                     core_anchor_wide.load(), core_anchor_moved.load(), core_unproj_fail.load(), clean_erased_core.load(),
+                     jac_core_orig.load(), jac_core_own.load(), jac_core_zero.load());
+    }
+  };
+  static BearingStats &bearing_stats() {
+    static BearingStats s;
+    return s;
+  }
+
+  /**
+   * @brief OV_KB_BEARING: unit bearing (camera frame) of a raw pixel under the current calibration, without clip.
+   * Default (pinhole models): normalize(undistort(uv), 1). false when the model gives no bearing for the pixel.
+   */
+  virtual bool unproject_bearing(const Eigen::Vector2d &uv, Eigen::Vector3d &b) {
+    const Eigen::Vector2d n = undistort_d(uv);
+    if (!n.allFinite())
+      return false;
+    b = Eigen::Vector3d(n(0), n(1), 1.0).normalized();
+    return true;
+  }
+
+  /**
+   * @brief OV_KB_BEARING: raw pixel of a point p given in the camera frame (any length; any sign of z where the model allows it).
+   * Default (pinhole models): z > 0 required, distort(x/z, y/z). false when the model has no pixel for the direction.
+   */
+  virtual bool project_bearing(const Eigen::Vector3d &p, Eigen::Vector2d &uv) {
+    if (!(p(2) > 0.0))
+      return false;
+    uv = distort_d(Eigen::Vector2d(p(0) / p(2), p(1) / p(2)));
+    return true;
+  }
+
+  /**
+   * @brief OV_KB_BEARING: Jacobians of project_bearing at p: H_dz_dp (2x3, with H_dz_dp p = 0), and when asked the 2x8 Jacobian
+   * with respect to the intrinsics (column order of compute_distort_jacobian) and the 2x3 one with respect to (p1, p2, s).
+   */
+  virtual bool project_bearing_jacobian(const Eigen::Vector3d &p, Eigen::Matrix<double, 2, 3> &H_dz_dp, Eigen::MatrixXd *H_dz_dzeta,
+                                        Eigen::MatrixXd *H_dz_dq) {
+    if (!(p(2) > 0.0))
+      return false;
+    const Eigen::Vector2d n(p(0) / p(2), p(1) / p(2));
+    Eigen::MatrixXd dz_dzn, dz_dzeta;
+    compute_distort_jacobian(n, dz_dzn, dz_dzeta);
+    Eigen::Matrix<double, 2, 3> dn_dp;
+    dn_dp << 1.0 / p(2), 0.0, -p(0) / (p(2) * p(2)), 0.0, 1.0 / p(2), -p(1) / (p(2) * p(2));
+    H_dz_dp = dz_dzn * dn_dp;
+    if (H_dz_dzeta != nullptr)
+      *H_dz_dzeta = dz_dzeta;
+    if (H_dz_dq != nullptr)
+      compute_nonradial_jacobian(n, *H_dz_dq);
+    return true;
+  }
 
   /**
    * @brief Non-radial terms of one camera from the environment.

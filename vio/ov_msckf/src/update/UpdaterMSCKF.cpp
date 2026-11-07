@@ -52,6 +52,17 @@ extern double g_sp_alloc, g_sp_jac, g_sp_null, g_sp_marg, g_sp_chi2, g_sp_cpy, g
 #include <mutex>
 #include <vector>
 namespace {
+// OV_KB_BEARING statistics: outcome of the chi2 test of one MSCKF feature, and its rim observations
+void bearing_note_chi2(const ov_core::Feature &f, bool used) {
+  ov_core::CamBase::BearingStats &st = ov_core::CamBase::bearing_stats();
+  const int nr = ov_core::FeatureInitializer::count_rim(f);
+  (used ? st.msckf_used : st.msckf_chi2).fetch_add(1, std::memory_order_relaxed);
+  if (nr > 0) {
+    (used ? st.msckf_rim_used : st.msckf_rim_chi2).fetch_add(1, std::memory_order_relaxed);
+    if (used)
+      st.msckf_rim_obs_used.fetch_add(nr, std::memory_order_relaxed);
+  }
+}
 // OV_SYSPROF=1: sub-phase attribution inside UpdaterMSCKF step 4. Default OFF; when off the
 // only cost is one predicted-not-taken branch per phase.
 static const bool g_sysprof = [] { const char *e = std::getenv("OV_SYSPROF"); return e && *e == '1'; }();
@@ -318,6 +329,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Clean the feature
     (*it0)->clean_old_measurements(clonetimes);
+
+    // OV_KB_BEARING: observations without a bearing under the current calibration are erased (rim ones; every one with
+    // OV_BEARING_ALL=1)
+    if (ov_core::CamBase::kb_bearing())
+      FeatureInitializer::bearing_clean(**it0, state->_cam_intrinsics_cameras);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -747,6 +763,9 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       ct_meas += vr[fi].rows();
     }
     }
+    if (ov_core::CamBase::kb_bearing()) // OV_KB_BEARING statistics
+      for (int fi = 0; fi < NF; fi++)
+        bearing_note_chi2(*feature_vec[fi], keep[fi] != 0);
     // features not kept were erased-equivalent: rebuild vec of kept for the cleanup below
     std::vector<std::shared_ptr<Feature>> kept;
     for (int fi = 0; fi < NF; fi++) if (keep[fi]) kept.push_back(feature_vec[fi]);
@@ -827,6 +846,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Check if we should delete or not
+    if (ov_core::CamBase::kb_bearing()) // OV_KB_BEARING statistics
+      bearing_note_chi2(**it2, !(chi2 > _options.chi2_multipler * chi2_check));
     if (chi2 > _options.chi2_multipler * chi2_check) {
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
@@ -945,3 +966,5 @@ after_feature_loop:;
   PRINT_ALL("[MSCKF-UP]: %.4f seconds update state (%d size)\n", (rT5 - rT4).total_microseconds() * 1e-6, (int)res_big.rows());
   PRINT_ALL("[MSCKF-UP]: %.4f seconds total\n", (rT5 - rT1).total_microseconds() * 1e-6);
 }
+
+void UpdaterMSCKF::set_bearing_cameras(const std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> &cams) { initializer_feat->set_cameras(cams); }

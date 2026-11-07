@@ -24,6 +24,9 @@
 
 #include "CamBase.h"
 
+#include <algorithm>
+#include <limits>
+
 namespace ov_core {
 
 /**
@@ -101,6 +104,11 @@ namespace ov_core {
  * goes through (x_i, y_i); the focal-length columns use the measured (x, y). The terms are constants,
  * they are not columns of the intrinsics Jacobian. When all three are zero the four functions below
  * run their original bodies.
+ *
+ * OV_KB_BEARING=1 (default OFF; see CamBase::bearing_cfg): unproject_bearing, project_bearing and project_bearing_jacobian
+ * below work on unit bearings over the whole lens, without the clip of cv::fisheye::undistortPoints (OpenCV 4.5.4 clips the
+ * distorted angle at pi/2, so every pixel beyond about 86 deg from the optical axis comes back at 85-86 deg). The functions
+ * above (undistort, distort and their Jacobians) are unchanged.
  */
 class CamEqui : public CamBase {
 
@@ -113,6 +121,172 @@ public:
   CamEqui(int width, int height) : CamBase(width, height) {}
 
   ~CamEqui() {}
+
+  /**
+   * @brief Sets the calibration (CamBase::set_value). OV_KB_BEARING=1 only: also caches the range of the Kannala-Brandt
+   * polynomial for the bearing functions (first turning point of theta_d(theta) in (0, 2.2] rad). Off: exactly CamBase::set_value.
+   */
+  void set_value(const Eigen::MatrixXd &calib) override {
+    CamBase::set_value(calib);
+    if (kb_bearing())
+      bearing_range_update();
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------
+  // OV_KB_BEARING (see CamBase::bearing_cfg). Kannala-Brandt with the non-radial terms (p1, p2, s) acting on the measured
+  // normalised coordinates m = ((u - cx)/fx, (v - cy)/fy): m = m_i + N(m), m_i = KB(theta) * (azimuth unit vector).
+  // ---------------------------------------------------------------------------------------------------------------------------
+
+  /// unit bearing of a raw pixel: m_i = m - N(m) (explicit), theta from KB(theta) = |m_i| by safeguarded Newton, no clip
+  bool unproject_bearing(const Eigen::Vector2d &uv, Eigen::Vector3d &b) override {
+    if (!bp_valid())
+      bearing_range_update();
+    const double fx = camera_values(0), fy = camera_values(1), cx = camera_values(2), cy = camera_values(3);
+    const double mx = (uv(0) - cx) / fx, my = (uv(1) - cy) / fy;
+    double mix = mx, miy = my;
+    if (has_nonradial) {
+      const double p1 = camera_nonradial(0), p2 = camera_nonradial(1), sk = camera_nonradial(2);
+      const double r2 = mx * mx + my * my;
+      mix = mx - (2.0 * p1 * mx * my + p2 * (r2 + 2.0 * mx * mx) + sk * my);
+      miy = my - (p1 * (r2 + 2.0 * my * my) + 2.0 * p2 * mx * my);
+    }
+    const double thd = std::sqrt(mix * mix + miy * miy);
+    if (!std::isfinite(thd))
+      return false;
+    if (thd < 1e-12) {
+      b = Eigen::Vector3d(0.0, 0.0, 1.0);
+      return true;
+    }
+    if (thd > bp_thd)
+      return false;
+    double lo = 0.0, hi = bp_t, t = std::min(thd, bp_t);
+    for (int it = 0; it < 60; it++) {
+      const double f = kb_g(t) - thd;
+      if (f > 0.0)
+        hi = t;
+      else
+        lo = t;
+      const double d = kb_dg(t);
+      double tn = (d > 0.0) ? t - f / d : 0.5 * (lo + hi);
+      if (!(tn > lo && tn < hi))
+        tn = 0.5 * (lo + hi);
+      const bool done = std::abs(tn - t) < 1e-14;
+      t = tn;
+      if (done)
+        break;
+    }
+    const double s = std::sin(t) / thd;
+    b = Eigen::Vector3d(s * mix, s * miy, std::cos(t));
+    return true;
+  }
+
+  /// raw pixel of a camera-frame point (any length, z of any sign up to the polynomial's turning point)
+  bool project_bearing(const Eigen::Vector3d &p, Eigen::Vector2d &uv) override {
+    if (!bp_valid())
+      bearing_range_update();
+    const double nrm = p.norm();
+    if (!(nrm > 0.0) || !std::isfinite(nrm))
+      return false;
+    const double rho = std::sqrt(p(0) * p(0) + p(1) * p(1)), t = std::atan2(rho, p(2));
+    if (t > bp_t)
+      return false;
+    double mix, miy;
+    if (rho > 1e-9 * nrm) {
+      const double g = kb_g(t) / rho;
+      mix = g * p(0);
+      miy = g * p(1);
+    } else {
+      if (!(p(2) > 0.0))
+        return false;
+      mix = p(0) / p(2);
+      miy = p(1) / p(2);
+    }
+    double mx = mix, my = miy;
+    if (has_nonradial)
+      add_nonradial(mix, miy, mx, my);
+    uv(0) = camera_values(0) * mx + camera_values(2);
+    uv(1) = camera_values(1) * my + camera_values(3);
+    return true;
+  }
+
+  /// Jacobians of project_bearing; H_dz_dp p = 0 (the pixel depends on the direction only)
+  bool project_bearing_jacobian(const Eigen::Vector3d &p, Eigen::Matrix<double, 2, 3> &H_dz_dp, Eigen::MatrixXd *H_dz_dzeta,
+                                Eigen::MatrixXd *H_dz_dq) override {
+    if (!bp_valid())
+      bearing_range_update();
+    const double x = p(0), y = p(1), z = p(2);
+    const double rho = std::sqrt(x * x + y * y), r2 = rho * rho + z * z, nrm = std::sqrt(r2);
+    if (!(nrm > 0.0) || !std::isfinite(nrm))
+      return false;
+    const double t = std::atan2(rho, z);
+    if (t > bp_t)
+      return false;
+    Eigen::Matrix<double, 2, 3> dmi;
+    double ax, ay, mix, miy;
+    if (rho > 1e-9 * nrm) {
+      ax = x / rho;
+      ay = y / rho;
+      const double g = kb_g(t), dg = kb_dg(t);
+      const Eigen::RowVector3d dt(z * x / (rho * r2), z * y / (rho * r2), -rho / r2);
+      Eigen::Matrix<double, 2, 3> da = Eigen::Matrix<double, 2, 3>::Zero();
+      da(0, 0) = (1.0 - ax * ax) / rho;
+      da(0, 1) = -ax * ay / rho;
+      da(1, 0) = -ax * ay / rho;
+      da(1, 1) = (1.0 - ay * ay) / rho;
+      const Eigen::Vector2d a(ax, ay);
+      dmi = dg * a * dt + g * da;
+      mix = g * ax;
+      miy = g * ay;
+    } else {
+      if (!(z > 0.0))
+        return false;
+      dmi << 1.0 / z, 0.0, -x / (z * z), 0.0, 1.0 / z, -y / (z * z);
+      ax = 1.0; // azimuth undefined; t ~ 0, so the k columns vanish
+      ay = 0.0;
+      mix = x / z;
+      miy = y / z;
+    }
+    double mx = mix, my = miy;
+    Eigen::Matrix2d A = Eigen::Matrix2d::Identity();
+    if (has_nonradial) {
+      add_nonradial(mix, miy, mx, my);
+      const double p1 = camera_nonradial(0), p2 = camera_nonradial(1), sk = camera_nonradial(2);
+      Eigen::Matrix2d dN;
+      dN << 2.0 * p1 * my + 6.0 * p2 * mx, 2.0 * p1 * mx + 2.0 * p2 * my + sk, 2.0 * p1 * mx + 2.0 * p2 * my, 6.0 * p1 * my + 2.0 * p2 * mx;
+      A = (Eigen::Matrix2d::Identity() - dN).inverse();
+    }
+    const double fx = camera_values(0), fy = camera_values(1);
+    Eigen::Matrix2d FA;
+    FA << fx * A(0, 0), fx * A(0, 1), fy * A(1, 0), fy * A(1, 1);
+    H_dz_dp = FA * dmi;
+    if (H_dz_dzeta != nullptr) {
+      *H_dz_dzeta = Eigen::MatrixXd::Zero(2, 8);
+      (*H_dz_dzeta)(0, 0) = mx;
+      (*H_dz_dzeta)(0, 2) = 1.0;
+      (*H_dz_dzeta)(1, 1) = my;
+      (*H_dz_dzeta)(1, 3) = 1.0;
+      const Eigen::Vector2d FAa = FA * Eigen::Vector2d(ax, ay);
+      double tp = t * t * t;
+      for (int j = 0; j < 4; j++) {
+        H_dz_dzeta->col(4 + j) = FAa * tp;
+        tp *= t * t;
+      }
+    }
+    if (H_dz_dq != nullptr) {
+      const double r2m = mx * mx + my * my;
+      Eigen::Matrix<double, 2, 3> dNq;
+      dNq << 2.0 * mx * my, r2m + 2.0 * mx * mx, my, r2m + 2.0 * my * my, 2.0 * mx * my, 0.0;
+      *H_dz_dq = FA * dNq;
+    }
+    return true;
+  }
+
+  /// OV_KB_BEARING: first turning point of theta_d(theta) (2.2 rad if none) and theta_d there, for the current k1..k4
+  double bearing_theta_peak() {
+    if (!bp_valid())
+      bearing_range_update();
+    return bp_t;
+  }
 
   /**
    * @brief Given a raw uv point, this will undistort it based on the camera matrices into normalized camera coords.
@@ -345,6 +519,49 @@ public:
   }
 
 protected:
+  /// OV_KB_BEARING: KB(t) = t (1 + k1 t^2 + k2 t^4 + k3 t^6 + k4 t^8) with the current k1..k4, and its derivative
+  double kb_g(double t) const {
+    const double t2 = t * t;
+    return t * (1.0 + t2 * (camera_values(4) + t2 * (camera_values(5) + t2 * (camera_values(6) + t2 * camera_values(7)))));
+  }
+  double kb_dg(double t) const {
+    const double t2 = t * t;
+    return 1.0 + t2 * (3.0 * camera_values(4) + t2 * (5.0 * camera_values(5) + t2 * (7.0 * camera_values(6) + t2 * 9.0 * camera_values(7))));
+  }
+  /// OV_KB_BEARING: the cached range belongs to the current k1..k4
+  bool bp_valid() const {
+    return camera_values.rows() == 8 && bp_k[0] == camera_values(4) && bp_k[1] == camera_values(5) && bp_k[2] == camera_values(6) &&
+           bp_k[3] == camera_values(7);
+  }
+  /// OV_KB_BEARING: bp_t = first t in (0, 2.2] with KB'(t) <= 0 (0.25 deg scan, then bisection; 2.2 if none), bp_thd = KB(bp_t)
+  void bearing_range_update() {
+    if (camera_values.rows() != 8)
+      return;
+    const double tmax = 2.2, step = 0.25 * M_PI / 180.0;
+    double t_peak = tmax, prev = 0.0;
+    for (double t = step; t <= tmax + 1e-12; t += step) {
+      if (!(kb_dg(t) > 0.0)) {
+        double a = prev, b = t;
+        for (int j = 0; j < 80; j++) {
+          const double m = 0.5 * (a + b);
+          if (kb_dg(m) > 0.0)
+            a = m;
+          else
+            b = m;
+        }
+        t_peak = a;
+        break;
+      }
+      prev = t;
+    }
+    bp_t = t_peak;
+    bp_thd = kb_g(t_peak);
+    for (int j = 0; j < 4; j++)
+      bp_k[j] = camera_values(4 + j);
+  }
+  double bp_k[4] = {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0};
+  double bp_t = 2.2, bp_thd = 0.0;
+
   /**
    * @brief Raw pixel -> the pixel an ideal Kannala-Brandt camera with the same 8 intrinsics would have measured.
    * (x, y) = ((u - cx)/fx, (v - cy)/fy) are the measured normalised coordinates; N(x, y) is subtracted.

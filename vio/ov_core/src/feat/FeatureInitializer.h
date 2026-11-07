@@ -22,9 +22,11 @@
 #ifndef OPEN_VINS_FEATUREINITIALIZER_H
 #define OPEN_VINS_FEATUREINITIALIZER_H
 
+#include <memory>
 #include <unordered_map>
 
 #include "FeatureInitializerOptions.h"
+#include "cam/CamBase.h"
 
 namespace ov_core {
 
@@ -127,7 +129,41 @@ public:
    */
   const FeatureInitializerOptions config() { return _options; }
 
+  /**
+   * @brief OV_KB_BEARING: the LIVE camera objects of the filter (State::_cam_intrinsics_cameras, refreshed after every update).
+   * Only used for the features that take the bearing path (at least one rim observation; every feature with OV_BEARING_ALL=1);
+   * with the switch off nothing changes.
+   */
+  void set_cameras(const std::unordered_map<size_t, std::shared_ptr<CamBase>> &cams) { _bcams = cams; }
+
+  /// OV_KB_BEARING: number of rim observations of a feature (|uvs_norm| > tan(OV_BEARING_SWITCH_DEG)); 0 when the switch is off
+  static int count_rim(const Feature &feat);
+
+  /**
+   * @brief OV_KB_BEARING: erases the rim observations of a feature whose raw pixel has no bearing under the current calibration
+   * (beyond the turning point of the Kannala-Brandt polynomial). Returns the number erased. Never touches a non-rim observation,
+   * except with OV_BEARING_ALL=1, where every observation must have a bearing (core ones erased are counted apart).
+   */
+  static int bearing_clean(Feature &feat, const std::unordered_map<size_t, std::shared_ptr<CamBase>> &cams);
+
 protected:
+  /// OV_KB_BEARING: camera objects (empty = the bearing path is off)
+  std::unordered_map<size_t, std::shared_ptr<CamBase>> _bcams;
+
+  /// OV_KB_BEARING: true when this feature takes the bearing path (switch on, cameras set, at least one rim observation; with
+  /// OV_BEARING_ALL=1 every feature)
+  bool bearing_path(const Feature &feat) const;
+
+  /// OV_KB_BEARING: linear triangulation of a feature with rim observations (bearings of every observation, anchor within OV_BEARING_ANCHOR_DEG, the original checks)
+  bool single_triangulation_bearing(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM);
+
+  /// OV_KB_BEARING: Levenberg-Marquardt refinement with PIXEL residuals of all observations through CamBase::project_bearing
+  bool single_gaussnewton_bearing(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM);
+
+  /// OV_KB_BEARING: cost of single_gaussnewton_bearing (px^2, rim rows weighted); +inf when a projection fails
+  double compute_error_bearing(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM, std::shared_ptr<Feature> feat,
+                               double alpha, double beta, double rho);
+
   /// Contains options for the initializer process
   FeatureInitializerOptions _options;
 

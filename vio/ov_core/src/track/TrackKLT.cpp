@@ -1897,6 +1897,96 @@ static int sampson_mask(const double *f, const std::vector<cv::Point2f> &p0, con
   return nin;
 }
 
+// OV_KB_BEARING (default OFF; CamBase::bearing_cfg): the tracker's RANSAC without the pinhole coordinates at the rim.
+// The fundamental matrix is fitted by today's call (same threshold, confidence and RNG state, which the caller has installed) on the
+// CORE points only (|normalized| <= tan(OV_BEARING_SWITCH_DEG) in both images), projected onto the essential manifold, and points are
+// classified by a pixel-equivalent epipolar distance between unit bearings unprojected from the raw pixels (no clip):
+//   for (q, n) in {(b1, E b0) in image 1, (b0, E^T b1) in image 0}: d = q . n/|n|, e = |H_dz_dp(q) t| asin|d|,
+//   t = the unit direction from q towards the epipolar plane; accepted if both e < OV_BEARING_RANSAC_PX.
+// mode 2: every point is classified so; mode 1: core points keep the core RANSAC mask, rim points get the test; mode 0: core points
+// keep the core RANSAC mask, rim points pass. Fewer than 10 core points, or no model: today's call on all points (counted).
+static void bearing_ransac(const std::vector<cv::Point2f> &pts0, const std::vector<cv::Point2f> &pts1, const std::vector<cv::Point2f> &pts0_n,
+                           const std::vector<cv::Point2f> &pts1_n, const std::vector<uchar> &mask_klt, ov_core::CamBase *cam0,
+                           ov_core::CamBase *cam1, double rthr, double rconf, std::vector<uchar> &mask_rsc) {
+  const ov_core::CamBase::BearingCfg &cfg = ov_core::CamBase::bearing_cfg();
+  ov_core::CamBase::BearingStats &st = ov_core::CamBase::bearing_stats();
+  st.rs_calls.fetch_add(1, std::memory_order_relaxed);
+  const size_t N = pts0_n.size();
+  std::vector<char> rim(N, 0);
+  std::vector<cv::Point2f> c0, c1;
+  std::vector<int> cidx;
+  c0.reserve(N);
+  c1.reserve(N);
+  for (size_t i = 0; i < N; i++) {
+    rim[i] = (ov_core::CamBase::bearing_is_rim(pts0_n[i].x, pts0_n[i].y) || ov_core::CamBase::bearing_is_rim(pts1_n[i].x, pts1_n[i].y)) ? 1 : 0;
+    if (!rim[i]) {
+      c0.push_back(pts0_n[i]);
+      c1.push_back(pts1_n[i]);
+      cidx.push_back((int)i);
+    }
+  }
+  cv::Mat F;
+  std::vector<uchar> mcore;
+  if (c0.size() >= 10)
+    F = cv::findFundamentalMat(c0, c1, cv::FM_RANSAC, rthr, rconf, mcore);
+  if (F.rows != 3 || F.cols != 3) {
+    st.rs_fallback.fetch_add(1, std::memory_order_relaxed);
+    cv::findFundamentalMat(pts0_n, pts1_n, cv::FM_RANSAC, rthr, rconf, mask_rsc);
+    mask_rsc.resize(N, 0);
+    return;
+  }
+  mcore.resize(c0.size(), 0);
+  Eigen::Matrix3d Fe;
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++)
+      Fe(r, c) = F.at<double>(r, c);
+  Eigen::JacobiSVD<Eigen::Matrix3d> sv(Fe, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const Eigen::Matrix3d E = sv.matrixU() * Eigen::Vector3d(1.0, 1.0, 0.0).asDiagonal() * sv.matrixV().transpose();
+  // pixel-equivalent distance of q (unit bearing in camera cam) from the plane with normal n; inf when undefined
+  auto pix = [&](const Eigen::Vector3d &q, const Eigen::Vector3d &n, ov_core::CamBase *cam) {
+    const double nn = n.norm();
+    if (!(nn > 0.0))
+      return std::numeric_limits<double>::infinity();
+    const Eigen::Vector3d nh = n / nn;
+    const double d = q.dot(nh);
+    Eigen::Vector3d nt = nh - d * q;
+    const double ntn = nt.norm();
+    if (!(ntn > 1e-12))
+      return std::numeric_limits<double>::infinity();
+    nt /= ntn;
+    Eigen::Matrix<double, 2, 3> H;
+    if (!cam->project_bearing_jacobian(q, H, nullptr, nullptr))
+      return std::numeric_limits<double>::infinity();
+    return (H * nt).norm() * std::asin(std::min(1.0, std::abs(d)));
+  };
+  mask_rsc.assign(N, 0);
+  for (size_t j = 0; j < cidx.size(); j++)
+    mask_rsc[(size_t)cidx[j]] = mcore[j];
+  for (size_t i = 0; i < N; i++) {
+    if (i >= mask_klt.size() || !mask_klt[i]) {
+      mask_rsc[i] = 0; // not tracked: the caller rejects it anyway
+      continue;
+    }
+    const bool test = (cfg.ransac == 2) || (cfg.ransac == 1 && rim[i]);
+    if (cfg.ransac == 0 && rim[i])
+      mask_rsc[i] = 1;
+    if (test) {
+      Eigen::Vector3d b0, b1;
+      if (!cam0->unproject_bearing(Eigen::Vector2d(pts0[i].x, pts0[i].y), b0) || !cam1->unproject_bearing(Eigen::Vector2d(pts1[i].x, pts1[i].y), b1)) {
+        st.rs_unproj_fail.fetch_add(1, std::memory_order_relaxed);
+        mask_rsc[i] = 0;
+      } else {
+        const double e = std::max(pix(b1, E * b0, cam1), pix(b0, E.transpose() * b1, cam0));
+        mask_rsc[i] = (e < cfg.ransac_px) ? 1 : 0;
+      }
+    }
+    if (rim[i])
+      (mask_rsc[i] ? st.rs_rim_keep : st.rs_rim_rej).fetch_add(1, std::memory_order_relaxed);
+    else
+      (mask_rsc[i] ? st.rs_core_keep : st.rs_core_rej).fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
                                 std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out,
                                 const std::vector<uchar> *pre_status, int n_old,
@@ -2014,7 +2104,10 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   }();
   cv::theRNG().state = rng_seed;
   const double _tr0 = _tmd ? trk_now_s() : 0.0;
-  { VPROF("1.track/d3_ransac_findF");
+  if (ov_core::CamBase::kb_bearing()) { // OV_KB_BEARING: core-fitted model, pixel-equivalent test (bearing_ransac above)
+    static const double rconf_b = [] { const char *e = std::getenv("OV_RANSAC_CONF"); return e ? atof(e) : 0.999; }();
+    bearing_ransac(pts0, pts1, pts0_n, pts1_n, mask_klt, _cam0, _cam1, 2.0 / max_focallength, rconf_b, mask_rsc);
+  } else { VPROF("1.track/d3_ransac_findF");
   // OV_USAC=1: OpenCV's USAC (SPRT + local optimization) reaches the same confidence with far
   // fewer model evaluations than classic FM_RANSAC. Inlier sets differ slightly -> ATE-gated.
   static const bool usac = [] { const char *e = std::getenv("OV_USAC"); return e && *e == '1'; }();

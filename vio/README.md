@@ -74,7 +74,10 @@ warm-start iterations can converge away from the seed. Since 2026-10-14 `selfcal
 matching and the lens terms itself, at calibration values: `OV_XCAM=1`, `OV_XCAM_PRESET=rt`,
 `OV_NONRAD_SKEW_FIXED=1`, `OV_PRIOR_NONRAD_SIG=0.002` (ten times the flight value) and, on a
 desktop, `OV_GROUP_CAMS=1`; `--no-matching` and `--no-lens-terms` switch them off
-(`../selfcalib/README.md`).
+(`../selfcalib/README.md`). Since 2026-11-07 its passes also run the bearing measurement model
+(`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1`, section "Bearing measurement model")
+with a fisheye mask fitted to each lens's image circle; `--no-bearing` switches both off.
+Flight does not run the bearing model.
 
 The per-vehicle flight folder is produced by the self-calibration package, not written by
 hand — `selfcalib/tool/deploy_vio.py` copies this config next to the calibrated chains under
@@ -261,6 +264,44 @@ delays before are smaller than those the flights measured; the durations of the 
 are what compares. One run of 19:56 with the four lines, made while the Orin was busy with the
 system's update check after a boot, fell behind for 1.5 s, up to 403 ms; the same run on the
 idle Orin did not. No flight hovers longer than 3 s, and none was flown with the four lines.
+
+## Bearing measurement model (calibration only)
+
+The tracker stores every observation as pinhole coordinates (x/z, y/z) computed by
+`cv::fisheye::undistortPoints`, which clips the distorted angle at pi/2 (OpenCV 4.5.4): with
+the fleet's lenses every pixel more than about 86 deg from the optical axis is stored at 85-86
+deg, whatever its true direction, and pinhole coordinates cannot hold 90 deg or more at all.
+The tracker's RANSAC then drops most observations beyond 80 deg, and the lens model beyond
+about 86 deg is an extrapolation. `OV_KB_BEARING=1` uses observations as unit bearings computed
+from the raw pixel with the current calibration, predicted by a projection that accepts any
+direction the lens model covers, with exact Jacobians (`ov_core/src/cam/CamBase.h`,
+`CamEqui.h`; triangulation in `ov_core/src/feat/FeatureInitializer.cpp`; measurement rows in
+`ov_msckf/src/update/UpdaterHelper.cpp`; tracker RANSAC in `ov_core/src/track/TrackKLT.cpp`).
+
+| env var | what it does | calibration (`selfcalib`) |
+|---|---|---|
+| `OV_KB_BEARING` | The bearing model. Without `OV_BEARING_ALL` it takes only the rim observations (beyond `OV_BEARING_SWITCH_DEG`). | `1` |
+| `OV_BEARING_ALL` | Every observation through the bearing model, not only the rim ones. The measurement rows of the observations within 80 deg equal the original rows to float precision; their triangulation uses the bearings. Does nothing without `OV_KB_BEARING=1` (one warning). | `1` |
+| `OV_BEARING_RANSAC` | Tracker RANSAC with the model on: `1` = the shipped test for points within 80 deg in both images, a pixel-equivalent epipolar test on unit bearings for the others; `2` (the default when the model is on) = that test for every point; `0` = rim points are kept without a test. | `1` |
+| `OV_BEARING_SWITCH_DEG`, `OV_BEARING_ANCHOR_DEG`, `OV_BEARING_RIM_SIGMA`, `OV_BEARING_RANSAC_PX`, `OV_BEARING_SLAM_MAXDEG` | rim angle (80 deg), largest bearing of a feature's anchor observation (75 deg), noise multiplier of the rim rows (1), threshold of the bearing RANSAC test (2 px), largest bearing at which a SLAM landmark is re-anchored instead of marginalized (85 deg) | defaults |
+| `OV_BEARING_FORCE` | tests only: every row through the bearing split of the first-estimate Jacobians | unset |
+
+All are off when unset, and the estimator's output is then byte-identical to the build without
+them (a calibration pass and a flight-configuration replay, checked on a desktop). The switch
+line `[bearing-cfg] on=1 ...` at start-up and the counters `[bearing]` / `[bearing-all]` at the
+end of `run.log` show that the model ran. Not supported with `OV_PREJAC=1` (the process ends with
+an error). With the model on the tracker's RANSAC is replaced as a whole, so `OV_RANSAC_OLDFIT`
+(campaign.env) does not run in those passes.
+
+Measured on the fleet's recordings (29 Oct 2026): in calibration, the lens model at 105-110 deg
+from the axis comes out 4.5-6.9 times more repeatable between starting values (0.6-0.8 px with
+90 s of flight, against 3.5-4.4 px), and the other numbers (camera geometry, stereo depth,
+tracking error of the calibrations, the convergence region) stay within the scatter of the
+estimator without it; of 90 calibrations from distant starting values the stopping rule ended
+87 at pass 2 and 3 at pass 3 (without it: 90 at pass 2). A pass takes about 4 % longer on the Orin NX
+(66 instead of 63 s for 90 s of flight). In flight it brought no gain, and on one vehicle more
+replays ended just above 6 cm than with the shipped estimator (6 against 1 of 240): flight does
+not set these variables, and `flight_stiffness.env` must not.
 
 ## Calibration switches
 
