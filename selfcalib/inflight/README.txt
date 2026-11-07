@@ -161,8 +161,8 @@ run_inflight_replay.sh --tool-cpus 4-7 does both (and refuses --flight-folder wi
 ms at the 90th percentile, it processed the same sets of images (none dropped), and its tracking error changed by +0.5,
 +0.2 and -0.6 cm. With the computer otherwise idle (no flight estimator) no affinity is needed.
 
-Two passes beside the flight estimator were not run as one sequence; from the one-pass runs (pass 8-9 % slower beside it)
-the result would come about 158-163 s after takeoff (estimate).
+Two passes beside the flight estimator were not run as one sequence. Applying the one-pass runs' slowdown (8-9 % beside
+it) to the nine measured two-pass replays of section 4 puts the result about 164 s after takeoff (161-175 s; estimate).
 
 
 6. THIS BRANCH ON THE FLIGHT COMPUTER
