@@ -12,7 +12,15 @@ synthetic-smudge localization / fixed-point publish / 6 diagnosis verdicts / cro
   (mean of the frames that changed > 2.4 %, 15 % binary map, fleet-radius disk argmax) and the
   image-health gate. `image_pass()` runs it with one process per camera. The tool gives it the
   run's window, cut at 30 s after takeoff when the window is longer (`--image-after-takeoff`;
-  with 0, or a recording without a takeoff, it reads the whole window).
+  with 0, or a recording without a takeoff, it reads the whole window). It also hands back the
+  mean image of each camera, for `wmask.py`.
+- `wmask.py` — the fisheye mask of the calibration passes when they run the bearing model
+  (since 2026-11-07): per camera, where the lens's bright image circle ends on the mean image,
+  seen from the principal point of the calibration a pass starts from (radial profiles every
+  0.5 deg, 380-500 px, robust circle fit), and `mask_fisheye_theta_max` = the smallest
+  end radius / focal length over the cameras that share the global key (camera 3 has its own),
+  so that the estimator's disk ends 4 px inside the circle. The rule and its checks are in the
+  module's docstring.
 - `publish.py` — §3.4/§6 robust-mean publisher (median + chordal rotation mean over harvests);
   kept for the study, the tool now publishes the converged pass itself.
 - `evalate.py` — trajectory metrics (toff-corrected; global/POSTG/NOUM), study conventions.
@@ -21,7 +29,8 @@ synthetic-smudge localization / fixed-point publish / 6 diagnosis verdicts / cro
   verdict table {HEALTHY / FLY-AGAIN / HARDWARE-CHANGED / PLATFORM-DEFECT}.
 - `run_tool.py` — end-to-end driver: window (takeoff + 20 s) → gates → accumulation pass →
   fleet + image-center seed (scenario D) → warm-start until the stopping rule → publish the last
-  pass → diagnose.
+  pass → diagnose. The passes run the bearing model with the fitted mask unless `--no-bearing`
+  (README, "Bearing model and fitted fisheye mask").
 
 ## One-command usage (new vehicle, zero own calibration)
 ```bash

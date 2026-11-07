@@ -174,6 +174,7 @@ python3 tool/run_tool.py \
     [--image-processes N]         # processes of the image pass (default one per camera)
     [--min-still S]               # standstill the recording must begin with (default 6)
     [--no-matching] [--no-lens-terms]   # without the matching / the two lens terms (both: the default before 2026-10-14)
+    [--no-bearing]                # without the bearing model and the fitted fisheye mask (the default before 2026-11-07)
     [--max-pass 16] [--domain 70]
 ```
 
@@ -185,7 +186,8 @@ temporal-accumulation pass (image-center prior: every 4th frame enters the mean 
 it changed by more than 2.4 % since the previous one; the mean is thresholded at 15 % of its
 brightest pixel and a disk of the fleet-shared radius is correlated with it, argmax = principal
 point; the pass reads the window up to 30 s after takeoff, `--image-after-takeoff`, with one
-process per camera) → seed assembly (fleet average + image-center prior) → warm-start loop: run estimator,
+process per camera; it also keeps the mean images, on which every pass's fisheye mask is fitted) → seed
+assembly (fleet average + image-center prior) → warm-start loop: run estimator,
 harvest calibration, re-seed, repeat **until, at pass ≥ 2, no parameter type moved by more than
 twice the full-flight envelope since the previous pass** (5 px principal point, 1 % focal
 length, 0.002 mean distortion, 0.7° rotation, 5 cm translation, 12 ms t_d; at most
@@ -270,6 +272,63 @@ alone as `lens_terms.env`. **They are part of the calibration**: wherever the ch
 flight and for depth, they must come with it (the MANIFEST gives the lines). The chain without
 its lens terms is not the calibrated lens model. In flight the estimator starts from them and
 keeps refining them under a narrow prior; a calibration without lens terms starts them at zero.
+
+### Bearing model and fitted fisheye mask (on by default)
+
+The estimator turns pixels into pinhole coordinates with OpenCV, which clips the angle from the
+optical axis: on the fleet's lenses every pixel more than about 86 deg off the axis comes back at
+85-86 deg, and the tracker's RANSAC then drops most observations beyond 80 deg. The lens model
+beyond about 86 deg was therefore an extrapolation. Since 2026-11-07 the calibration passes run
+the estimator's bearing measurement model (`../vio/README.md`, "Bearing measurement model"),
+which uses every observation as a unit direction computed from its raw pixel, and the tool sets
+in their environment whatever of these you have not set yourself:
+
+```bash
+OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1   # bearing model for every observation; shipped RANSAC within 80 deg
+```
+
+With the model the outermost ring of the image is used, so the tool also fits the estimator's
+fisheye mask to each lens: on the mean image of its image pass it finds where the bright image
+circle ends, as seen from the principal point, and sets `mask_fisheye_theta_max` (cameras 0-2,
+the smallest of them) and `mask_fisheye_theta_max3` (camera 3) in the passes' copy of the config
+so that the disk ends 4 px inside the circle (`tool/wmask.py` has the rule). Each pass gets the
+mask fitted around the principal points of the calibration it starts from: pass 1 those of the
+seed, whose image-centre prior can be some 20 px off (the disk of pass 1 can then be up to about
+23 px narrower than needed on that camera, or up to 4 px wider), every later pass those of the
+pass before, which in the tool's runs on the fleet's recordings gave a disk 0.7 px narrower to
+1.7 px wider than a fit at the recording's final calibration. The values of each pass are in the log (`fisheye mask (fitted to the image
+circle ...)`) and in `report.json` (`w_mask`). On the eleven fleet recordings the fit from the
+tool's own image pass (30 s of flight) gives the same disk as a fit on 300 pictures spread over
+the whole recording, at the same calibration, to within 0.3 px of radius. The rule is made for
+the fleet's lens (the circle ends 380-500 px from the principal point): for another lens, a
+config whose mask is not the automatic disk, or a fit that fails, the config's mask is kept and
+the log says why. The fitted disk is never wider than the config's.
+
+What it changes, measured on the fleet's recordings: the lens model 105-110 deg off the axis
+comes out 4.5-6.9 times more repeatable between starting values (0.6-0.8 px with 90 s of flight,
+against 3.5-4.4 px); camera geometry, stereo depth, tracking error and convergence stay within
+the scatter of a calibration without it. On the flight computer a pass takes about 4 % longer
+(66 instead of 63 s with 90 s of flight, 0.5 s of it the mask fit) and a whole run 152-158
+instead of 144-149 s.
+On the eleven fleet recordings (90 s of flight) the tool with these settings stopped at pass 2
+with a HEALTHY verdict. On the three test recordings its calibrations differ from those of the
+configuration that was tested (the mask fitted at each recording's final calibration) by
+0.3-0.4 px below 60 deg and 0.8-1.1 px at 105-110 deg off the axis; two runs of the tool without
+the model differ from each other by 0.3-0.4 and 3.0-8.3 px (`docs/VALIDATION_MATRIX.md`,
+section 8). The flight
+configuration is unchanged: `deploy_vio.py` and `--frozen-check` run the flight estimator
+without the bearing model and with the config's own mask (in flight the model brought no gain,
+`../vio/README.md`).
+
+`--no-bearing` switches both off: the passes then run as before 2026-11-07, with the config's
+mask. Exporting `OV_KB_BEARING=0` does the same; your own values of `OV_BEARING_ALL`,
+`OV_BEARING_RANSAC` and the other `OV_BEARING_*` variables replace the defaults. The model is
+off by itself for a template whose cameras are not Kannala-Brandt (`equidistant`) and for
+`--calib-stereo true` (it was tested on monocular passes). An estimator built before the commit
+that added it ignores the switches; the run then ends with a WARNING (`report.json`
+`calib_passes.bearing_model_ran` false): rebuild it. The log says what the passes ran with
+(`calibration passes: ..., bearing model ON (...)`), and so does `report.json`
+(`calib_passes.bearing_model`).
 
 ### Ground truth is optional and found automatically
 
@@ -375,12 +434,14 @@ since 2026-10-09, the two lens terms as states and the matching between cameras)
 the `vio/` package and is documented in `../vio/README.md`. Since 2026-10-14 the calibration
 passes of this package have both of the two as well (section above; the lens terms with a ten
 times wider prior), so the last calibration pass differs from the flight trajectory by the
-stiff priors. `--frozen-check` adds one pass that
+stiff priors and, since 2026-11-07, by the bearing model and the fitted mask, which only the
+calibration passes run. `--frozen-check` adds one pass that
 runs the published calibration with the flight settings, if the recording has ground truth
 (without it the option does nothing and says so). On the vehicle that pass is the flight
 operating point; on a desktop it runs the CPU tracker, and it matches between cameras where the
 calibration passes did (the tool groups the cameras on a desktop) or when you export
-`OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched.
+`OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched. It runs
+without the bearing model even when your shell exports its variables.
 
 **This matters operationally:** `run_serial.sh` passes your shell environment through, so
 flight variables leaking into a calibration run silently pin the calibration at its seed.

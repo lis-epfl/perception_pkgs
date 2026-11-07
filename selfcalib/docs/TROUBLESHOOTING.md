@@ -77,3 +77,20 @@ orphaned processes before anything else.
 - Gates pass + convergence oscillates between two states across seeds: both are valid
   fixed-point-adjacent states (multi-basin structure); the robust-mean publish handles it —
   report the published mean, never a single harvest.
+
+## 9. Bearing model (calibration passes, on by default since 2026-11-07)
+
+- `WARNING: the bearing model was asked for, but the estimator did not report it` — the
+  estimator was built before the commit that added the model and ignored `OV_KB_BEARING`:
+  rebuild it (`vio/vio_deploy/scripts/build_openvins.sh`). The calibration is then the one
+  without the model, with the fitted mask; `report.json` `calib_passes.bearing_model_ran` is
+  false.
+- `fisheye mask of the config kept: ...` — the tool found no image circle to fit the mask to
+  (another lens, whose circle does not end 380-500 px from the principal point, or the circle
+  outside the sensor), the config does not draw the disk itself (`use_mask` /
+  `mask_fisheye_auto` false), a camera had no mean image, or the fit itself failed (the reason
+  then names the error). The passes then run the bearing model with the config's own mask.
+  `report.json` `w_mask.passes[k].reason` says which.
+- The estimator ends at start-up with `[bearing] OV_KB_BEARING=1 does not support OV_PREJAC=1`:
+  unset `OV_PREJAC` for calibration, or pass `--no-bearing`.
+- To calibrate as before 2026-11-07: `--no-bearing` (or export `OV_KB_BEARING=0`).

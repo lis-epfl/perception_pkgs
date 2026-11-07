@@ -164,7 +164,8 @@ best-fit rotation. Confirms §6.2: the offset is constant, not drift.
 
 ## 7. End-to-end driver (`run_tool.py`)
 (Validated before 2026-10-14, when the calibration had neither the matching between cameras nor
-the two lens terms; `--no-matching --no-lens-terms` gives that run.)
+the two lens terms, nor since 2026-11-07 the bearing model; `--no-matching --no-lens-terms
+--no-bearing` gives that run. Section 8 has the tests of the bearing model.)
 gates → one accumulation pass (circle fit + image health) → leave-one-out fleet seed + own
 circle fit (scenario D, zero own calibration) → warm-start to self-consistency → robust-mean
 publish → diagnosis.
@@ -173,3 +174,55 @@ publish → diagnosis.
 |---|---|
 | nxt3, full bag, --fleet-exclude nxt3, GT attached | all gates PASS; converged at pass 2 (resid 0.0064, Δtoff 0.00 ms); published toff −0.039256 (population center −0.039251); ATE POSTG **3.61 cm**; verdict **HEALTHY: deploy** |
 | nxt1 s2 (defect path) | static PASS, **timing FLAG** (8.07 % drops / 37.1 ms noise, run proceeds with warning), image PASS; zero-own-calibration seed converged at pass 2; published toff **−0.054584** (independently re-derives the study's triple-confirmed −0.054 from a fleet seed 15 ms away); diagnosis: self-consistent 0.0103, in-distribution, ATE POSTG 0.884 m unhealthy → verdict **PLATFORM-DEFECT — repair, not recalibrate** [+ timing-gate consistency note] |
+
+## 8. Bearing model and fitted fisheye mask (2026-11-07)
+The configuration the calibration passes run since 2026-11-07 (README, "Bearing model and fitted
+fisheye mask"), tested on the fleet's recordings before it was made the default.
+
+**Estimator (`vio/`), every switch unset.** One calibration pass (nxt3 4 June, 90 s, the
+calibration's own settings, `OV_DETERMINISTIC=1`) and a flight-configuration replay (the whole
+recording, every line of `flight_stiffness.env`, matching on 5,375 sets of images): trajectory,
+calibration and calibration series byte-identical to the estimator of 3a96bc0, on the desktop.
+`OV_BEARING_ALL=1` alone: the same. The build adds no compiler warning (desktop, CPU tracker; Orin
+NX, GPU path). On the Orin NX, the flight configuration as flown (GPU tracker, `campaign.env`,
+`flight_stiffness.env`, the lens terms of a published calibration, `OV_DETERMINISTIC=1`) replayed
+over the whole nxt10 4 June recording gives the trajectory and calibration of the estimator of
+3a96bc0 byte for byte (1,958 poses; the estimator of 3a96bc0 run twice gives the same bytes too).
+
+**Estimator, the calibration's switches** (`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1`).
+The same pass gives the calibration of the build the rerun of 29 Oct 2026 tested, byte for byte;
+the trajectory differs only by the standstill poses that main writes since commit dc8d058. Its
+unit tests (projection and its inverse, Jacobians against finite differences, triangulation,
+measurement rows with and without first-estimate Jacobians, chi2 of a synthetic update) give the
+same output.
+
+**Calibration chains** (the paper's protocol: 6 starting values at r = 0.1 on each of the three
+test recordings, 90 s of flight, two passes, the mask fitted at each recording's final
+calibration, as tested). Spread over the starting values after pass 2: 0.85 mm / 0.0144 deg
+(tested build, same starting values: 0.80 mm / 0.0134 deg; the estimator without the model, two
+stored runs: 0.78-0.95 mm / 0.0140-0.0153 deg). Same starting value, this build minus the tested
+one: 1.21 mm / 0.0195 deg RMS; two runs of the estimator without the model differ by 1.18 mm /
+0.0220 deg. Lens model at 105-110 deg off the axis, spread over the starting values: 0.43-0.54 px
+(tested: 0.59-0.77 px; without the model: 3.07-4.10 px). Largest step from pass 1 to pass 2:
+0.12-0.29 envelopes (the stopping rule's limit is 2).
+
+**Fitted mask** (`wmask.py`). On the eleven fleet recordings, at the same calibration, the fit on
+the tool's own mean images (30 s of flight) gives the disk of the fit on 300 pictures over the
+whole recording to within 0.25 px of radius (cameras 0-2) and 0.28 px (camera 3), with the rule's
+first implementation giving the same end of the circle on all 44 cameras. Around the principal
+points of the seed (pass 1) the disk is 23 px narrower to 4 px wider; around those of a pass-1
+calibration (every later pass) 0.4 px narrower to 1.2 px wider, and in pass 2 of the tool's runs
+below (eleven recordings on the desktop, three on the flight computer) 0.7 px narrower to 1.7 px
+wider. The fit takes 0.6 s per pass on the flight computer.
+
+**End to end** (leave-one-out fleet seed, ground truth from the bag, desktop unless noted).
+
+| run | result |
+|---|---|
+| `--no-bearing`, nxt3 4 June, 90 s, `OV_DETERMINISTIC=1` | published chain, lens terms, both harvests and the mount byte-identical to the tool and estimator of 3a96bc0; `report.json` only adds `calib_passes.bearing_model` and `w_mask` (null) |
+| default, the eleven fleet recordings, 90 s | 11 of 11 **HEALTHY: deploy** at pass 2 (largest step 0.13-0.62 envelopes); the model ran in every pass; tool ATE 2.47-4.16 cm (mean 3.09; the tested configuration 3.17, without the model 3.30). Against the tested configuration's runs (the mask fitted at each recording's final calibration), median over the recordings of the largest projection difference: 0.36 px below 60 deg, 0.53 px at 100-105 deg, 0.83 px at 105-110 deg; two runs without the model differ by 0.29 / 2.66 / 4.24 px, the tested configuration from a run without the model by 0.49 / 6.95 / 12.05 px |
+| default, the three test recordings, 20 s (the default flight time) | 3 of 3 HEALTHY at pass 2 (largest step 0.73-1.16 envelopes; without the model 0.80-1.55), tool ATE 1.16-4.04 cm (without the model 1.22-2.60; single runs) |
+| default + `--frozen-check`, nxt10 4 June, 20 s, `OV_KB_BEARING=1 OV_BEARING_ALL=1` exported in the shell | calibration passes ran the model; the flight check did not (no `[bearing-cfg]` line, mask 1.83 / 1.87, matching on 711 sets); HEALTHY |
+| default with a mask fit that raises (test copy of `wmask.py`), nxt3 4 June, 20 s | WARNING, the config's mask in both passes, HEALTHY at pass 2 |
+| default on the Orin NX (GPU 612 MHz), the three test recordings, 90 s, two runs each, alternating with the tool and estimator of 3a96bc0 (one run at a time) | 6 of 6 **HEALTHY: deploy** at pass 2 (3a96bc0: 6 of 6); the model ran in every pass. An estimator pass 64.6-68.4 s against 62.0-64.5 s (paired: +4.6 % median, +2.0 to +4.2 s, of which 0.5 s is the mask fit), a whole run 151.6-157.8 s against 144.1-148.9 s (+3.6 % median). Two runs of the same recording differ by 0.28-0.50 px below 60 deg and 0.71-1.30 px at 105-110 deg (3a96bc0: 0.34-0.43 / 5.48-8.23 px); the runs differ from the desktop's run by 0.31-0.47 / 0.80-1.59 px |
+

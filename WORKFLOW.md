@@ -20,7 +20,9 @@ Both operating points use this one build. Needs Ubuntu 22.04, ROS 2 Humble, and
 `libeigen3-dev libboost-all-dev libceres-dev`. Rebuild after updating the repository: since
 2026-10-14 a calibration matches between cameras and estimates two lens terms by default, which
 needs an estimator built from commit 6bbaf8c on (an older build ignores both, and the run ends
-with a WARNING for each).
+with a WARNING for each). Since 2026-11-07 it also runs the bearing measurement model, which needs
+an estimator built from the commit that added it (an older build ignores it, and the run ends with
+a WARNING).
 
 ---
 
@@ -164,8 +166,10 @@ online calibration stays tethered to the chain you just deployed. Without it you
 the *calibration* operating point in flight, with loose priors that let the calibration
 random-walk. Source the copy in the flight folder: it also carries the lens terms of that
 calibration. Check with `env | grep OV_PRIOR` — flying should print six variables. Before a
-calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` should print nothing, or only switches
-you set on purpose: since 2026-10-14 the calibration sets the matching and the lens terms itself.
+calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD|BEARING'` should print nothing, or only
+switches you set on purpose: since 2026-10-14 the calibration sets the matching and the lens terms
+itself, since 2026-11-07 the bearing model too. Flying, `env | grep BEARING` should print nothing:
+the flight estimator runs without the bearing model.
 
 Since 2026-10-09 the same file keeps two lens terms per camera as calibration states in
 flight and matches features between neighbouring cameras. What that changes, measured on the
