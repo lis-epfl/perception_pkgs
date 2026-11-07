@@ -122,9 +122,9 @@ after takeoff, range 155.9-168.2 s, 9 replays (3 rounds of nxt3_s1, nxt6_s2, nxt
 start below, pass 1 ended 90.3 s after takeoff in 7 of the 9 replays and 1.9 and 2.1 s behind the live data in the other
 two; pass 2 took 65.6-76.0 s (median 68.0) to the verdict.
 Other flight times, same protocol: 20 s 49.8, 30 s 63.2, 60 s 105.9, 120 s 213.1, 150 s 257.6 s (medians).
-  Study records (not in this repository): paper_rerun/spread_study/flight_time_table/ft_live.py -> ft_live.txt, runs in
-  flight_time_table/orin/onl2p; how each cell of the paper's flight-time table was produced, and the independent
-  recomputation: paper_rerun/review/table2_short_flights/provenance/README.txt (column "Ready after takeoff").
+  Study records (not in this repository): the replays of 13 Oct and the script that computed these times from their
+  traces; how each cell of the paper's flight-time table was produced, and its independent recomputation (column "Ready
+  after takeoff").
 
 When pass 1 caught up with the live data (one pass, 12 Oct 2026, 11 runs on nxt3_s1, nxt6_s2, nxt10_s1, standstill before
 takeoff 11 / 8 / 4 s): 55-62 s after takeoff alone (n = 4), 69-77 s beside the flight estimator on separate cores (n = 3),
@@ -132,7 +132,7 @@ both from the common start below. In flight the pass ran at 1.46-1.51 x real tim
 estimator; the standstill replays at 2.2-2.9 x. The calibration of the in-flight pass was as close to the whole-flight
 calibration as a pass run after the flight (0.6-1.5 mm and 0.03-0.10 deg, against 0.5-1.3 mm and 0.05-0.09 deg; two runs
 of the same pass differ by about 0.9 mm).
-  Study records: paper_rerun/spread_study/online15/README.txt and online_table.txt.
+  Study records (not in this repository): the test of 12 Oct, its notes and its table of runs.
 
 The common start. In the replay the heuristics run as a batch on the recorded file, so the tool is started a few seconds
 after takeoff (--start-after, default 3) and pass 1 usually begins 13-17 s after takeoff, earlier or later than in the
@@ -206,8 +206,7 @@ which is why the launcher now samples the computer): pass 1 at 1.33 x real time 
 after takeoff (70.5 s from the common start), pass 2 76.0 s, READY 166.3 s after takeoff; after the flight 154.3 and
 142.0 s. Its calibrations are in the comparison above; its times are not those of a quiet computer.
 
-  Records (not in this repository): paper_rerun/review/inflight_branch/orin (the scripts that ran, logs, run folders with
-  inflight_report.txt/.json).
+  Records (not in this repository): the scripts that ran, their logs, and the run folders with inflight_report.txt/.json.
 
 
 7. WHAT IT DOES NOT DO (limitations)
