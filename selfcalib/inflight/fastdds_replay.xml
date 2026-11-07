@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- FastDDS profile for the real-time replay (run_inflight_replay.sh exports it as FASTRTPS_DEFAULT_PROFILES_FILE for the
+     players, the recorder, the first-frame listener and the optional flight estimator). The same profile was used by the
+     replays behind the paper's "ready after takeoff" numbers. -->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors>
+      <!-- Shared memory. A 1280x800 JPEG is about 240 kB, and net.core.rmem_max on the Orin NX is 208 kB, so a UDP-only
+           path on the same computer cannot buffer even one image and loses fragments in bursts. On the vehicle the camera
+           driver and the estimator also run on one computer, so shared memory is the faithful transport. -->
+      <transport_descriptor>
+        <transport_id>shm_tr</transport_id>
+        <type>SHM</type>
+        <segment_size>134217728</segment_size>
+        <port_queue_capacity>4096</port_queue_capacity>
+        <maxMessageSize>4194304</maxMessageSize>
+      </transport_descriptor>
+      <!-- UDP for discovery only, restricted to the loopback interface so nothing leaves the computer. This replaces
+           ROS_LOCALHOST_ONLY=1, which in rmw_fastrtps turns the built-in transports off and shared memory with them. -->
+      <transport_descriptor>
+        <transport_id>udp_tr</transport_id>
+        <type>UDPv4</type>
+        <sendBufferSize>1048576</sendBufferSize>
+        <receiveBufferSize>1048576</receiveBufferSize>
+        <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="inflight_replay" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_tr</transport_id>
+          <transport_id>udp_tr</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
