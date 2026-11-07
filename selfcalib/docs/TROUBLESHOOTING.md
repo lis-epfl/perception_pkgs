@@ -78,7 +78,7 @@ orphaned processes before anything else.
   fixed-point-adjacent states (multi-basin structure); the robust-mean publish handles it —
   report the published mean, never a single harvest.
 
-## 9. Bearing model (calibration passes, on by default since 2026-11-07)
+## 9. Bearing model (calibration passes and flight, on by default since 2026-11-07)
 
 - `WARNING: the bearing model was asked for, but the estimator did not report it` — the
   estimator was built before the commit that added the model and ignored `OV_KB_BEARING`:
@@ -92,5 +92,29 @@ orphaned processes before anything else.
   then names the error). The passes then run the bearing model with the config's own mask.
   `report.json` `w_mask.passes[k].reason` says which.
 - The estimator ends at start-up with `[bearing] OV_KB_BEARING=1 does not support OV_PREJAC=1`:
-  unset `OV_PREJAC` for calibration, or pass `--no-bearing`.
+  unset `OV_PREJAC` for calibration, or pass `--no-bearing`; in flight, unset it or deploy the
+  original model.
 - To calibrate as before 2026-11-07: `--no-bearing` (or export `OV_KB_BEARING=0`).
+- `WARNING: OV_KB_BEARING=0 in the environment together with flight priors` — the shell sourced
+  the `flight_stiffness.env` of a folder deployed for the original model. The calibration then
+  runs without the bearing model; unset `OV_KB_BEARING` (and the flight settings) for the default.
+- deploy_vio.py: `measurement model: the ORIGINAL, without the bearing model (...)` — expected
+  with `--no-bearing` or `OV_KB_BEARING` other than 1 in the shell; otherwise the calibration
+  ran without the model (`report.json` `w_mask` null, or no `w_mask` at all: a calibration by the
+  tool before 2026-11-07), or the vio package's `flight_stiffness.env` does not switch it on (a
+  package older than the tool). Recalibrate with the tool's default, or update the package, to
+  fly the bearing model.
+- deploy_vio.py: `WARNING: measurement model: bearing, but with the flight config's own fisheye
+  mask` — the pass the calibration published kept the config's mask (see the item above about
+  `fisheye mask of the config kept`), or the flight config's mask cannot take the fitted one (it
+  does not draw the disk itself, or groups the cameras under other keys than the calibration
+  config). The bearing model was measured in flight with the fitted mask only: fix the configs
+  and deploy again, or deploy the original model (`--no-bearing`).
+- deploy_vio.py: `ERROR: report.json w_mask ...` — the record of the fitted mask is damaged (not
+  a mask angle, or no record of the published pass): run the calibration again into an empty
+  `--out`, or deploy the original model (`--no-bearing`).
+- A flight log without `[bearing-cfg] on=1` although the folder was deployed with the model: the
+  shell did not source the folder's `flight_stiffness.env`, something exported `OV_KB_BEARING`
+  other than 1 after it, or the estimator was built before commit 250f9f2 (it then flies the
+  original model with the fitted mask). `env | grep BEARING` and the log's
+  `auto fisheye mask` lines tell which.

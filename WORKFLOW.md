@@ -20,9 +20,9 @@ Both operating points use this one build. Needs Ubuntu 22.04, ROS 2 Humble, and
 `libeigen3-dev libboost-all-dev libceres-dev`. Rebuild after updating the repository: since
 2026-10-14 a calibration matches between cameras and estimates two lens terms by default, which
 needs an estimator built from commit 6bbaf8c on (an older build ignores both, and the run ends
-with a WARNING for each). Since 2026-11-07 it also runs the bearing measurement model, which needs
-an estimator built from the commit that added it (an older build ignores it, and the run ends with
-a WARNING).
+with a WARNING for each). Since 2026-11-07 it also runs the bearing measurement model, and so does
+flight, which needs an estimator built from commit 250f9f2 on (an older build ignores it: a
+calibration run then ends with a WARNING, and a flight runs the original model with the fitted mask).
 
 ---
 
@@ -101,19 +101,42 @@ python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myve
         ...
 [deploy] mount rotation: yaw -3.24 deg, tilt 3.25 deg  (anchored 0.245 m -> 0.059 m)
 [deploy]   NOTE: the estimator does NOT read this. Apply it to the OUTPUT trajectory.
-[deploy] verified: 4 cameras, t_d -0.039256 s, chain/config cross-references consistent
+[deploy] measurement model: bearing (OV_BEARING_ALL=1 OV_BEARING_RANSAC=1 OV_KB_BEARING=1); fisheye mask fitted
+         by the calibration, the one of the pass it published (pass 2): mask_fisheye_theta_max 1.808444,
+         mask_fisheye_theta_max3 1.818816 -> estimator_flight.yaml
+[deploy] verified: 4 cameras, t_d -0.039256 s, chain/config cross-references consistent, the bearing model with the fitted fisheye mask
 ```
 
 It **refuses to deploy a calibration whose verdict was not `HEALTHY`** unless you pass
 `--force`, and it verifies the result before declaring success: all three YAML files present,
-`%YAML:1.0` on line 1 of each, camera set unchanged in transit, and the config's
-`relative_config_*` keys actually pointing at the two chain files.
+`%YAML:1.0` on line 1 of each, camera set unchanged in transit, the config's
+`relative_config_*` keys actually pointing at the two chain files, and the fisheye mask and
+the flight settings the ones intended.
+
+**The measurement model (since 2026-11-07).** The folder flies the bearing measurement model
+(`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1` in its `flight_stiffness.env`) with the
+fisheye mask the calibration fitted to each lens, the one of the pass it published, written into
+its `estimator_flight.yaml`. A calibration made without the model (`--no-bearing`, or by the tool
+before 2026-11-07) is deployed without it, with the config's own mask. To fly the original model
+with any calibration, deploy it into its own folder with the model off:
+
+```bash
+OV_KB_BEARING=0 python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle_original
+# or: python3 selfcalib/tool/deploy_vio.py --calib-out out_myvehicle --out flight_myvehicle_original --no-bearing
+```
+
+That folder keeps the config's own mask and its `flight_stiffness.env` sets `OV_KB_BEARING=0`:
+its flight is the flight of before 2026-11-07, byte for byte. (Exporting `OV_KB_BEARING=0` after
+sourcing a folder deployed with the model switches the model off but keeps the fitted, narrower
+mask: not the original flight.) What the model changes in flight, measured on the flight
+computer in real time: `vio/README.md`, "Bearing measurement model".
 
 ### What you get
 
 ```
 flight_myvehicle/
-  estimator_flight.yaml       flight config (from the vio package)
+  estimator_flight.yaml       flight config (from the vio package), with the fisheye mask the
+                              calibration fitted (the config's own for the original model)
   kalibr_imucam_chain.yaml    ← the published chain, renamed
   kalibr_imu_chain.yaml       ← the IMU chain
   flight_stiffness.env        the flight settings (from the vio package); its last line holds
@@ -168,14 +191,18 @@ random-walk. Source the copy in the flight folder: it also carries the lens term
 calibration. Check with `env | grep OV_PRIOR` — flying should print six variables. Before a
 calibration, `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD|BEARING'` should print nothing, or only
 switches you set on purpose: since 2026-10-14 the calibration sets the matching and the lens terms
-itself, since 2026-11-07 the bearing model too. Flying, `env | grep BEARING` should print nothing:
-the flight estimator runs without the bearing model.
+itself, since 2026-11-07 the bearing model too. Flying, `env | grep BEARING` should print
+`OV_KB_BEARING=1`, `OV_BEARING_ALL=1` and `OV_BEARING_RANSAC=1` (a folder deployed for the
+original model: `OV_KB_BEARING=0`), and the estimator's log starts with `[bearing-cfg] on=1 ...`
+(none for the original model); its `auto fisheye mask` lines show the mask in use.
 
 Since 2026-10-09 the same file keeps two lens terms per camera as calibration states in
 flight and matches features between neighbouring cameras. What that changes, measured on the
 flight computer, and how to switch it off: `vio/README.md`, "Matching and lens terms in
-flight". The live node of the vehicle is `run_online_msckf`; `run_subscribe_msckf` reads
-neither the PX4 IMU nor compressed images and does not match between cameras.
+flight". Since 2026-11-07 it also switches on the bearing measurement model: `vio/README.md`,
+"Bearing measurement model", and the section above on the original model. The live node of the
+vehicle is `run_online_msckf`; `run_subscribe_msckf` reads neither the PX4 IMU nor compressed
+images and does not match between cameras.
 
 ---
 

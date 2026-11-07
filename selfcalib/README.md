@@ -221,6 +221,9 @@ and one whose flight showed no lever arm keeps that folder's lever arm; `mount.j
 MANIFEST name the calibration that solved them. They describe how the IMU sits in the motion
 capture's rigid body, which a camera calibration does not change: solve them again in the
 motion capture after changing the hardware.
+Since 2026-11-07 the folder flies the bearing measurement model with the fisheye mask the
+calibration fitted, written into its `estimator_flight.yaml` (section "Bearing model and fitted
+fisheye mask"); `--no-bearing`, or `OV_KB_BEARING=0` exported, deploys the original model.
 See `../WORKFLOW.md` for the full four-step walkthrough.
 
 **Exit codes**: `0` success · `1` gate failure (re-record) · `2` the stopping rule never held
@@ -315,10 +318,7 @@ with a HEALTHY verdict. On the three test recordings its calibrations differ fro
 configuration that was tested (the mask fitted at each recording's final calibration) by
 0.3-0.4 px below 60 deg and 0.8-1.1 px at 105-110 deg off the axis; two runs of the tool without
 the model differ from each other by 0.3-0.4 and 3.0-8.3 px (`docs/VALIDATION_MATRIX.md`,
-section 8). The flight
-configuration is unchanged: `deploy_vio.py` and `--frozen-check` run the flight estimator
-without the bearing model and with the config's own mask (in flight the model brought no gain,
-`../vio/README.md`).
+section 8).
 
 `--no-bearing` switches both off: the passes then run as before 2026-11-07, with the config's
 mask. Exporting `OV_KB_BEARING=0` does the same; your own values of `OV_BEARING_ALL`,
@@ -329,6 +329,22 @@ that added it ignores the switches; the run then ends with a WARNING (`report.js
 `calib_passes.bearing_model_ran` false): rebuild it. The log says what the passes ran with
 (`calibration passes: ..., bearing model ON (...)`), and so does `report.json`
 (`calib_passes.bearing_model`).
+
+**In flight.** Since 2026-11-07 flight runs the bearing model too (`../vio/README.md`, "Bearing
+measurement model", has the real-time test on the flight computer: the same tracking error,
+about 10 % more time per set of images). The flight settings (`flight_stiffness.env` of the vio
+package) set the three switches, and `deploy_vio.py` writes into the flight folder's
+`estimator_flight.yaml` the mask of the pass the calibration published (`report.json`
+`w_mask.passes`, the entry of `published_from_pass`): the mask that pass ran with, fitted
+around the principal points of the pass before. Where that pass kept the config's mask, the
+folder keeps it too, with a WARNING. A calibration made without the model (`--no-bearing`,
+`OV_KB_BEARING=0`, a rig the model is off for, or this tool before 2026-11-07, whose
+`report.json` has no `w_mask`) is deployed without it: the original model, with the config's
+mask. `--frozen-check` flies the calibration the same way. To fly the original model with a
+calibration made with it, deploy with `OV_KB_BEARING=0` exported or `deploy_vio.py --no-bearing`:
+that folder's flight is byte-identical to the flight of before 2026-11-07, and its
+`flight_stiffness.env` sets `OV_KB_BEARING=0`. The folder's MANIFEST says which model it flies
+and with which mask.
 
 ### Ground truth is optional and found automatically
 
@@ -397,7 +413,8 @@ accumulated drift.
 ## 6. Reading the verdict
 
 - `HEALTHY` — calibration self-consistent, in fleet distribution, (ATE healthy if GT given).
-  Deploy it with `tool/deploy_vio.py`, which takes the chain and its lens terms together.
+  Deploy it with `tool/deploy_vio.py`, which takes the chain, its lens terms and its fitted
+  fisheye mask together.
 - `FLY-AGAIN` — the recording, not the vehicle, was inadequate (gate details say which
   gate); record another ordinary flight and rerun.
 - `HARDWARE-CHANGED` — converged cleanly but off the fleet distribution: the vehicle really
@@ -430,25 +447,29 @@ priors leave the calibration states mobile so the warm-start iterations can conv
 from the seed.
 
 Flight mode — `estimator_flight.yaml` and `flight_stiffness.env` (the tightened priors and,
-since 2026-10-09, the two lens terms as states and the matching between cameras) — lives in
-the `vio/` package and is documented in `../vio/README.md`. Since 2026-10-14 the calibration
-passes of this package have both of the two as well (section above; the lens terms with a ten
-times wider prior), so the last calibration pass differs from the flight trajectory by the
-stiff priors and, since 2026-11-07, by the bearing model and the fitted mask, which only the
-calibration passes run. `--frozen-check` adds one pass that
+since 2026-10-09, the two lens terms as states and the matching between cameras; since
+2026-11-07 the bearing model) — lives in the `vio/` package and is documented in
+`../vio/README.md`. Since 2026-10-14 the calibration passes of this package have the lens terms
+and the matching as well (section above; the lens terms with a ten times wider prior), and both
+run the bearing model with the same fitted mask, so the last calibration pass differs from the
+flight trajectory by the stiff priors. `--frozen-check` adds one pass that
 runs the published calibration with the flight settings, if the recording has ground truth
 (without it the option does nothing and says so). On the vehicle that pass is the flight
 operating point; on a desktop it runs the CPU tracker, and it matches between cameras where the
 calibration passes did (the tool groups the cameras on a desktop) or when you export
-`OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched. It runs
-without the bearing model even when your shell exports its variables.
+`OV_GROUP_CAMS=1`. The log and `report.json` (`deploy_check`) say whether it matched. It flies
+the measurement model as `deploy_vio.py` deploys this calibration: the bearing model with the
+mask of the published pass when the passes ran the model, the original model with the config's
+mask when they did not; the bearing variables of your shell are ignored (`deploy_check`
+`bearing_model`, `fisheye_mask`, `bearing_model_ran`).
 
 **This matters operationally:** `run_serial.sh` passes your shell environment through, so
 flight variables leaking into a calibration run silently pin the calibration at its seed.
 The convergence gates will flag the non-convergence, but the root cause is the environment.
-Check with `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` before a calibration run — it should
-print nothing, or only switches you set on purpose (the tool sets the matching and the lens
-terms itself). `run_tool.py` guards its own passes: it unsets the flight priors, replaces the
+Check with `env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD|BEARING'` before a calibration run — it should
+print nothing, or only switches you set on purpose (the tool sets the matching, the lens
+terms and the bearing model itself; an `OV_KB_BEARING=0` from the folder of a flight with the
+original model switches the bearing model off, with a WARNING). `run_tool.py` guards its own passes: it unsets the flight priors, replaces the
 flight value of the lens-term prior by the calibration value 0.002, and unsets an
 `OV_NONRADIAL` left in the shell by a flight folder or another calibration, each with a
 WARNING, and lists them in `report.json` (`calib_passes`). `OV_NONRADIAL` is kept in one case only: you export a

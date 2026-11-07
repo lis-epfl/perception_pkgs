@@ -226,3 +226,44 @@ wider. The fit takes 0.6 s per pass on the flight computer.
 | default with a mask fit that raises (test copy of `wmask.py`), nxt3 4 June, 20 s | WARNING, the config's mask in both passes, HEALTHY at pass 2 |
 | default on the Orin NX (GPU 612 MHz), the three test recordings, 90 s, two runs each, alternating with the tool and estimator of 3a96bc0 (one run at a time) | 6 of 6 **HEALTHY: deploy** at pass 2 (3a96bc0: 6 of 6); the model ran in every pass. An estimator pass 64.6-68.4 s against 62.0-64.5 s (paired: +4.6 % median, +2.0 to +4.2 s, of which 0.5 s is the mask fit), a whole run 151.6-157.8 s against 144.1-148.9 s (+3.6 % median). Two runs of the same recording differ by 0.28-0.50 px below 60 deg and 0.71-1.30 px at 105-110 deg (3a96bc0: 0.34-0.43 / 5.48-8.23 px); the runs differ from the desktop's run by 0.31-0.47 / 0.80-1.59 px |
 
+## 9. Bearing model in flight (2026-11-07)
+Since 2026-11-07 flight runs the bearing model as well (`vio/vio_deploy/config/flight_stiffness.env`,
+point 5), with the fisheye mask of the pass the calibration published, which `deploy_vio.py` writes
+into the flight folder (README, "Bearing model and fitted fisheye mask"). The real-time test on the
+Orin NX that decided it is in `../../vio/README.md`, "Bearing measurement model": the same tracking
+error (3.69 against 3.73 cm over 11 flights x 3 runs per model, no run above 6 cm in either), about
+10 % more time per set of images. The `--frozen-check` row of section 8 describes the tool before
+this change. Tests of the change (workstation; the estimator's code is that of 5301181, unchanged):
+
+**Deployment** (no estimator; the three 90 s calibrations the real-time test flew, nxt3 4 June,
+nxt6 23 June, nxt10 4 June; `deploy_vio.py` of 5301181 as the reference; 216 checks, all pass).
+
+| case | result |
+|---|---|
+| default | the fitted mask of the published pass in `estimator_flight.yaml` (nxt3 1.808444 / 1.818816, nxt6 1.817016 / 1.819301, nxt10 1.800899 / 1.83665); with each recording's topic layout it is the real-time test's config of the bearing model for all 11 recordings, byte for byte, and the sourced `flight_stiffness.env` is that test's environment (campaign.env and the real-time replay switches aside); every other file as deployed before |
+| `OV_KB_BEARING=0` exported, `--no-bearing`, or both with `OV_KB_BEARING=1` | the folder of 5301181 file for file (`estimator_flight.yaml`, chains, mount, lens terms, `campaign.env`); the sourced flight settings differ only by `OV_KB_BEARING=0`; it is the real-time test's config and environment of the original model |
+| `report.json` without `w_mask` (a tool before 2026-11-07), or `w_mask` null (`--no-bearing` calibration) | the original model, the config's mask |
+| the published pass kept the config's mask; a flight config without the automatic disk, or without the camera-3 key | the bearing model with the config's own mask, WARNING |
+| a flight disk narrower than the fitted one | the fitted mask lowered to it, noted |
+| `w_mask` record damaged (not an angle, a key that is not a mask key, no record of the published pass) | refused |
+| a vio package whose `flight_stiffness.env` does not set the model | the original model, no fitted mask |
+| deployed again into the same folder: model, original, model | each time the folder of that deployment |
+
+**Replays** (CPU tracker, `OV_DETERMINISTIC=1`, `OV_GROUP_CAMS=1`, 2 threads, whole recordings; each
+recording with its own calibration):
+
+| | nxt3 4 June | nxt6 23 June | nxt10 4 June |
+|---|---|---|---|
+| default folder = the real-time test's config and environment of the bearing model | identical | identical | identical |
+| override folder = folder of 5301181 = the real-time test's original model | identical | identical | identical |
+| default folder sourced, then the override folder, in one shell = folder of 5301181 | identical | | |
+| `OV_KB_BEARING=0` exported over the default folder (the fitted mask stays) | differs from the original (as documented) | | |
+
+**Tool** (`--frozen-check`, nxt3 4 June, 20 s, `OV_DETERMINISTIC=1`, against the tool of 5301181): all
+four runs HEALTHY at pass 2. Default: published chain, lens terms and both harvests byte-identical;
+the flight check flies the bearing model with the mask of the published pass (1.807651 / 1.815172),
+and its trajectory and calibration equal those of the folder `deploy_vio.py` writes, replayed over
+the same window. The ATE certificate and the mount, which the tool computes on the flight check,
+follow it (POSTG 2.09 against 1.65 cm, mount yaw -3.73 against -3.54 deg). `--no-bearing`:
+everything byte-identical to the tool of 5301181, the flight check included (the original model,
+which the deployed folder of that calibration flies as well).

@@ -29,7 +29,12 @@ binding camera and at least that far inside on the others.
 The ring (380-500 px) is the fleet's lens (f about 252 px, image circle ending about 458 px from the principal point);
 on another rig the profiles do not reach the circle and the rule finds no edge: the config's mask is then kept. The
 rule never widens the config's disk (a value above the config's is lowered to it).
+
+Flight (since 2026-11-07) runs the bearing model as well, with the mask of the pass a calibration published
+(report.json w_mask): flight_mask() reads it and fits it to the flight config, for deploy_vio.py and the tool's flight
+check alike.
 """
+import math
 import re
 import numpy as np
 import cv2
@@ -204,3 +209,66 @@ def apply_lines(cfg_txt, lines):
             new = cfg_txt.rstrip('\n') + '\n%s: %s\n' % (k, txt)
         cfg_txt = new
     return cfg_txt
+
+
+def published_lines(report):
+    """The fitted mask of the pass a calibration published, from its report (report.json of run_tool.py).
+    -> (lines, why): lines = {key: theta_max} that pass ran with, or None and why (a sentence) when there is none: the
+    calibration ran without the bearing model (w_mask null, or a report written before 2026-11-07 without the field), or its
+    published pass kept the config's own mask (the reason the fit gave). Raises ValueError when the record is malformed."""
+    if 'w_mask' not in report:
+        return None, 'report.json has no w_mask: a calibration by the tool before 2026-11-07, which ran without the bearing model'
+    wm = report['w_mask']
+    if wm is None:
+        return None, 'report.json w_mask is null: the calibration ran without the bearing model'
+    p = report.get('published_from_pass')
+    rec = [e for e in (wm.get('passes') or []) if isinstance(e, dict) and e.get('pass') == p] if isinstance(wm, dict) else []
+    if len(rec) != 1:
+        raise ValueError('report.json w_mask holds %d records of the published pass (%r), not one' % (len(rec), p))
+    lines = rec[0].get('lines')
+    if lines is None:
+        return None, 'the published pass %s kept the config\'s own mask (%s)' % (p, rec[0].get('reason') or 'no reason recorded')
+    if not isinstance(lines, dict) or not lines:
+        raise ValueError('report.json w_mask of the published pass: lines %r are not a mask' % (lines,))
+    out = {}
+    for k, v in lines.items():
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            x = float('nan')
+        if not re.fullmatch(r'mask_fisheye_theta_max\d*', str(k)) or isinstance(v, bool) or not 0.0 < x < math.pi:
+            raise ValueError('report.json w_mask of the published pass: %r: %r is not a mask angle' % (k, v))
+        out[str(k)] = x
+    return out, None
+
+
+def for_config(lines, cfg_txt, cams):
+    """The lines of a fitted mask for another config of the rig (the flight config) -> (lines, note).
+    lines None and note = why, when they cannot be used there: the config does not draw the disk itself (use_mask /
+    mask_fisheye_auto false), or its mask has other keys (every camera must get its fitted value: the global key for the
+    cameras without one of their own, mask_fisheye_theta_max<i> for each camera with one). Otherwise a value wider than
+    this config's own is lowered to it, as in w_mask (note then names the keys, else None)."""
+    auto, theta, own, _ = config_mask(cfg_txt, cams)
+    if not auto:
+        return None, 'the flight config does not draw the fisheye disk itself (use_mask / mask_fisheye_auto)'
+    keys = {'mask_fisheye_theta_max%d' % c if c in own else 'mask_fisheye_theta_max': c for c in cams}
+    if set(lines) != set(keys):
+        return None, ('the fitted mask sets %s, the flight config\'s mask has %s' % (', '.join(sorted(lines)), ', '.join(sorted(keys))))
+    out, capped = {}, []
+    for k, v in lines.items():
+        cfgv = theta[keys[k]]
+        if v > cfgv:
+            capped.append(k)
+            v = cfgv
+        out[k] = v
+    return out, ('wider than the flight config, lowered to it: %s' % ', '.join(sorted(capped))) if capped else None
+
+
+def flight_mask(report, cfg_txt, cams):
+    """The fisheye mask a calibration is flown with when flight runs the bearing model: the fitted mask of the pass it
+    published, for the flight config cfg_txt. -> (lines, note): lines None = the flight config's own mask stays, note why.
+    Raises ValueError when report.json's record is malformed."""
+    lines, why = published_lines(report)
+    if lines is None:
+        return None, why
+    return for_config(lines, cfg_txt, cams)
