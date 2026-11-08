@@ -14,7 +14,9 @@ a disk of the fleet-shared radius (FFT), and the argmax is the principal point.
 image_pass() is what the tool calls: the same pass with one process per camera. The cameras do
 not interact in any step, so the result is the one of accumulate() + fit_centers() +
 health_from_acc() in a single process; on the flight computer it takes about 8 s instead of
-about 18 s for 30 s of flight."""
+about 18 s for 30 s of flight. It can also hand back the mean images (mean_image()), from which
+the tool fits the fisheye mask of the calibration passes when they run the bearing model
+(wmask.py)."""
 import json, os, subprocess, sys, tempfile
 import numpy as np
 import cv2
@@ -105,6 +107,12 @@ def fit_centers(acc, radii):
     return out
 
 
+def mean_image(a):
+    """The mean image of one camera's accumulation: the changed frames' exact sum (float32 holds every partial sum of
+    grey levels exactly up to 65,000 frames) over their number."""
+    return a['sum'] / max(a['n'], 1)
+
+
 def health_from_acc(acc, centers, radii):
     out, ok = {}, True
     for c, a in acc.items():
@@ -128,13 +136,14 @@ def usable_cpus():
     return len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
 
 
-def image_pass(bag, radii, cams=(0, 1, 2, 3), processes=None, scratch=None):
+def image_pass(bag, radii, cams=(0, 1, 2, 3), processes=None, scratch=None, means=None):
     """The tool's image pass -> (centers, health): fit_centers() and health_from_acc() of
     accumulate(), with one process per camera (at most `processes` at a time; default one per
     camera, up to the CPUs this process may use). Each process opens the recording itself and
     reads its own camera, window included. processes=1, or a single camera, runs here in this
     process. Both results are keyed in the order of `cams`. `scratch`: where the processes
     leave their small result files while the pass runs (default: the system's temp folder).
+    `means`: a dict, filled with {camera: mean image} (mean_image(), float32) when given.
     An interrupt ends the processes; a caller that is killed outright leaves them to finish."""
     rec = _rec(bag)
     cams = tuple(int(c) for c in cams)
@@ -144,6 +153,8 @@ def image_pass(bag, radii, cams=(0, 1, 2, 3), processes=None, scratch=None):
         acc = accumulate(rec, cams=cams)
         centers = fit_centers(acc, radii)
         health = health_from_acc(acc, centers, radii)
+        if means is not None:
+            means.update({c: mean_image(acc[c]) for c in cams if c in acc})
     else:
         running = []
         with tempfile.TemporaryDirectory(prefix='circlefit_', dir=scratch) as tmp:
@@ -176,6 +187,8 @@ def image_pass(bag, radii, cams=(0, 1, 2, 3), processes=None, scratch=None):
                         sys.stderr.write(''.join('[camera %d] %s\n' % (c, ln) for ln in said.splitlines()))
                     if res:
                         centers[c], health['cam%d' % c] = res['center'], res['health']
+                        if means is not None:
+                            means[c] = np.load(os.path.join(tmp, 'cam%d_mean.npy' % c))
             finally:
                 for _c, err, proc in running:       # only after a failure or an interrupt: do not leave the others running
                     proc.kill()
@@ -202,6 +215,7 @@ def _camera_main():
     if c in acc:                         # no frame of this camera in the window: the tool gets no entry for it, as before
         centers = fit_centers(acc, radii)
         res = {'center': centers[c], 'health': health_from_acc(acc, centers, radii)['cam%d' % c]}
+        np.save(os.path.join(os.path.dirname(os.path.abspath(a.out)), 'cam%d_mean.npy' % c), mean_image(acc[c]))
     with open(a.out, 'w') as f:
         json.dump(res, f)
 

@@ -164,7 +164,8 @@ best-fit rotation. Confirms §6.2: the offset is constant, not drift.
 
 ## 7. End-to-end driver (`run_tool.py`)
 (Validated before 2026-10-14, when the calibration had neither the matching between cameras nor
-the two lens terms; `--no-matching --no-lens-terms` gives that run.)
+the two lens terms, nor since 2026-11-07 the bearing model; `--no-matching --no-lens-terms
+--no-bearing` gives that run. Section 8 has the tests of the bearing model.)
 gates → one accumulation pass (circle fit + image health) → leave-one-out fleet seed + own
 circle fit (scenario D, zero own calibration) → warm-start to self-consistency → robust-mean
 publish → diagnosis.
@@ -173,3 +174,109 @@ publish → diagnosis.
 |---|---|
 | nxt3, full bag, --fleet-exclude nxt3, GT attached | all gates PASS; converged at pass 2 (resid 0.0064, Δtoff 0.00 ms); published toff −0.039256 (population center −0.039251); ATE POSTG **3.61 cm**; verdict **HEALTHY: deploy** |
 | nxt1 s2 (defect path) | static PASS, **timing FLAG** (8.07 % drops / 37.1 ms noise, run proceeds with warning), image PASS; zero-own-calibration seed converged at pass 2; published toff **−0.054584** (independently re-derives the study's triple-confirmed −0.054 from a fleet seed 15 ms away); diagnosis: self-consistent 0.0103, in-distribution, ATE POSTG 0.884 m unhealthy → verdict **PLATFORM-DEFECT — repair, not recalibrate** [+ timing-gate consistency note] |
+
+## 8. Bearing model and fitted fisheye mask (2026-11-07)
+The configuration the calibration passes run since 2026-11-07 (README, "Bearing model and fitted
+fisheye mask"), tested on the fleet's recordings before it was made the default.
+
+**Estimator (`vio/`), every switch unset.** One calibration pass (nxt3 4 June, 90 s, the
+calibration's own settings, `OV_DETERMINISTIC=1`) and a flight-configuration replay (the whole
+recording, every line of `flight_stiffness.env`, matching on 5,375 sets of images): trajectory,
+calibration and calibration series byte-identical to the estimator of 3a96bc0, on the desktop.
+`OV_BEARING_ALL=1` alone: the same. The build adds no compiler warning (desktop, CPU tracker; Orin
+NX, GPU path). On the Orin NX, the flight configuration as flown (GPU tracker, `campaign.env`,
+`flight_stiffness.env`, the lens terms of a published calibration, `OV_DETERMINISTIC=1`) replayed
+over the whole nxt10 4 June recording gives the trajectory and calibration of the estimator of
+3a96bc0 byte for byte (1,958 poses; the estimator of 3a96bc0 run twice gives the same bytes too).
+
+**Estimator, the calibration's switches** (`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1`).
+The same pass gives the calibration of the build the rerun of 29 Oct 2026 tested, byte for byte;
+the trajectory differs only by the standstill poses that main writes since commit dc8d058. Its
+unit tests (projection and its inverse, Jacobians against finite differences, triangulation,
+measurement rows with and without first-estimate Jacobians, chi2 of a synthetic update) give the
+same output.
+
+**Calibration chains** (the paper's protocol: 6 starting values at r = 0.1 on each of the three
+test recordings, 90 s of flight, two passes, the mask fitted at each recording's final
+calibration, as tested). Spread over the starting values after pass 2: 0.85 mm / 0.0144 deg
+(tested build, same starting values: 0.80 mm / 0.0134 deg; the estimator without the model, two
+stored runs: 0.78-0.95 mm / 0.0140-0.0153 deg). Same starting value, this build minus the tested
+one: 1.21 mm / 0.0195 deg RMS; two runs of the estimator without the model differ by 1.18 mm /
+0.0220 deg. Lens model at 105-110 deg off the axis, spread over the starting values: 0.43-0.54 px
+(tested: 0.59-0.77 px; without the model: 3.07-4.10 px). Largest step from pass 1 to pass 2:
+0.12-0.29 envelopes (the stopping rule's limit is 2).
+
+**Fitted mask** (`wmask.py`). On the eleven fleet recordings, at the same calibration, the fit on
+the tool's own mean images (30 s of flight) gives the disk of the fit on 300 pictures over the
+whole recording to within 0.25 px of radius (cameras 0-2) and 0.28 px (camera 3), with the rule's
+first implementation giving the same end of the circle on all 44 cameras. Around the principal
+points of the seed (pass 1) the disk is 23 px narrower to 4 px wider; around those of a pass-1
+calibration (every later pass) 0.4 px narrower to 1.2 px wider, and in pass 2 of the tool's runs
+below (eleven recordings on the desktop, three on the flight computer) 0.7 px narrower to 1.7 px
+wider. The fit takes 0.6 s per pass on the flight computer.
+
+**End to end** (leave-one-out fleet seed, ground truth from the bag, desktop unless noted).
+
+| run | result |
+|---|---|
+| `--no-bearing`, nxt3 4 June, 90 s, `OV_DETERMINISTIC=1` | published chain, lens terms, both harvests and the mount byte-identical to the tool and estimator of 3a96bc0; `report.json` only adds `calib_passes.bearing_model` and `w_mask` (null) |
+| default, the eleven fleet recordings, 90 s | 11 of 11 **HEALTHY: deploy** at pass 2 (largest step 0.13-0.62 envelopes); the model ran in every pass; tool ATE 2.47-4.16 cm (mean 3.09; the tested configuration 3.17, without the model 3.30). Against the tested configuration's runs (the mask fitted at each recording's final calibration), median over the recordings of the largest projection difference: 0.36 px below 60 deg, 0.53 px at 100-105 deg, 0.83 px at 105-110 deg; two runs without the model differ by 0.29 / 2.66 / 4.24 px, the tested configuration from a run without the model by 0.49 / 6.95 / 12.05 px |
+| default, the three test recordings, 20 s (the default flight time) | 3 of 3 HEALTHY at pass 2 (largest step 0.73-1.16 envelopes; without the model 0.80-1.55), tool ATE 1.16-4.04 cm (without the model 1.22-2.60; single runs) |
+| default + `--frozen-check`, nxt10 4 June, 20 s, `OV_KB_BEARING=1 OV_BEARING_ALL=1` exported in the shell | calibration passes ran the model; the flight check did not (no `[bearing-cfg]` line, mask 1.83 / 1.87, matching on 711 sets); HEALTHY |
+| default with a mask fit that raises (test copy of `wmask.py`), nxt3 4 June, 20 s | WARNING, the config's mask in both passes, HEALTHY at pass 2 |
+| default on the Orin NX (GPU 612 MHz), the three test recordings, 90 s, two runs each, alternating with the tool and estimator of 3a96bc0 (one run at a time) | 6 of 6 **HEALTHY: deploy** at pass 2 (3a96bc0: 6 of 6); the model ran in every pass. An estimator pass 64.6-68.4 s against 62.0-64.5 s (paired: +4.6 % median, +2.0 to +4.2 s, of which 0.5 s is the mask fit), a whole run 151.6-157.8 s against 144.1-148.9 s (+3.6 % median). Two runs of the same recording differ by 0.28-0.50 px below 60 deg and 0.71-1.30 px at 105-110 deg (3a96bc0: 0.34-0.43 / 5.48-8.23 px); the runs differ from the desktop's run by 0.31-0.47 / 0.80-1.59 px |
+
+## 9. Bearing model in flight (2026-11-07)
+Since 2026-11-07 flight runs the bearing model as well (`vio/vio_deploy/config/flight_stiffness.env`,
+point 5), with the fisheye mask of the pass the calibration published, which `deploy_vio.py` writes
+into the flight folder as it was fitted (README, "Bearing model and fitted fisheye mask"); every other
+case flies the original model. The real-time test on the
+Orin NX that decided it is in `../../vio/README.md`, "Bearing measurement model": the same tracking
+error (3.69 against 3.73 cm over 11 flights x 3 runs per model, no run above 6 cm in either), about
+10 % more time per set of images. The `--frozen-check` row of section 8 describes the tool before
+this change. Tests of the change (workstation; the estimator's code is that of 5301181, unchanged):
+
+**Deployment** (no estimator; the three 90 s calibrations the real-time test flew, nxt3 4 June,
+nxt6 23 June, nxt10 4 June; `deploy_vio.py` of 5301181 as the reference; 345 checks, all pass,
+counting the shells and docs checks).
+
+| case | result |
+|---|---|
+| default | the fitted mask of the published pass in `estimator_flight.yaml` (nxt3 1.808444 / 1.818816, nxt6 1.817016 / 1.819301, nxt10 1.800899 / 1.83665); with each recording's topic layout it is the real-time test's config of the bearing model for all 11 recordings, byte for byte, and the sourced `flight_stiffness.env` is that test's environment (campaign.env and the real-time replay switches aside); every other file as deployed before |
+| `OV_KB_BEARING=0` exported, `--no-bearing`, or both with `OV_KB_BEARING=1` | the folder of 5301181 file for file (`estimator_flight.yaml`, chains, mount, lens terms, `campaign.env`); the sourced flight settings differ only by `OV_KB_BEARING=0`; it is the real-time test's config and environment of the original model |
+| `report.json` without `w_mask` (a tool before 2026-11-07), or `w_mask` null (`--no-bearing` calibration) | the original model, the config's mask |
+| the fitted mask cannot fly as it is: the estimator of the calibration did not run the model (`bearing_model_ran` false); the published pass kept the config's mask (no circle found, or the fit failed); a flight config without the automatic disk (`use_mask` or `mask_fisheye_auto` false), without the camera-3 key or with a key of its own for another camera, or with a disk narrower than the fitted one (cameras 0-2, or camera 3) | the original model, with a WARNING naming the reason and what would let the model fly: the folder of 5301181 file for file (MANIFEST and `flight_stiffness.env` aside), its flight settings those of 5301181 plus `OV_KB_BEARING=0`; `--frozen-check` takes the same decision (`run_tool.flight_model`) |
+| a flight disk wider than the fitted one, or equal to it | the bearing model with the fitted mask as it is |
+| `w_mask` record damaged (not an angle, a key that is not a mask key, no record of the published pass) | refused (`--frozen-check`: the deployment check fails); `--no-bearing` deploys the original model |
+| a vio package whose `flight_stiffness.env` does not set the model | the original model, no fitted mask |
+| the default, the original model asked for, a calibration without the model | the folder that `deploy_vio.py` of the commit before this rule (408c165) writes, file for file (the MANIFEST up to its paths, `flight_stiffness.env` as sourced) |
+| deployed again into the same folder: model, original, model, a calibration whose mask cannot fly | each time the folder of that deployment |
+
+**Replays** (CPU tracker, `OV_DETERMINISTIC=1`, `OV_GROUP_CAMS=1`, 2 threads, whole recordings; each
+recording with its own calibration):
+
+| | nxt3 4 June | nxt6 23 June | nxt10 4 June |
+|---|---|---|---|
+| default folder = the real-time test's config and environment of the bearing model | identical | identical | identical |
+| override folder = folder of 5301181 = the real-time test's original model | identical | identical | identical |
+| default folder sourced, then the override folder, in one shell = folder of 5301181 | identical | | |
+| `OV_KB_BEARING=0` exported over the default folder (the fitted mask stays) | differs from the original (as documented) | | |
+| folder of a calibration whose published pass kept the config's mask, and of one whose estimator did not run the model (the original model) = folder of 5301181 | identical, both | | |
+
+Run again after the rule that the model flies only with the fitted mask: every replay of the
+table gives the bytes it gave before the rule (trajectory and calibration).
+
+**Tool** (`--frozen-check`, nxt3 4 June, 20 s, `OV_DETERMINISTIC=1`, against the tool of 5301181): all
+four runs HEALTHY at pass 2. Default: published chain, lens terms and both harvests byte-identical;
+the flight check flies the bearing model with the mask of the published pass (1.807651 / 1.815172),
+and its trajectory and calibration equal those of the folder `deploy_vio.py` writes, replayed over
+the same window. The ATE certificate and the mount, which the tool computes on the flight check,
+follow it (POSTG 2.09 against 1.65 cm, mount yaw -3.73 against -3.54 deg). `--no-bearing`:
+everything byte-identical to the tool of 5301181, the flight check included (the original model,
+which the deployed folder of that calibration flies as well). After the rule that the model flies
+only with the fitted mask, the four runs give the same bytes again, and a fifth, the default with a
+mask fit that raises (test copy of `wmask.py`), is HEALTHY at pass 2: its passes run the model with
+the config's mask, so its flight check flies the original model with a WARNING (`deploy_check`
+`bearing_model` false, `bearing_model_off` naming the pass that kept the config's mask; POSTG
+2.07 cm), and equals, byte for byte, the replay of the folder `deploy_vio.py` writes from that
+calibration (the original model too, with the same WARNING).

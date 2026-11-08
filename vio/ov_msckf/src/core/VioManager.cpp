@@ -425,6 +425,25 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
   updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
 
+  // OV_KB_BEARING (default OFF; CamBase::bearing_cfg): the feature initializers of both updaters get the LIVE camera objects
+  // (refreshed by the filter after every update), for the features that take the bearing path. OV_PREJAC (triangulation on a
+  // worker thread) is not supported with it and ends the process.
+  if (ov_core::CamBase::kb_bearing()) {
+    const char *pj = std::getenv("OV_PREJAC");
+    if (pj && *pj == '1') {
+      PRINT_ERROR(RED "[bearing] OV_KB_BEARING=1 does not support OV_PREJAC=1\n" RESET);
+      std::exit(EXIT_FAILURE);
+    }
+    updaterMSCKF->set_bearing_cameras(state->_cam_intrinsics_cameras);
+    updaterSLAM->set_bearing_cameras(state->_cam_intrinsics_cameras);
+    (void)ov_core::CamBase::bearing_stats(); // constructed now, so that the [bearing] line is printed at exit
+  } else {
+    // OV_BEARING_ALL is a sub-switch of OV_KB_BEARING: alone it does nothing (say so, instead of silently running the original code)
+    const char *ba = std::getenv("OV_BEARING_ALL");
+    if (ba && *ba != '\0' && std::string(ba) != "0")
+      PRINT_WARNING(YELLOW "[bearing] warning: OV_BEARING_ALL='%s' has no effect without OV_KB_BEARING=1\n" RESET, ba);
+  }
+
   // OV_XCAM_DIFF: the differential rows of a two-camera pair are scaled for the pixel noise the updaters use. They are only right for
   // pairs that the cross-camera association of the tracker has registered, so the tracker says whether it runs and how it is set.
   const ov_core::TrackBase::XcamSettings xcam_set = trackFEATS->xcam_settings();

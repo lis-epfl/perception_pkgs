@@ -568,6 +568,115 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
       // Project the current feature into the current frame of reference
       Eigen::Vector3d p_FinCi = R_ItoC * p_FinIi + p_IinC;
+
+      // OV_KB_BEARING (default OFF; CamBase::bearing_cfg): a rim observation (stored |uvs_norm| > tan(switch)), or one
+      // whose CURRENT predicted bearing is beyond the switch angle (this includes z <= 0), is predicted with the bearing projection
+      // (no pinhole division) and gets its exact Jacobian; the distortion part at the current point, the geometric part at the FEJ
+      // point, as below. Every other observation takes the original code that follows, unchanged.
+      // OV_BEARING_ALL=1: EVERY observation takes this branch. A core row (the ones the original code would
+      // take: stored and current predicted bearing within the switch angle) gets the ORIGINAL first-estimate split
+      // dz/dp_FinC = D(n_cur) P(p_fej) whenever the FEJ point is in front of the camera (so its rows equal the original rows; the
+      // prediction is the double-precision projection instead of the original float-rounded one), the bearing split otherwise.
+      if (ov_core::CamBase::kb_bearing()) {
+        const ov_core::CamBase::BearingCfg &bcfg = ov_core::CamBase::bearing_cfg();
+        const Eigen::VectorXf &un_m = feature.uvs_norm[pair.first].at(m);
+        const bool brim = ov_core::CamBase::bearing_is_rim(un_m(0), un_m(1));
+        const double t_cur = std::atan2(std::sqrt(p_FinCi(0) * p_FinCi(0) + p_FinCi(1) * p_FinCi(1)), p_FinCi(2));
+        const bool bcore = !brim && (t_cur <= bcfg.switch_rad); // the original code's rows (without OV_BEARING_ALL they stay there)
+        if (!bcore || bcfg.force || bcfg.all) {
+          ov_core::CamBase::BearingStats &bst = ov_core::CamBase::bearing_stats();
+          // OV_BEARING_ALL core row with the original FEJ split (decided below, once the FEJ point is known)
+          const bool core_all = bcfg.all && bcore && !bcfg.force;
+          const double z_cur = p_FinCi(2);
+          bst.jac_bearing.fetch_add(1, std::memory_order_relaxed);
+          if (brim)
+            bst.jac_rim.fetch_add(1, std::memory_order_relaxed);
+          std::shared_ptr<ov_core::CamBase> camb = state->_cam_intrinsics_cameras.at(pair.first);
+          Eigen::Vector2d uv_pred;
+          Eigen::Matrix<double, 2, 3> Hd_cur;
+          Eigen::MatrixXd dz_dzeta_b, dz_dq_b;
+          const bool ok = camb->project_bearing(p_FinCi, uv_pred) &&
+                          camb->project_bearing_jacobian(p_FinCi, Hd_cur, &dz_dzeta_b, state->_do_calib_cam_nonradial ? &dz_dq_b : nullptr);
+          const double ncur = p_FinCi.norm();
+          if (!ok || !(ncur > 0.0)) {
+            // no prediction for this direction: a zero row pair (never a NaN)
+            res.block(2 * c, 0, 2, 1).setZero();
+            H_f.block(2 * c, 0, 2, H_f.cols()).setZero();
+            bst.jac_zero.fetch_add(1, std::memory_order_relaxed);
+            if (core_all)
+              bst.jac_core_zero.fetch_add(1, std::memory_order_relaxed);
+            c++;
+            continue;
+          }
+          Eigen::Vector2d uv_mb;
+          uv_mb << (double)feature.uvs[pair.first].at(m)(0), (double)feature.uvs[pair.first].at(m)(1);
+          res.block(2 * c, 0, 2, 1) = uv_mb - uv_pred;
+          bst.note_res(t_cur, (uv_mb - uv_pred).squaredNorm());
+
+          // FEJ, exactly as the original branch does it
+          if (state->_options.do_fej) {
+            R_GtoIi = clone_Ii->Rot_fej();
+            p_IiinG = clone_Ii->pos_fej();
+            p_FinIi = R_GtoIi * (p_FinG_fej - p_IiinG);
+            p_FinCi = R_ItoC * p_FinIi + p_IinC;
+          }
+          // dz/dp_FinC = J_dir(b_cur) (I - b_fej b_fej^T) / |p_fej|, J_dir(b) = Jacobian at the unit vector = H(p) |p|; exact when
+          // the current and the FEJ points coincide (H(p) = H(b)/|p| and H(b) b = 0)
+          Eigen::MatrixXd dz_dpfc_b;
+          if (core_all && z_cur > 0.0 && p_FinCi(2) > 0.0) {
+            // OV_BEARING_ALL core row: the ORIGINAL split dz/dp_FinC = D(n_cur) P(p_fej). For z > 0 the bearing projection is
+            // distort(x/z, y/z), so its Jacobian at the current point is D(n_cur) P(p_cur) and the first two columns of P(p_cur) are
+            // I / z_cur: D(n_cur) = z_cur * (first two columns of Hd_cur). P(p_fej) = dzn_dpfc of the original code at the FEJ point.
+            const Eigen::Matrix2d D_cur = Hd_cur.leftCols<2>() * z_cur;
+            Eigen::Matrix<double, 2, 3> P_fej;
+            P_fej << 1 / p_FinCi(2), 0, -p_FinCi(0) / (p_FinCi(2) * p_FinCi(2)), 0, 1 / p_FinCi(2), -p_FinCi(1) / (p_FinCi(2) * p_FinCi(2));
+            dz_dpfc_b = D_cur * P_fej;
+            bst.jac_core_orig.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            const double nfej = p_FinCi.norm();
+            const Eigen::Vector3d b_fej = p_FinCi / nfej;
+            const Eigen::Matrix<double, 2, 3> Jdir = Hd_cur * ncur;
+            dz_dpfc_b = Jdir * (Eigen::Matrix3d::Identity() - b_fej * b_fej.transpose()) / nfej;
+            if (core_all)
+              bst.jac_core_own.fetch_add(1, std::memory_order_relaxed);
+          }
+          Eigen::MatrixXd dpfc_dpfg_b = R_ItoC * R_GtoIi;
+          Eigen::MatrixXd dpfc_dclone_b = Eigen::MatrixXd::Zero(3, 6);
+          dpfc_dclone_b.block(0, 0, 3, 3).noalias() = R_ItoC * skew_x(p_FinIi);
+          dpfc_dclone_b.block(0, 3, 3, 3) = -dpfc_dpfg_b;
+          Eigen::MatrixXd dz_dpfg_b = dz_dpfc_b * dpfc_dpfg_b;
+          H_f.block(2 * c, 0, 2, H_f.cols()).noalias() = dz_dpfg_b * dpfg_dlambda;
+          H_x.block(2 * c, map_hx[clone_Ii], 2, clone_Ii->size()).noalias() = dz_dpfc_b * dpfc_dclone_b;
+          for (size_t i = 0; i < dpfg_dx_order.size(); i++) {
+            H_x.block(2 * c, map_hx[dpfg_dx_order.at(i)], 2, dpfg_dx_order.at(i)->size()).noalias() += dz_dpfg_b * dpfg_dx.at(i);
+          }
+          if (state->_options.do_calib_camera_pose) {
+            Eigen::MatrixXd dpfc_dcalib_b = Eigen::MatrixXd::Zero(3, 6);
+            dpfc_dcalib_b.block(0, 0, 3, 3) = skew_x(p_FinCi - p_IinC);
+            dpfc_dcalib_b.block(0, 3, 3, 3) = Eigen::Matrix<double, 3, 3>::Identity();
+            H_x.block(2 * c, map_hx[calibration], 2, calibration->size()).noalias() += dz_dpfc_b * dpfc_dcalib_b;
+          }
+          if (state->_options.do_calib_camera_intrinsics) {
+            H_x.block(2 * c, map_hx[distortion], 2, distortion->size()) = dz_dzeta_b;
+          }
+          if (state->_do_calib_cam_nonradial) {
+            if (ov_core::CamBase::nonradial_skew_fixed_from_env())
+              dz_dq_b.col(2).setZero(); // skew held at its start value (OV_NONRAD_SKEW_FIXED), as below
+            std::shared_ptr<Vec> nonrad = state->_cam_nonradial.at(pair.first);
+            H_x.block(2 * c, map_hx[nonrad], 2, nonrad->size()) = dz_dq_b;
+          }
+          // rim rows: pixel noise OV_BEARING_RIM_SIGMA x sigma (rows divided, so the callers' R = sigma^2 I stays right)
+          if (brim && bcfg.rim_sigma != 1.0) {
+            const double w = 1.0 / bcfg.rim_sigma;
+            res.block(2 * c, 0, 2, 1) *= w;
+            H_f.block(2 * c, 0, 2, H_f.cols()) *= w;
+            H_x.block(2 * c, 0, 2, H_x.cols()) *= w;
+          }
+          c++;
+          continue;
+        }
+      }
+
       Eigen::Vector2d uv_norm;
       uv_norm << p_FinCi(0) / p_FinCi(2), p_FinCi(1) / p_FinCi(2);
 

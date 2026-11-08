@@ -24,6 +24,7 @@
 
 #include <Eigen/Eigen>
 #include <memory>
+#include <unordered_map>
 
 #include "feat/FeatureInitializerOptions.h"
 
@@ -32,6 +33,7 @@
 namespace ov_core {
 class Feature;
 class FeatureInitializer;
+class CamBase;
 } // namespace ov_core
 namespace ov_type {
 class Landmark;
@@ -85,6 +87,9 @@ public:
    * @param state State of the filter
    */
   void change_anchors(std::shared_ptr<State> state);
+
+  /// OV_KB_BEARING: hands the LIVE camera objects of the filter to the feature initializer (the features of the bearing path)
+  void set_bearing_cameras(const std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> &cams);
 
 protected:
   /**

@@ -12,7 +12,7 @@ vio_deploy/                                deployment assets (this package's own
   config/estimator_flight.yaml               FLIGHT config
   config/flight_stiffness.env                flight settings: x0.10 calibration-prior stiffness,
                                              lens terms as states, matching between cameras,
-                                             limits for slow flight
+                                             limits for slow flight, bearing measurement model
   config/campaign.env                        the vehicle's GPU tracker and scheduler switches
   scripts/run_serial.sh                      the ONLY supported estimator invocation
   scripts/build_openvins.sh                  builds this workspace
@@ -61,12 +61,21 @@ set, makes the two lens terms per camera calibration states with that standard d
 The same file switches on what flight has had since 2026-10-09 (next section): the lens terms
 as states (the sixth row, with `OV_NONRAD_SKEW_FIXED=1`) and the matching of features between
 neighbouring cameras (`OV_XCAM=1`, `OV_XCAM_PRESET=rt`). Since 2026-10-14 it also sets four limits
-for slow flight (the section after that).
+for slow flight (the section after that), and since 2026-11-07 the bearing measurement model
+(`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1`, section "Bearing measurement model"),
+which flies with the fisheye mask the calibration fitted to each lens.
 
-**Flight** — `config/estimator_flight.yaml` **with** `config/flight_stiffness.env` sourced.
-The tightened priors tether the online calibration to its published chain. With the five
-priors of the first rows, the flight settings until 2026-10-08, this pair (uniform, no
-per-vehicle tuning) produced 2.4–4.5 cm SE(3) ATE across an 11-flight, 3-vehicle benchmark.
+**Flight** — a folder deployed by `selfcalib/tool/deploy_vio.py` (below): its
+`estimator_flight.yaml` **with** its `flight_stiffness.env` sourced. They are
+`config/estimator_flight.yaml` and `config/flight_stiffness.env` plus what the calibration
+brings: its chains, its lens terms and, when the folder flies the bearing model, the fisheye
+mask it fitted (for the original model, `OV_KB_BEARING=0` instead). Do not fly the package's
+two files as they are: since 2026-11-07 `config/flight_stiffness.env` switches the bearing
+model on, and `config/estimator_flight.yaml` holds the config's own mask (1.83 / 1.87), with
+which the model was never measured in flight. The tightened priors tether the online
+calibration to its published chain. With the five priors of the first rows, the flight
+settings until 2026-10-08, the package's config and priors (uniform, no per-vehicle tuning)
+produced 2.4–4.5 cm SE(3) ATE across an 11-flight, 3-vehicle benchmark.
 
 **Calibration** — `selfcalib/configs/estimator_calib.yaml` with the flight priors of
 `flight_stiffness.env` **unset**. Loose priors keep the calibration states mobile so the
@@ -74,13 +83,17 @@ warm-start iterations can converge away from the seed. Since 2026-10-14 `selfcal
 matching and the lens terms itself, at calibration values: `OV_XCAM=1`, `OV_XCAM_PRESET=rt`,
 `OV_NONRAD_SKEW_FIXED=1`, `OV_PRIOR_NONRAD_SIG=0.002` (ten times the flight value) and, on a
 desktop, `OV_GROUP_CAMS=1`; `--no-matching` and `--no-lens-terms` switch them off
-(`../selfcalib/README.md`).
+(`../selfcalib/README.md`). Since 2026-11-07 its passes also run the bearing measurement model
+(`OV_KB_BEARING=1 OV_BEARING_ALL=1 OV_BEARING_RANSAC=1`, section "Bearing measurement model")
+with a fisheye mask fitted to each lens's image circle; `--no-bearing` switches both off.
+Flight runs the same model with the mask of the pass the calibration published.
 
 The per-vehicle flight folder is produced by the self-calibration package, not written by
 hand — `selfcalib/tool/deploy_vio.py` copies this config next to the calibrated chains under
 the filenames the estimator resolves (`kalibr_imucam_chain.yaml`, `kalibr_imu_chain.yaml`),
-adds a copy of `flight_stiffness.env` that ends with the lens terms of that calibration, and
-verifies the result. See `../WORKFLOW.md`.
+writes into that copy the fisheye mask the calibration fitted (when the folder flies the
+bearing model), adds a copy of `flight_stiffness.env` that ends with the lens terms of that
+calibration, and verifies the result. See `../WORKFLOW.md`.
 
 ```bash
 # the flight settings, from a folder produced by deploy_vio.py (its copy also carries the
@@ -104,11 +117,14 @@ the calibration was made on. Without them the live node starts and receives noth
 replay writes no trajectory. `selfcalib` adds them for its own runs.
 
 A folder deployed before 2026-10-09 has no `flight_stiffness.env` of its own: deploy it again
-(`deploy_vio.py` on the same calibration output), or follow that folder's own MANIFEST.
+(`deploy_vio.py` on the same calibration output). Its own MANIFEST no longer applies: it sources
+`config/flight_stiffness.env`, which since 2026-11-07 switches the bearing model on, never
+measured with the config's mask such a folder holds. A folder deployed before 2026-11-07 does not
+set `OV_KB_BEARING` itself: fly it from a fresh shell, or deploy it again (`../WORKFLOW.md`, step 4).
 
 Rule of thumb: **calibrating → flight settings unset; flying → source them.**
 `run_serial.sh` passes your shell environment through, so check
-`env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD'` if a run behaves oddly — flight priors leaking
+`env | grep -E 'OV_PRIOR|OV_XCAM|OV_NONRAD|BEARING'` if a run behaves oddly — flight priors leaking
 into a calibration run pin the calibration at its seed. `run_tool.py` takes the flight
 priors out of its own calibration passes, puts the lens-term prior back to the calibration
 value, and says so; `run_serial.sh` used directly does not.
@@ -261,6 +277,91 @@ delays before are smaller than those the flights measured; the durations of the 
 are what compares. One run of 19:56 with the four lines, made while the Orin was busy with the
 system's update check after a boot, fell behind for 1.5 s, up to 403 ms; the same run on the
 idle Orin did not. No flight hovers longer than 3 s, and none was flown with the four lines.
+
+## Bearing measurement model
+
+The tracker stores every observation as pinhole coordinates (x/z, y/z) computed by
+`cv::fisheye::undistortPoints`, which clips the distorted angle at pi/2 (OpenCV 4.5.4): with
+the fleet's lenses every pixel more than about 86 deg from the optical axis is stored at 85-86
+deg, whatever its true direction, and pinhole coordinates cannot hold 90 deg or more at all.
+The tracker's RANSAC then drops most observations beyond 80 deg, and the lens model beyond
+about 86 deg is an extrapolation. `OV_KB_BEARING=1` uses observations as unit bearings computed
+from the raw pixel with the current calibration, predicted by a projection that accepts any
+direction the lens model covers, with exact Jacobians (`ov_core/src/cam/CamBase.h`,
+`CamEqui.h`; triangulation in `ov_core/src/feat/FeatureInitializer.cpp`; measurement rows in
+`ov_msckf/src/update/UpdaterHelper.cpp`; tracker RANSAC in `ov_core/src/track/TrackKLT.cpp`).
+
+| env var | what it does | calibration (`selfcalib`) | flight (`flight_stiffness.env`, since 2026-11-07) |
+|---|---|---|---|
+| `OV_KB_BEARING` | The bearing model. Without `OV_BEARING_ALL` it takes only the rim observations (beyond `OV_BEARING_SWITCH_DEG`). Unset, empty or `0` = off. | `1` | `1` |
+| `OV_BEARING_ALL` | Every observation through the bearing model, not only the rim ones. The measurement rows of the observations within 80 deg equal the original rows to float precision; their triangulation uses the bearings. Does nothing without `OV_KB_BEARING=1` (one warning). | `1` | `1` |
+| `OV_BEARING_RANSAC` | Tracker RANSAC with the model on: `1` = the shipped test for points within 80 deg in both images, a pixel-equivalent epipolar test on unit bearings for the others; `2` (the default when the model is on) = that test for every point; `0` = rim points are kept without a test. | `1` | `1` |
+| `OV_BEARING_SWITCH_DEG`, `OV_BEARING_ANCHOR_DEG`, `OV_BEARING_RIM_SIGMA`, `OV_BEARING_RANSAC_PX`, `OV_BEARING_SLAM_MAXDEG` | rim angle (80 deg), largest bearing of a feature's anchor observation (75 deg), noise multiplier of the rim rows (1), threshold of the bearing RANSAC test (2 px), largest bearing at which a SLAM landmark is re-anchored instead of marginalized (85 deg) | defaults | defaults |
+| `OV_BEARING_FORCE` | tests only: every row through the bearing split of the first-estimate Jacobians | unset | unset |
+
+All are off when unset, and the estimator's output is then byte-identical to the build without
+them (a calibration pass and a flight-configuration replay, checked on a desktop). The switch
+line `[bearing-cfg] on=1 ...` at start-up and the counters `[bearing]` / `[bearing-all]` at the
+end of `run.log` show that the model ran. Not supported with `OV_PREJAC=1` (the process ends with
+an error). With the model on the tracker's RANSAC is replaced as a whole, so `OV_RANSAC_OLDFIT`
+(campaign.env) does not run with it.
+
+Measured on the fleet's recordings (29 Oct 2026): in calibration, the lens model at 105-110 deg
+from the axis comes out 4.5-6.9 times more repeatable between starting values (0.6-0.8 px with
+90 s of flight, against 3.5-4.4 px), and the other numbers (camera geometry, stereo depth,
+tracking error of the calibrations, the convergence region) stay within the scatter of the
+estimator without it; of 90 calibrations from distant starting values the stopping rule ended
+87 at pass 2 and 3 at pass 3 (without it: 90 at pass 2). A pass takes about 4 % longer on the Orin NX
+(66 instead of 63 s for 90 s of flight).
+
+**In flight (since 2026-11-07).** `flight_stiffness.env` sets the three switches, and
+`deploy_vio.py` writes into the flight folder's `estimator_flight.yaml` the fisheye mask the
+calibration fitted to each lens: the mask of the pass it published (`report.json` `w_mask`;
+`../selfcalib/README.md`, "Bearing model and fitted fisheye mask"). The mask goes with the model:
+the config's disk (`mask_fisheye_theta_max` 1.83, camera 3 1.87) ends at or beyond the edge of the
+bright image circle, whose outermost pixels the model would use; on the fleet the fitted disk is
+3-13 px narrower in radius. The model flies only with the fitted mask, unchanged: the combination
+measured below. Every other case is deployed with the original model and the config's mask: a
+calibration made without the model (`--no-bearing`, or by `selfcalib` before 2026-11-07) and,
+with a WARNING, one whose fitted mask cannot fly as it is (its estimator did not run the model,
+its published pass kept the config's mask, or the flight config does not draw the disk itself,
+keys its cameras differently or has a disk narrower than the fitted one). `--frozen-check` of
+`selfcalib` flies a calibration the same way.
+
+Measured on the Orin NX in real time (7 Nov 2026; replay runner with `OV_REALTIME=1`, the
+vehicle's GPU tracker and `campaign.env`, GPU at 612 MHz): the same 90 s calibration per vehicle,
+flown with and without the model, on 11 recordings of the three vehicles (the calibration's own
+and held-out ones), three runs each. Tracking error is the RMS position error after a rigid fit
+to motion capture, while airborne. Times are pooled over every set of images after the first 2 s.
+
+| | original model | bearing model + fitted mask |
+|---|---|---|
+| tracking error, mean of the 11 flights | 3.73 cm | 3.69 cm (difference −0.04 cm, 95 % interval −0.35 to +0.28) |
+| runs above 6 cm; runs that failed | 0 and 0 of 33 | 0 and 0 of 33 |
+| time per set of images, mean / 99th percentile | 8.82 / 12.03 ms | 9.67 / 16.68 ms (+10 % / +39 %) |
+| the same on the three 15 Hz recordings, mean | 8.88 ms | 10.23 ms (+15 %) |
+| delay from the images to the filter, median / 99th percentile | 16.6 / 22.9 ms | 17.4 / 25.9 ms |
+| CPU of the estimator | 0.61 cores | 0.66 cores (+8 %) |
+| live node (one run each, nxt3): images complete → pose published, median / 99th percentile | 53.4 / 68.3 ms | 54.7 / 72.6 ms |
+
+No set of images was dropped in either model (the same sets were throttled by `track_frequency`
+in both). Leaving out the first 2 s and the sets stamped after the IMU file ends (replay
+artifacts), no set reached the filter more than 100 ms after its images, and more than 34.5 ms
+after them 0.21 % of the sets without the model and 0.31 % with it (at 30 Hz 0.09 % and
+0.12 %). The run-to-run scatter of one flight's tracking
+error is 0.5 cm, and the per-flight differences (−0.94 to +0.43 cm, mean of three runs each) are
+consistent with that scatter alone (chi-square p 0.18). Not covered: calibrations from
+short flights in real time (in the offline replays of 29 Oct, six of 240 runs with 10-30 s
+calibrations of one vehicle ended at 6.1-6.8 cm against one without the model), a real flight,
+and the cost of each switch on its own.
+
+To fly the original model, deploy the calibration with `OV_KB_BEARING=0` exported, or
+`deploy_vio.py --no-bearing`: the folder then holds the config's own mask and its
+`flight_stiffness.env` sets `OV_KB_BEARING=0`, and its flight is byte-identical to that of a
+folder deployed before 2026-11-07 (deterministic replays on a desktop, three vehicles).
+`OV_KB_BEARING=0` exported after sourcing a folder deployed with the model switches the model
+off but keeps the fitted mask: that is not the original flight. An estimator built before
+commit 250f9f2 ignores the three variables.
 
 ## Calibration switches
 

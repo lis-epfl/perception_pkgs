@@ -10,7 +10,10 @@ all of it. The image pass (image-center prior, image check) reads this data up t
 point, focal length, mean distortion, rotation, translation, t_d) moved by more than twice the
 full-flight envelope since pass k-1; at most --max-pass (16) passes. The published calibration is
 that last pass. Since 2026-10-14 the passes match features between neighbouring cameras and
-estimate two more lens terms per camera by default (--no-matching, --no-lens-terms).
+estimate two more lens terms per camera by default (--no-matching, --no-lens-terms). Since
+2026-11-07 they run the bearing measurement model, with a fisheye mask fitted to the lens's
+image circle (--no-bearing), and so does flight: deploy_vio.py writes the mask of the published
+pass into the flight folder, and --frozen-check flies the calibration the same way.
 
 Usage:
   python3 run_tool.py --drone nxt3 --bag bags/nxt3_raw_4cam_basin \
@@ -34,6 +37,7 @@ from bagio import Recording
 from chainio import parse_chain, write_chain, cams_from_caljson, calib_residual, step_types
 from gates import static_start_gate, timing_gate
 from circlefit import image_pass, usable_cpus, radii_from_chain, radii_from_fleet
+from wmask import w_mask, apply_lines, flight_mask
 from publish import robust_mean, chordal_mean
 from diagnose import fleet_stats, fleet_members, diagnose
 import gtdetect
@@ -154,6 +158,20 @@ def _config_wants_series(cfg_path):
 FLIGHT_MATCHING = ('OV_XCAM', 'OV_XCAM_PRESET')
 CALIB_MATCHING = (('OV_XCAM', '1'), ('OV_XCAM_PRESET', 'rt'))
 CALIB_LENS = (('OV_PRIOR_NONRAD_SIG', '0.002'), ('OV_NONRAD_SKEW_FIXED', '1'))
+# Since 2026-11-07 the calibration passes also run the bearing measurement model (estimator switch OV_KB_BEARING, for every
+# observation, with the shipped RANSAC below 80 deg) and a fisheye mask fitted to the lens's image circle (wmask.py): together
+# the configuration "E1W" of the rerun of 29 Oct 2026. --no-bearing, or OV_KB_BEARING=0 in the caller's environment, switches
+# both off. Flight runs the model too, since the same day: flight_stiffness.env sets these three variables, and a calibration
+# made with the model is flown with the mask of the pass it published, as fitted (deploy_vio.py writes it into the flight
+# folder; frozen_pass() flies the calibration the same way). A calibration made without the model is flown without it, and so
+# is one whose fitted mask cannot fly as it is (flight_model(), with a WARNING): the original model, the config's own mask.
+# README, "Bearing model and fitted fisheye mask".
+CALIB_BEARING = (('OV_KB_BEARING', '1'), ('OV_BEARING_ALL', '1'), ('OV_BEARING_RANSAC', '1'))
+
+
+def _is_bearing_var(k):
+    """an environment variable of the bearing model (OV_KB_BEARING and its sub-switches OV_BEARING_*)"""
+    return k == 'OV_KB_BEARING' or k.startswith('OV_BEARING_')
 
 
 def _env_file(path):
@@ -185,16 +203,19 @@ def _number(s):
 
 def _flight_settings(vio_root):
     """What flight_stiffness.env sets -> (OV_PRIOR_NONRAD_SIG as a float or None, [(name, value)] of its lines that are not
-    priors: today the held third lens term and the matching between cameras)."""
+    priors: today the held third lens term, the matching between cameras and the limits for slow flight). The bearing model's
+    lines are left out: the calibration passes set the same values themselves (CALIB_BEARING), so they tell nothing about
+    where a shell's settings came from."""
     try:
         fl = _env_file(os.path.join(vio_root, 'vio_deploy', 'config', 'flight_stiffness.env'))
     except OSError:
         return None, []
-    return _number(fl.get('OV_PRIOR_NONRAD_SIG')), [(k, v) for k, v in fl.items() if not k.startswith('OV_PRIOR')]
+    return _number(fl.get('OV_PRIOR_NONRAD_SIG')), [(k, v) for k, v in fl.items()
+                                                    if not k.startswith('OV_PRIOR') and not _is_bearing_var(k)]
 
 
 def _calib_pass_env(environ, campaign, flight_sig, flight_rest=(), lens=True, matching=True, group=True,
-                    lens_why='--no-lens-terms'):
+                    lens_why='--no-lens-terms', bearing=True, bearing_why='--no-bearing'):
     """Environment of the calibration passes: the caller's environment, the calibration's own switches and the campaign
     switches, without what belongs to flight.
 
@@ -206,6 +227,8 @@ def _calib_pass_env(environ, campaign, flight_sig, flight_rest=(), lens=True, ma
                  which, for the warnings)
     matching     False (--no-matching): the passes do not match between cameras
     group        False when the passes run stereo (--calib-stereo true), where the cameras cannot be grouped
+    bearing      False: the passes run without the bearing model (--no-bearing, or a rig it is not made for: bearing_why says
+                 which, for the warnings)
     Returns (env, lens_sig, warnings, unset): lens_sig is the OV_PRIOR_NONRAD_SIG the passes run with (None = they estimate
     no lens terms), warnings the lines to print, unset the names taken out of the caller's environment (a flight lens prior
     that the calibration value replaces is not in it). Raises ValueError when OV_PRIOR_NONRAD_SIG is set to something that
@@ -218,8 +241,11 @@ def _calib_pass_env(environ, campaign, flight_sig, flight_rest=(), lens=True, ma
     Matching (default ON for mono passes): OV_XCAM = 1 and OV_XCAM_PRESET = rt unless the caller set them; OV_XCAM set to
     anything that does not start with 1 switches it off. It runs only where the four images reach the estimator as one set:
     OV_GROUP_CAMS = 1 is added when the caller and campaign.env leave it unset and the passes run mono.
+    Bearing model (default ON): OV_KB_BEARING = 1, OV_BEARING_ALL = 1 and OV_BEARING_RANSAC = 1 unless the caller set them;
+    OV_KB_BEARING set to anything but 1 switches it off (the estimator reads only "1" as on).
     Taken out:
       - every OV_PRIOR_* of the flight stiffness (they would pin the calibration at its seed).
+      - when the bearing model is off, OV_KB_BEARING and every OV_BEARING_* (they would be read by the estimator as given).
       - when the lens terms are off, OV_PRIOR_NONRAD_SIG; with --no-matching, OV_XCAM and OV_XCAM_PRESET; in stereo, the
         matching that came with the flight settings.
       - OV_NONRADIAL (lens terms as given values). It stays only as the start of pass 1 when the caller exported a
@@ -289,6 +315,17 @@ def _calib_pass_env(environ, campaign, flight_sig, flight_rest=(), lens=True, ma
         env.setdefault('OV_XCAM_PRESET', dict(CALIB_MATCHING)['OV_XCAM_PRESET'])
         if group and 'OV_GROUP_CAMS' not in env and 'OV_GROUP_CAMS' not in campaign:
             env['OV_GROUP_CAMS'] = '1'      # the matching needs the four images as one set (campaign.env sets it on the vehicle)
+    if bearing:
+        for k, v in CALIB_BEARING:
+            env.setdefault(k, v)
+    else:
+        gone_b = sorted(k for k in env if _is_bearing_var(k))
+        for k in gone_b:
+            del env[k]
+        unset += gone_b
+        if [k for k in gone_b if not (k == 'OV_KB_BEARING' and environ[k] != '1')]:    # not for the caller's own OV_KB_BEARING=0
+            warnings.append('%s in the environment, but the calibration passes run without the bearing model (%s): unset for '
+                            'them.' % (','.join(gone_b), bearing_why))
     if 'OV_NONRADIAL' in env and (not own_sig or flight_shell):
         if env['OV_NONRADIAL'].strip():
             unset.append('OV_NONRADIAL')
@@ -319,14 +356,50 @@ def _matched_sets(run_log):
     return int(hits[-1]) if hits else 0
 
 
-def _flight_check_env(vio_root, a, nonradial=None, group=False):
+def _bearing_ran(run_log):
+    """Did the estimator run the bearing model? True when its log has the "[bearing-cfg] on=1" line it prints when it reads
+    OV_KB_BEARING=1, False when not (an estimator built before the model, or the switch not read), None when the log cannot
+    be read."""
+    try:
+        return '[bearing-cfg] on=1' in open(run_log, errors='replace').read()
+    except OSError:
+        return None
+
+
+def flight_model(vio_root, report, cams):
+    """The measurement model a calibration flies with, as deploy_vio.py deploys it and --frozen-check flies it (unless the
+    original model is asked for: deploy_vio.py --no-bearing or OV_KB_BEARING other than 1 at deploy) -> (lines, why, fix).
+    lines: the bearing model flies, with this fisheye mask (the one of the published pass, exactly as fitted) written into
+    the flight config. None: the ORIGINAL model flies, with the flight config's own mask, and why says why: the calibration
+    ran without the model (fix None: the flight runs the model the calibration ran), the vio package's flight_stiffness.env
+    does not switch it on (fix None), or the fitted mask cannot fly as it is (wmask.flight_mask; fix says what would let it:
+    deploy_vio.py and the tool then WARN). Only the combination measured in flight, the bearing model with the mask the
+    calibration fitted, ever flies the model. Raises ValueError when report.json's record of the mask is malformed."""
+    if 'w_mask' not in report:
+        return None, 'the calibration ran without it: report.json has no w_mask (a calibration by the tool before 2026-11-07)', None
+    if report['w_mask'] is None:
+        return None, ('the calibration ran without it: report.json w_mask is null (--no-bearing, OV_KB_BEARING=0, cameras other '
+                      'than Kannala-Brandt, or stereo passes)'), None
+    cfgdir = os.path.join(vio_root, 'vio_deploy', 'config')
+    if _env_file(os.path.join(cfgdir, 'flight_stiffness.env')).get('OV_KB_BEARING') != '1':
+        return None, ('the vio package\'s flight_stiffness.env does not switch it on (%s)'
+                      % os.path.join(cfgdir, 'flight_stiffness.env')), None
+    return flight_mask(report, open(os.path.join(cfgdir, 'estimator_flight.yaml')).read(), sorted(cams))
+
+
+def _flight_check_env(vio_root, a, nonradial=None, group=False, bearing=False):
     """Environment of the flight check: the caller's, plus campaign.env on the vehicle, plus every line of
     flight_stiffness.env. The lens terms it starts from are those of THIS calibration, or none (zero): never what the
-    caller's shell or a file holds. group: the tool grouped the cameras of the calibration passes itself (a desktop, or
-    --no-campaign-env), so the flight check groups them too and matches as the passes did."""
-    env = dict(os.environ)
+    caller's shell or a file holds. The bearing model's variables of the caller are left out: the flight runs the model as
+    flight_stiffness.env sets it when bearing (deploy_vio.py's folder of a calibration made with the model, whose fitted mask
+    flies as it is), and without it otherwise (flight_model(): a calibration made without the model, or one whose fitted
+    mask cannot fly as it is, flown as deploy_vio.py flies it).
+    group: the tool grouped the cameras of the calibration passes itself (a desktop, or --no-campaign-env), so the flight
+    check groups them too and matches as the passes did."""
+    env = {k: v for k, v in os.environ.items() if not _is_bearing_var(k)}   # the model only as the flight settings set it
     env.update(_campaign_env(vio_root, not getattr(a, 'no_campaign_env', False))[0])
-    env.update(_env_file(os.path.join(vio_root, 'vio_deploy', 'config', 'flight_stiffness.env')))
+    env.update({k: v for k, v in _env_file(os.path.join(vio_root, 'vio_deploy', 'config', 'flight_stiffness.env')).items()
+                if bearing or not _is_bearing_var(k)})
     env.pop('OV_NONRADIAL', None)
     if nonradial:
         env['OV_NONRADIAL'] = nonradial
@@ -427,7 +500,8 @@ def _redirect_scratch(cfg_txt, dirpath):
     return cfg_txt
 
 
-def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s, nonradial=None, group=False):
+def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_s, nonradial=None, group=False, bearing=False,
+                mask_lines=None):
     """Run the published calibration under the FLIGHT config, exactly as it will be deployed.
 
     This is what the ATE certificate must measure. The warm-start passes run the
@@ -447,9 +521,11 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     the documented flight invocation.
 
     The environment is the caller's, plus campaign.env on the vehicle, plus every line of flight_stiffness.env: the stiff
-    priors, the two lens terms as states and the matching between cameras. On a desktop there is no campaign.env, so the
-    CPU tracker runs, and the matching runs only if the caller exported OV_GROUP_CAMS=1. The lens terms start at those of
-    this calibration, or at zero when it has none.
+    priors, the two lens terms as states, the matching between cameras, the limits for slow flight and, with bearing, the
+    bearing model. On a desktop there is no campaign.env, so the CPU tracker runs, and the matching runs only if the caller
+    exported OV_GROUP_CAMS=1. The lens terms start at those of this calibration, or at zero when it has none. mask_lines:
+    the fisheye mask written into the flight config (flight_model(): the one of the published pass, as fitted), as
+    deploy_vio.py writes it; None = the config's own, with the original model.
 
     Returns the trajectory path. Raises on any failure -- the caller degrades honestly.
     """
@@ -462,12 +538,15 @@ def frozen_pass(vio_root, run_serial, a, published_chain, outdir, ncam, timeout_
     os.makedirs(outdir, exist_ok=True)
     # The flight config resolves its chains by RELATIVE name, so they must sit beside the copy.
     rec = Recording.open(a.bag)
+    ftxt = open(fcfg).read()
+    if mask_lines:
+        ftxt = apply_lines(ftxt, mask_lines)
     open(f'{outdir}/estimator_flight.yaml', 'w').write(
-        _inject_window(_inject_layout(_redirect_scratch(open(fcfg).read(), outdir), rec), a.window))
+        _inject_window(_inject_layout(_redirect_scratch(ftxt, outdir), rec), a.window))
     shutil.copy(a.imu_chain, f'{outdir}/kalibr_imu_chain.yaml')
     shutil.copy(published_chain, f'{outdir}/kalibr_imucam_chain.yaml')
 
-    env = _flight_check_env(vio_root, a, nonradial, group)
+    env = _flight_check_env(vio_root, a, nonradial, group, bearing)
     bag_arg = ','.join(rec.uris)
     cp = subprocess.run(['bash', run_serial, bag_arg, f'{outdir}/estimator_flight.yaml',
                          f'{outdir}/out', str(ncam), 'false', '42', str(a.domain)],
@@ -526,6 +605,16 @@ def main():
                          'exporting OV_PRIOR_NONRAD_SIG=0 does the same. Off by itself for a template whose '
                          'cameras are not Kannala-Brandt. With both switches, a run in a shell that sets none of '
                          'these variables is the default run of the tool before 2026-10-14.')
+    ap.add_argument('--no-bearing', action='store_true',
+                    help='calibration passes without the bearing measurement model and with the config\'s own fisheye '
+                         'mask, as before 2026-11-07. By default the passes run the model (OV_KB_BEARING=1 '
+                         'OV_BEARING_ALL=1 OV_BEARING_RANSAC=1) with a mask fitted to each camera\'s image circle '
+                         '(README, "Bearing model and fitted fisheye mask"); exporting OV_KB_BEARING=0 does the same as '
+                         'this switch. Off by '
+                         'itself for a template whose cameras are not Kannala-Brandt, and for stereo passes. Flight '
+                         'runs the model the calibration ran: a calibration made without it is deployed without it '
+                         '(deploy_vio.py), and so is one whose fitted mask cannot fly as it is (a WARNING); '
+                         '--frozen-check flies it so.')
     ap.add_argument('--max-pass', type=int, default=16,
                     help='cap on estimator passes (paper: 16). The stopping rule needs at least two.')
     ap.add_argument('--domain', type=int, default=70)
@@ -588,7 +677,10 @@ def main():
                          'exactly: the stiffness priors and, since 2026-10-09, the lens terms as '
                          'states and the matching between cameras (the matching only where the '
                          'cameras are grouped: on the vehicle, on a desktop when the calibration passes '
-                         'matched, or with OV_GROUP_CAMS=1).')
+                         'matched, or with OV_GROUP_CAMS=1); since 2026-11-07 the bearing model with the '
+                         'fisheye mask of the published pass, as deploy_vio.py deploys the calibration '
+                         '(the original model when the passes ran without it, or when that mask cannot fly '
+                         'as it is).')
     ap.add_argument('--cam-end', type=float, default=None)
     ap.add_argument('--pass-timeout', type=float, default=None,
                     help='seconds per estimator pass (default: 20x bag duration, min 1800)')
@@ -632,16 +724,36 @@ def main():
     _lens_why = ('--no-lens-terms' if a.no_lens_terms else None if _models == ['equidistant'] else
                  'camera model %s: the lens terms exist for Kannala-Brandt (equidistant) cameras only'
                  % (','.join(_models) or 'not found in --template'))
+    # The bearing model: on by default for monocular passes of Kannala-Brandt cameras (the configuration it was tested in).
+    if a.no_bearing:
+        _bearing_why = '--no-bearing'
+    elif os.environ.get('OV_KB_BEARING', '1') != '1':
+        _bearing_why = 'OV_KB_BEARING=%s in the environment' % os.environ['OV_KB_BEARING']
+    elif _models != ['equidistant']:
+        _bearing_why = ('camera model %s: the bearing model is made for Kannala-Brandt (equidistant) cameras'
+                        % (','.join(_models) or 'not found in --template'))
+    elif a.calib_stereo == 'true':
+        _bearing_why = 'stereo passes (--calib-stereo true): the bearing model was tested on monocular passes only'
+    else:
+        _bearing_why = None
     try:
         _pass_env, _lens_sig, _warn, _unset = _calib_pass_env(os.environ, _campaign, *_flight_settings(vio_root),
                                                               lens=_lens_why is None, matching=not a.no_matching,
                                                               group=a.calib_stereo != 'true',
-                                                              lens_why=_lens_why or '--no-lens-terms')
+                                                              lens_why=_lens_why or '--no-lens-terms',
+                                                              bearing=_bearing_why is None,
+                                                              bearing_why=_bearing_why or '--no-bearing')
     except ValueError as e:
         log('ERROR: %s' % e)
         return 6
     for _w in _warn:
         log('WARNING: ' + _w)
+    if (_bearing_why or '').startswith('OV_KB_BEARING=') and any(k.startswith('OV_PRIOR') and k != 'OV_PRIOR_NONRAD_SIG'
+                                                                 for k in os.environ):
+        # a flight folder deployed for the original model sets OV_KB_BEARING=0 (deploy_vio.py --no-bearing)
+        log('WARNING: OV_KB_BEARING=%s in the environment together with flight priors: probably the flight_stiffness.env of a '
+            'folder deployed without the bearing model. The calibration passes run without the model; unset OV_KB_BEARING '
+            'for the default.' % os.environ['OV_KB_BEARING'])
     # The estimator matches between cameras only when the four images reach it as one set and are tracked singly.
     _xcam = _pass_env.get('OV_XCAM', '')[:1] == '1'
     _matching = _xcam and _pass_env.get('OV_GROUP_CAMS', '')[:1] == '1' and a.calib_stereo != 'true'
@@ -655,11 +767,17 @@ def main():
     # The tool grouped the cameras itself (a desktop, or --no-campaign-env): the flight check then groups them as well.
     _tool_grouped = 'OV_GROUP_CAMS' in _pass_env and 'OV_GROUP_CAMS' not in os.environ and 'OV_GROUP_CAMS' not in _campaign
     _start_env = bool(_lens_sig) and bool(_pass_env.get('OV_NONRADIAL', '').strip())
-    log('calibration passes: matching between cameras %s, lens terms %s'
+    _bearing = _pass_env.get('OV_KB_BEARING', '') == '1'
+    log('calibration passes: matching between cameras %s, lens terms %s, bearing model %s'
         % ('ON' if _matching else 'off', ('estimated with prior %s, starting at %s' % (
-            _lens_sig, 'the values of OV_NONRADIAL in the environment' if _start_env else 'zero')) if _lens_sig else 'not estimated'))
+            _lens_sig, 'the values of OV_NONRADIAL in the environment' if _start_env else 'zero')) if _lens_sig else 'not estimated',
+           ('ON (%s), fisheye mask fitted to the image circle' % ' '.join('%s=%s' % (k, _pass_env[k]) for k in sorted(_pass_env)
+                                                                         if _is_bearing_var(k))) if _bearing else
+           'off (%s)' % (_bearing_why or 'OV_KB_BEARING=%s' % _pass_env.get('OV_KB_BEARING', ''))))
     report['calib_passes'] = {'matching_between_cameras': _matching, 'lens_terms_prior': float(_lens_sig) if _lens_sig else None,
                               'lens_terms_start': ('environment' if _start_env else 'zero') if _lens_sig else None,
+                              'bearing_model': ({k: _pass_env[k] for k in sorted(_pass_env) if _is_bearing_var(k)}
+                                                if _bearing else None),
                               'unset_from_environment': _unset}
 
     # ---- 0. ground truth: explicit --gt wins, else look for a mocap stream in the bag ----
@@ -754,21 +872,25 @@ def main():
     _fleet = [parse_chain(f'{OVR}/fleet_reference/{d}/theta_star.yaml')[0] for d in _members if d != a.fleet_exclude]
     radii = radii_from_fleet(_fleet) if _fleet else radii_from_chain(tmpl_cams)
 
+    _means = {}           # mean image per camera of the image pass: the bearing passes fit their fisheye mask on them
+
     def _image_pass(window):
         nonlocal _iproc
         log('image pass: activity/mask/gradient accumulation (%s, %d process%s)'
             % ('the window' if window == a.window else 'the first %.2f s: takeoff + %g s' % (window, a.image_after_takeoff),
                _iproc, '' if _iproc == 1 else 'es'))
         rec, t0 = (_wrec if window == a.window else Recording.open(a.bag, window=window)), time.time()
+        _means.clear()
         try:
-            res = image_pass(rec, radii, cams=cam_ids, processes=_iproc, scratch=a.out)
+            res = image_pass(rec, radii, cams=cam_ids, processes=_iproc, scratch=a.out, means=_means)
         except (RuntimeError, OSError) as e:
             if _iproc == 1:
                 raise
             log('WARNING: image pass with %d processes failed (%s) — repeating it in this process'
                 % (_iproc, (str(e).strip().splitlines() or [type(e).__name__])[-1][:200]))
             _iproc = 1
-            res = image_pass(rec, radii, cams=cam_ids, processes=1)
+            _means.clear()
+            res = image_pass(rec, radii, cams=cam_ids, processes=1, means=_means)
         log('image pass: %.1f s' % (time.time() - t0))
         return res
 
@@ -849,6 +971,10 @@ def main():
     cfg_txt = _override_track_frequency(
         _inject_window(_inject_layout(cfg_txt, _rec), a.window), a.track_frequency)
     open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
+    # With the bearing model each pass gets the fisheye mask fitted to the image circle around the principal points of the
+    # calibration it starts from (wmask.py): the seed for pass 1, the previous pass after that. The config's own mask stays when
+    # no circle is found (another lens), the config does not draw the disk itself, or the bearing model is off.
+    report['w_mask'] = {'passes': []} if _bearing else None
     shutil.copy(a.imu_chain, f'{rd}/kalibr_imu_chain.yaml')
     write_chain(a.template, seed, seed_toff, f'{rd}/kalibr_imucam_chain.yaml')
 
@@ -874,6 +1000,22 @@ def main():
             _env = dict(_pass_env)
             if _nonrad:
                 _env['OV_NONRADIAL'] = _nonrad      # lens terms of the previous pass (estimator built with the non-radial patch)
+            if _bearing:
+                try:
+                    _start, _ = parse_chain(f'{rd}/kalibr_imucam_chain.yaml')
+                    wm = w_mask(_means, {c: _start[c]['f'] for c in _start}, cfg_txt)
+                except Exception as e:          # the fit must never stop a calibration: the config's mask then stays
+                    wm = {'lines': None, 'reason': 'the fit failed (%s: %s)' % (type(e).__name__, str(e)[:200])}
+                wm['pass'] = p
+                report['w_mask']['passes'].append(wm)
+                if wm['lines']:
+                    open(f'{rd}/estimator_config.yaml', 'w').write(apply_lines(cfg_txt, wm['lines']))
+                    log('  fisheye mask (fitted to the image circle around the principal points of the %s): %s; binding camera %s'
+                        % ('seed' if p == 1 else 'calibration of pass %d' % (p - 1),
+                           ', '.join('%s %.6f' % kv for kv in sorted(wm['lines'].items())), wm.get('binding_camera')))
+                else:
+                    open(f'{rd}/estimator_config.yaml', 'w').write(cfg_txt)
+                    log('  %sfisheye mask of the config kept: %s' % ('WARNING: ' if p == 1 else '', wm['reason']))
             cp = subprocess.run(['bash', run_serial, ','.join(_rec.uris),
                                  f'{rd}/estimator_config.yaml', f'{rd}/out', str(ncam), a.calib_stereo,
                                  '42', str(a.domain)], capture_output=True, timeout=timeout_s, env=_env)
@@ -932,6 +1074,12 @@ def main():
         log('WARNING: the matching between cameras was asked for, but the estimator matched on no set of images in the last '
             'pass (an estimator built before commit 6bbaf8c? Rebuild it).')
     report['calib_passes']['lens_terms_estimated'] = bool(_nonrad) if _lens_sig else None
+    if _bearing:
+        _bran = _bearing_ran(os.path.join(rd, 'out', 'run.log'))
+        report['calib_passes']['bearing_model_ran'] = _bran
+        if _bran is False:
+            log('WARNING: the bearing model was asked for, but the estimator did not report it in the last pass (an estimator '
+                'built before the commit that added it? Rebuild it).')
     if _lens_sig and not _nonrad:
         log('WARNING: the lens terms were asked for, but the estimator reported none: the chain is published without them '
             '(an estimator built before commit 6bbaf8c? Rebuild it).')
@@ -991,18 +1139,37 @@ def main():
     if a.gt and frozen:
         fd = os.path.join(a.out, 'deploy_check')
         try:
-            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad, group=_tool_grouped)
+            # The measurement model of the flight, as deploy_vio.py deploys this calibration (flight_model(), the same decision):
+            # the bearing model when the passes ran it, flight_stiffness.env switches it on and the fisheye mask of the published
+            # pass flies as it is in the flight config; else the original model and the config's own mask, with a WARNING when
+            # the passes ran the model (only the bearing model with the fitted mask was measured in flight).
+            _fmask, _foff, _ffix = flight_model(vio_root, report, tmpl_cams)
+            _fbear = _fmask is not None
+            if _ffix:
+                log('WARNING: deployment check: the ORIGINAL model, without the bearing model, because %s. The bearing model flies '
+                    'only with the fisheye mask the calibration fitted, as it is (the combination measured in flight), and '
+                    'deploy_vio.py deploys this calibration with the original model too. To fly the bearing model: %s.'
+                    % (_foff, _ffix))
+            est_cert = frozen_pass(vio_root, run_serial, a, pub, fd, ncam, timeout_s, nonradial=_nonrad, group=_tool_grouped,
+                                   bearing=_fbear, mask_lines=_fmask)
             cert_kind = 'frozen-deployment'
-            _fenv = _flight_check_env(vio_root, a, _nonrad, _tool_grouped)
+            _fenv = _flight_check_env(vio_root, a, _nonrad, _tool_grouped, _fbear)
             _fsets = _matched_sets(os.path.join(fd, 'out', 'run.log'))
-            log('deployment check: flight config + flight_stiffness.env over the same recording (matching between cameras %s)'
+            log('deployment check: flight config + flight_stiffness.env over the same recording (matching between cameras %s; '
+                'bearing model %s)'
                 % (('ON, %d sets of images' % _fsets) if _fsets else
                    'OFF: asked for, but the images reach the estimator one camera at a time here; on the vehicle campaign.env '
                    'groups them, on a desktop the tool groups them unless --no-matching, or export OV_GROUP_CAMS=1' if _fenv.get('OV_XCAM', '')[:1] == '1' and
-                   _fenv.get('OV_GROUP_CAMS', '')[:1] != '1' else 'OFF'))
+                   _fenv.get('OV_GROUP_CAMS', '')[:1] != '1' else 'OFF',
+                   ('ON, fisheye mask of the published pass: %s' % ', '.join('%s %s' % (k, ('%.6f' % v).rstrip('0').rstrip('.'))
+                                                                              for k, v in sorted(_fmask.items()))) if _fbear else
+                   'off (%s), the flight config\'s own fisheye mask' % _foff))
             report['deploy_check'] = {'matched_sets_of_images': _fsets,
                                       'lens_terms_prior': _number(_fenv.get('OV_PRIOR_NONRAD_SIG')),
-                                      'lens_terms_start': 'this calibration' if _nonrad else 'zero'}
+                                      'lens_terms_start': 'this calibration' if _nonrad else 'zero',
+                                      'bearing_model': _fbear, 'fisheye_mask': _fmask,
+                                      'bearing_model_off': _foff,
+                                      'bearing_model_ran': _bearing_ran(os.path.join(fd, 'out', 'run.log'))}
         except Exception as e:
             rl = os.path.join(fd, 'out', 'run.log')
             log('deployment check FAILED (%s: %s) — falling back to the calibration-pass '

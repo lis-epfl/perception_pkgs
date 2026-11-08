@@ -23,6 +23,9 @@
 
 #include "UpdaterHelper.h"
 
+#include <algorithm>
+#include <vector>
+
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
 #include "state/State.h"
@@ -87,6 +90,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
     // Clean the feature
     (*it0)->clean_old_measurements(clonetimes);
+
+    // OV_KB_BEARING: observations without a bearing under the current calibration are erased (rim ones; every one with
+    // OV_BEARING_ALL=1)
+    if (ov_core::CamBase::kb_bearing())
+      FeatureInitializer::bearing_clean(**it0, state->_cam_intrinsics_cameras);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -240,6 +248,9 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     bool _ok; { VPROF("5.slam_delayed/c_state_initialize");
     _ok = StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler); }
+    if (ov_core::CamBase::kb_bearing() && FeatureInitializer::count_rim(**it2) > 0) // OV_KB_BEARING statistics
+      (_ok ? ov_core::CamBase::bearing_stats().slam_init_rim_ok : ov_core::CamBase::bearing_stats().slam_init_rim_fail)
+          .fetch_add(1, std::memory_order_relaxed);
     if (_ok) {
       ov_msckf::g_slam_init_ok.fetch_add(1, std::memory_order_relaxed);
       state->_features_SLAM.insert({(*it2)->featid, landmark});
@@ -286,6 +297,11 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
 
     // Clean the feature
     (*it0)->clean_old_measurements(clonetimes);
+
+    // OV_KB_BEARING: observations without a bearing under the current calibration are erased (rim ones; every one with
+    // OV_BEARING_ALL=1)
+    if (ov_core::CamBase::kb_bearing())
+      FeatureInitializer::bearing_clean(**it0, state->_cam_intrinsics_cameras);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -433,6 +449,9 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     double chi2_multipler =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     double chi2_thr = chi2_multipler * chi2_check;
+    if (ov_core::CamBase::kb_bearing() && FeatureInitializer::count_rim(**it2) > 0) // OV_KB_BEARING statistics
+      (chi2 > chi2_thr ? ov_core::CamBase::bearing_stats().slam_rim_chi2 : ov_core::CamBase::bearing_stats().slam_rim_used)
+          .fetch_add(1, std::memory_order_relaxed);
     if (chi2 > chi2_thr) {
       if ((int)feat.featid < state->_options.max_aruco_features) {
         PRINT_WARNING(YELLOW "[SLAM-UP]: rejecting aruco tag %d for chi2 thresh (%.3f > %.3f)\n" RESET, (int)feat.featid, chi2, chi2_thr);
@@ -516,6 +535,8 @@ void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
   // NOTE: for now we have anchor the feature in the same camera as it is before
   // NOTE: this also does not change the representation of the feature at all right now
   double marg_timestep = state->margtimestep();
+  const bool kbb = ov_core::CamBase::kb_bearing();
+  std::vector<size_t> to_marg;
   for (auto &f : state->_features_SLAM) {
     // Skip any features that are in the global frame
     if (f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_3D ||
@@ -524,8 +545,68 @@ void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
     // Else lets see if it is anchored in the clone that will be marginalized.
     assert(marg_timestep <= f.second->_anchor_clone_timestamp);
     if (f.second->_anchor_clone_timestamp == marg_timestep) {
-      perform_anchor_change(state, f.second, state->_timestamp, f.second->_anchor_cam_id);
+      if (!kbb) {
+        perform_anchor_change(state, f.second, state->_timestamp, f.second->_anchor_cam_id);
+        continue;
+      }
+      // OV_KB_BEARING: the inverse-depth anchor (x/z, y/z, 1/z) is singular at 90 deg from the anchor axis. Keep the
+      // same camera while the landmark is within OV_BEARING_ANCHOR_DEG of its axis at the newest clone; otherwise move the anchor to
+      // the camera that sees it closest to its axis; if even that one is beyond OV_BEARING_SLAM_MAXDEG, marginalize the landmark.
+      const ov_core::CamBase::BearingCfg &bcfg = ov_core::CamBase::bearing_cfg();
+      ov_core::CamBase::BearingStats &bst = ov_core::CamBase::bearing_stats();
+      std::shared_ptr<Landmark> lm = f.second;
+      const Eigen::Matrix3d R_GtoIa = state->_clones_IMU.at(lm->_anchor_clone_timestamp)->Rot();
+      const Eigen::Vector3d p_IainG = state->_clones_IMU.at(lm->_anchor_clone_timestamp)->pos();
+      const Eigen::Matrix3d R_ItoCa = state->_calib_IMUtoCAM.at(lm->_anchor_cam_id)->Rot();
+      const Eigen::Vector3d p_IinCa = state->_calib_IMUtoCAM.at(lm->_anchor_cam_id)->pos();
+      const Eigen::Vector3d p_FinG = R_GtoIa.transpose() * R_ItoCa.transpose() * (lm->get_xyz(false) - p_IinCa) + p_IainG;
+      const Eigen::Matrix3d R_GtoIn = state->_clones_IMU.at(state->_timestamp)->Rot();
+      const Eigen::Vector3d p_IninG = state->_clones_IMU.at(state->_timestamp)->pos();
+      auto cos_in = [&](size_t cam) {
+        const Eigen::Vector3d p_C =
+            state->_calib_IMUtoCAM.at(cam)->Rot() * (R_GtoIn * (p_FinG - p_IninG)) + state->_calib_IMUtoCAM.at(cam)->pos();
+        const double n = p_C.norm();
+        return n > 0.0 ? p_C(2) / n : -1.0;
+      };
+      const size_t cam_same = (size_t)lm->_anchor_cam_id;
+      const double c_same = cos_in(cam_same);
+      if (c_same >= bcfg.cos_anchor) {
+        perform_anchor_change(state, lm, state->_timestamp, cam_same);
+        bst.slam_anchor_same.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      std::vector<size_t> cams;
+      for (const auto &cc : state->_calib_IMUtoCAM)
+        cams.push_back(cc.first);
+      std::sort(cams.begin(), cams.end());
+      size_t best = cam_same;
+      double c_best = c_same;
+      for (size_t cam : cams) {
+        const double cv = cos_in(cam);
+        if (cv > c_best) {
+          c_best = cv;
+          best = cam;
+        }
+      }
+      if (c_best >= bcfg.cos_slam) {
+        perform_anchor_change(state, lm, state->_timestamp, best);
+        (best == cam_same ? bst.slam_anchor_same : bst.slam_anchor_other).fetch_add(1, std::memory_order_relaxed);
+      } else {
+        to_marg.push_back(f.first);
+        bst.slam_anchor_marg.fetch_add(1, std::memory_order_relaxed);
+      }
     }
+  }
+  // OV_KB_BEARING: the landmarks that could not be re-anchored leave the state now, before their anchor clone is marginalized.
+  // Directly (not through StateHelper::marginalize_slam, which skips ids below 4 x max_aruco_features: with this fork's feature ids
+  // such landmarks would keep an anchor that no longer exists).
+  for (size_t id : to_marg) {
+    auto it = state->_features_SLAM.find(id);
+    if (it == state->_features_SLAM.end())
+      continue;
+    StateHelper::marginalize(state, it->second);
+    state->_features_SLAM.erase(it);
+    ov_msckf::g_slam_marg.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -672,3 +753,5 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   landmark->set_from_xyz(new_feat.p_FinA_fej, true);
   landmark->has_had_anchor_change = true;
 }
+
+void UpdaterSLAM::set_bearing_cameras(const std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> &cams) { initializer_feat->set_cameras(cams); }

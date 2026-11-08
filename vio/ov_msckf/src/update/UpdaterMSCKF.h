@@ -24,6 +24,7 @@
 
 #include <Eigen/Eigen>
 #include <memory>
+#include <unordered_map>
 
 #include "feat/FeatureInitializerOptions.h"
 
@@ -32,6 +33,7 @@
 namespace ov_core {
 class Feature;
 class FeatureInitializer;
+class CamBase;
 } // namespace ov_core
 
 namespace ov_msckf {
@@ -76,6 +78,9 @@ public:
    * Results land in ov_msckf::g_prejac keyed by feature id, stamped with `epoch`.
    */
   void prejac_precompute(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_core::Feature>> &feats, uint64_t epoch);
+
+  /// OV_KB_BEARING: hands the LIVE camera objects of the filter to the feature initializer (the features of the bearing path)
+  void set_bearing_cameras(const std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> &cams);
 
 protected:
   /// Options used during update
