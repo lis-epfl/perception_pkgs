@@ -9,7 +9,7 @@ test/test_sender_parity.py feeds a sender_lean sequence file through this class 
   partners   the same camera at keyframes -10, -7, -5, -4, -3, -2, -1 (0.2-2 s back at 5 Hz) with a baseline >= 8 cm
   matching   mutual nearest neighbour of the top 1500 keypoints (by score) against the partners' 3000, cosine > 0.75, epipolar penalty
              folded into the fp16 product (SOFT 0.1), then the exact 1-deg band on the chosen match
-  3-D        >= 2 partner views, views off by > 0.35 deg pruned (2 passes), depth 0.3-12 m, parallax >= the floor: parmin_early (8 deg)
+  3-D        >= 2 partner views, views off by > 0.35 deg pruned (2 passes), depth 0.3-15 m (DEPMAX; 12 m before 2026-11-08), parallax >= the floor: parmin_early (8 deg)
              before the switch time (set_floor_switch; the node sets it to the take-off latch + 8 s), parmin (6 deg) from it on
   memory     a camera with < 100 fresh 3-D points takes depths from its last stored keyframe (stored every 5 keyframes), 1-deg gate;
              a keyframe is stored only when >= 100 of its fresh points have parallax >= mem_gate (8 deg), and only those points
@@ -28,7 +28,7 @@ import packet_codec
 
 
 class LiveSender:
-    DS = [-10, -7, -5, -4, -3, -2, -1]; TOPQ = 1500; BAND = 1.0; MINSIM = 0.75; RES_MAX = 0.35; MIN_BASE = 0.08; SOFT = 0.1
+    DS = [-10, -7, -5, -4, -3, -2, -1]; TOPQ = 1500; BAND = 1.0; MINSIM = 0.75; RES_MAX = 0.35; MIN_BASE = 0.08; SOFT = 0.1; DEPMAX = 15.0
     MEM_MIN = 100; MEM_EVERY = 5; DEAD_MIN = 50; CAPTURE_MODE = 'global'
 
     def __init__(self, ncam, width, height, drone_id, np_max=3000, dev='cuda', reset_on_epoch=True, parmin=6.0, parmin_early=8.0, mem_gate=8.0,
@@ -120,7 +120,7 @@ class LiveSender:
         v = X[:, None, :] - Cc; dep = (v * Dd).sum(2); cos = dep / v.norm(dim=2).clamp_min(1e-9)
         nobs = (W[:, 1:] > 0).sum(1)   # no separate dep > 0 test: cos = dep / |v| >= cosres > 0 on every view in use implies it
         par = torch.where(W[:, 1:] > 0, (Dd[:, 1:] * Dd[:, :1]).sum(2), torch.ones_like(W[:, 1:])).min(1).values
-        ok = (nobs >= 2) & (dep[:, 0] > 0.3) & (dep[:, 0] < 12) & torch.where(W > 0, cos >= cosres, torch.ones_like(cos, dtype=torch.bool)).all(1) & (par <= cospar) & torch.isfinite(X).all(1)
+        ok = (nobs >= 2) & (dep[:, 0] > 0.3) & (dep[:, 0] < self.DEPMAX) & torch.where(W > 0, cos >= cosres, torch.ones_like(cos, dtype=torch.bool)).all(1) & (par <= cospar) & torch.isfinite(X).all(1)
         Xw = (SB['Rk'][selc] @ X[..., None])[..., 0] + SB['pk'][selc]; Xrg = (Xw - SB['pb']) @ SB['Rz']
         OUT.update(par=par, ok=ok, Xrg=Xrg, qz=ok[:0], n3=ok[:0], o=ok[:0], n3v=(ok & (nobs >= 3)).sum(), nok=ok.sum())
 
